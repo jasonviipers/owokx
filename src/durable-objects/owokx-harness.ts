@@ -714,10 +714,15 @@ function normalizeCryptoSymbol(symbol: string): string {
     cleaned = cleaned.replace(/USDT+$/, "USDT");
   }
 
+  // Handle hyphenated symbols (BTC-USDT -> BTC/USDT)
+  if (cleaned.includes("-")) {
+    cleaned = cleaned.replace("-", "/");
+  }
+
   if (cleaned.includes("/")) {
     return cleaned;
   }
-  const match = cleaned.match(/^([A-Z]{2,10})(USD|USDT|USDC)$/);
+  const match = cleaned.match(/^([A-Z0-9]{2,10})(USD|USDT|USDC)$/);
   if (match) {
     return `${match[1]}/${match[2]}`;
   }
@@ -734,7 +739,8 @@ function isCryptoSymbol(symbol: string, cryptoSymbols: string[]): boolean {
       return true;
     }
   }
-  return /^[A-Z]{2,5}\/(USD|USDT|USDC)$/.test(normalizedInput);
+  // Allow 2-10 chars for ticker (e.g. PEPECOIN, RENDER)
+  return /^[A-Z0-9]{2,10}\/(USD|USDT|USDC)$/.test(normalizedInput);
 }
 
 /**
@@ -1855,7 +1861,12 @@ export class OwokxHarness extends DurableObject<Env> {
         const hasSignificantMove = Math.abs(momentum) >= threshold;
         const isBullish = momentum > 0;
 
-        const rawSentiment = hasSignificantMove && isBullish ? Math.min(Math.abs(momentum) / 5, 1) : 0.1;
+        let rawSentiment = hasSignificantMove && isBullish ? Math.min(Math.abs(momentum) / 5, 1) : 0.1;
+        
+        // Safety check: Ensure sentiment is finite. Default to 0.1 (neutral-ish) or 0 if invalid.
+        if (!Number.isFinite(rawSentiment)) {
+          rawSentiment = 0;
+        }
 
         signals.push({
           symbol,

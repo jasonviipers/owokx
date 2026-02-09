@@ -138,6 +138,29 @@ export default function App() {
   const [portfolioPeriod, setPortfolioPeriod] = useState<'1D' | '1W' | '1M'>('1D')
   const [agentBusy, setAgentBusy] = useState(false)
   const [agentMessage, setAgentMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
+  
+  // Toast for Orchestrator connection
+  useEffect(() => {
+    if (status?.swarm?.agents?.harness?.status === 'active') {
+       const lastHb = status.swarm.agents.harness.lastHeartbeat;
+       const now = Date.now();
+       if (now - lastHb < 5000) { // Only show if recently active (within 5s) to avoid spam on every poll
+          // Check if we already showed it recently to avoid loop? 
+          // Actually, we can just rely on a transient state or check previous status.
+          // For now, let's just show a subtle indicator or use the existing agentMessage if it's a new connection.
+       }
+    }
+  }, [status?.swarm?.agents?.harness?.lastHeartbeat]);
+
+  // Better approach: Watch for transition from disconnected to connected
+  const [wasConnected, setWasConnected] = useState(false);
+  useEffect(() => {
+    const isConnected = status?.swarm?.agents?.harness?.status === 'active';
+    if (isConnected && !wasConnected) {
+      setAgentMessage({ type: 'success', text: 'Orchestrator connected' });
+    }
+    setWasConnected(!!isConnected);
+  }, [status?.swarm?.agents?.harness?.status]);
 
   const checkSetup = useCallback(async () => {
     try {
