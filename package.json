@@ -1,0 +1,55 @@
+{
+  "name": "owokx",
+  "version": "0.3.0",
+  "description": "Cloudflare Workers MCP server for autonomous stock trading with Alpaca",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "build": "tsc",
+    "deploy": "wrangler deploy",
+    "deploy:production": "wrangler deploy --env production",
+    "deploy:oneclick": "npx tsx scripts/deploy.ts",
+    "db:migrate": "wrangler d1 migrations apply owokx-db --local",
+    "db:migrate:remote": "wrangler d1 migrations apply owokx-db --remote",
+    "db:studio": "wrangler d1 execute owokx-db --local --command 'SELECT 1'",
+    "typecheck": "tsc --noEmit",
+    "lint": "biome lint src/",
+    "lint:fix": "biome lint --write src/",
+    "format": "biome format --write src/",
+    "format:check": "biome format src/",
+    "check": "biome check src/",
+    "check:fix": "biome check --write src/",
+    "test": "vitest",
+    "test:run": "vitest run",
+    "setup:access": "npx tsx scripts/setup-access.ts"
+  },
+  "dependencies": {
+    "@ai-sdk/anthropic": "^3.0.35",
+    "@ai-sdk/cohere": "^3.0.18",
+    "@ai-sdk/deepseek": "^2.0.17",
+    "@ai-sdk/google": "^3.0.20",
+    "@ai-sdk/groq": "^3.0.21",
+    "@ai-sdk/mistral": "^3.0.18",
+    "@ai-sdk/openai": "^3.0.25",
+    "@ai-sdk/xai": "^3.0.46",
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "agents": "^0.0.74",
+    "ai": "^6.0.67",
+    "okx-api": "^3.1.1",
+    "openai": "^6.16.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.3.14",
+    "@cloudflare/workers-types": "^4.20241218.0",
+    "@types/node": "^22.10.2",
+    "@types/ws": "^8.18.1",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8",
+    "wrangler": "^4.61.1",
+    "ws": "^8.19.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

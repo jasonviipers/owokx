@@ -1,0 +1,3885 @@
+/**
+ * OwokxHarness - Autonomous Trading Agent Durable Object
+ *
+ * A fully autonomous trading agent that runs 24/7 on Cloudflare Workers.
+ * This is the "harness" - customize it to match your trading strategy.
+ *
+ * ═══════════════════════════════════════════════════════════════════════════
+ * HOW TO CUSTOMIZE THIS AGENT
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * 1. CONFIGURATION (AgentConfig & DEFAULT_CONFIG)
+ *    - Tune risk parameters, position sizes, thresholds
+ *    - Enable/disable features (options, crypto, staleness)
+ *    - Set LLM models and token limits
+ *
+ * 2. DATA SOURCES (runDataGatherers, gatherStockTwits, gatherReddit, etc.)
+ *    - Add new data sources (news APIs, alternative data)
+ *    - Modify scraping logic and sentiment analysis
+ *    - Adjust source weights in SOURCE_CONFIG
+ *
+ * 3. TRADING LOGIC (runAnalyst, executeBuy, executeSell)
+ *    - Change entry/exit rules
+ *    - Modify position sizing formulas
+ *    - Add custom indicators
+ *
+ * 4. LLM PROMPTS (researchSignal, runPreMarketAnalysis)
+ *    - Customize how the AI analyzes signals
+ *    - Change research criteria and output format
+ *
+ * 5. NOTIFICATIONS (sendDiscordNotification)
+ *    - Set DISCORD_WEBHOOK_URL secret to enable
+ *    - Modify what triggers notifications
+ *
+ * Deploy with: wrangler deploy -c wrangler.v2.toml
+ * ═══════════════════════════════════════════════════════════════════════════
+ */
+
+import { DurableObject } from "cloudflare:workers";
+import type { Env } from "../env.d";
+import { executeOrder } from "../execution/execute-order";
+import { isRequestAuthorized } from "../lib/auth";
+import { ErrorCode } from "../lib/errors";
+import {
+  buildPortfolioSnapshots,
+  downsampleEquityPoints,
+  periodWindowMs,
+  timeframeBucketMs,
+} from "../lib/portfolio-history";
+import { type BrokerProviders, createBrokerProviders } from "../providers/broker-factory";
+import { createLLMProvider } from "../providers/llm/factory";
+import type { Account, LLMProvider, MarketClock, Position } from "../providers/types";
+import { createD1Client } from "../storage/d1/client";
+import { createDecision } from "../storage/d1/queries/decisions";
+
+// ============================================================================
+// SECTION 1: TYPES & CONFIGURATION
+// ============================================================================
+// [CUSTOMIZABLE] Modify these interfaces to add new fields for custom data sources.
+// [CUSTOMIZABLE] AgentConfig contains ALL tunable parameters - start here!
+// ============================================================================
+
+interface AgentConfig {
+  // Polling intervals - how often the agent checks for new data
+  data_poll_interval_ms: number; // [TUNE] Default: 30s. Lower = more API calls
+  analyst_interval_ms: number; // [TUNE] Default: 120s. How often to run trading logic
+
+  broker: "alpaca" | "okx";
+
+  // Position limits - risk management basics
+  max_position_value: number; // [TUNE] Max $ per position
+  max_positions: number; // [TUNE] Max concurrent positions
+  min_sentiment_score: number; // [TUNE] Min sentiment to consider buying (0-1)
+  min_analyst_confidence: number; // [TUNE] Min LLM confidence to execute (0-1)
+
+  // Risk management - take profit and stop loss
+  take_profit_pct: number; // [TUNE] Take profit at this % gain
+  stop_loss_pct: number; // [TUNE] Stop loss at this % loss
+  position_size_pct_of_cash: number; // [TUNE] % of cash per trade
+
+  // Stale position management - exit positions that have lost momentum
+  stale_position_enabled: boolean;
+  stale_min_hold_hours: number; // [TUNE] Min hours before checking staleness
+  stale_max_hold_days: number; // [TUNE] Force exit after this many days
+  stale_min_gain_pct: number; // [TUNE] Required gain % to hold past max days
+  stale_mid_hold_days: number;
+  stale_mid_min_gain_pct: number;
+  stale_social_volume_decay: number; // [TUNE] Exit if volume drops to this % of entry
+
+  // LLM configuration
+  llm_provider: "openai-raw" | "ai-sdk" | "cloudflare-gateway"; // [TUNE] Provider: openai-raw, ai-sdk, cloudflare-gateway
+  llm_model: string; // [TUNE] Model for quick research (gpt-4o-mini)
+  llm_analyst_model: string; // [TUNE] Model for deep analysis (gpt-4o)
+  llm_min_hold_minutes: number; // [TUNE] Min minutes before LLM can recommend sell (default: 30)
+  starting_equity?: number;
+
+  // Options trading - trade options instead of shares for high-conviction plays
+  options_enabled: boolean; // [TOGGLE] Enable/disable options trading
+  options_min_confidence: number; // [TUNE] Higher threshold for options (riskier)
+  options_max_pct_per_trade: number;
+  options_min_dte: number; // [TUNE] Minimum days to expiration
+  options_max_dte: number; // [TUNE] Maximum days to expiration
+  options_target_delta: number; // [TUNE] Target delta (0.3-0.5 typical)
+  options_min_delta: number;
+  options_max_delta: number;
+  options_stop_loss_pct: number; // [TUNE] Options stop loss (wider than stocks)
+  options_take_profit_pct: number; // [TUNE] Options take profit (higher targets)
+
+  // Crypto trading - 24/7 momentum-based crypto trading
+  crypto_enabled: boolean; // [TOGGLE] Enable/disable crypto trading
+  crypto_symbols: string[]; // [TUNE] Which cryptos to trade (BTC/USD, etc.)
+  crypto_momentum_threshold: number; // [TUNE] Min % move to trigger signal
+  crypto_max_position_value: number;
+  crypto_take_profit_pct: number;
+  crypto_stop_loss_pct: number;
+
+  // Custom ticker blacklist - user-defined symbols to never trade (e.g., insider trading restrictions)
+  ticker_blacklist: string[];
+
+  // Allowed exchanges - only trade stocks listed on these exchanges (avoids OTC data issues)
+  allowed_exchanges: string[];
+}
+
+// [CUSTOMIZABLE] Add fields here when you add new data sources
+interface Signal {
+  symbol: string;
+  source: string; // e.g., "stocktwits", "reddit", "crypto", "your_source"
+  source_detail: string; // e.g., "reddit_wallstreetbets"
+  sentiment: number; // Weighted sentiment (-1 to 1)
+  raw_sentiment: number; // Raw sentiment before weighting
+  volume: number; // Number of mentions/messages
+  freshness: number; // Time decay factor (0-1)
+  source_weight: number; // How much to trust this source
+  reason: string; // Human-readable reason
+  timestamp: number; // Unix timestamp (ms) when signal was gathered
+  upvotes?: number;
+  comments?: number;
+  quality_score?: number;
+  subreddits?: string[];
+  best_flair?: string | null;
+  bullish?: number;
+  bearish?: number;
+  isCrypto?: boolean;
+  momentum?: number;
+  price?: number;
+}
+
+interface PositionEntry {
+  symbol: string;
+  entry_time: number;
+  entry_price: number;
+  entry_sentiment: number;
+  entry_social_volume: number;
+  entry_sources: string[];
+  entry_reason: string;
+  peak_price: number;
+  peak_sentiment: number;
+}
+
+interface SocialHistoryEntry {
+  timestamp: number;
+  volume: number;
+  sentiment: number;
+}
+
+interface LogEntry {
+  timestamp: string;
+  agent: string;
+  action: string;
+  [key: string]: unknown;
+}
+
+interface CostTracker {
+  total_usd: number;
+  calls: number;
+  tokens_in: number;
+  tokens_out: number;
+}
+
+interface ResearchResult {
+  symbol: string;
+  verdict: "BUY" | "SKIP" | "WAIT";
+  confidence: number;
+  entry_quality: "excellent" | "good" | "fair" | "poor";
+  reasoning: string;
+  red_flags: string[];
+  catalysts: string[];
+  timestamp: number;
+}
+
+interface TwitterConfirmation {
+  symbol: string;
+  tweet_count: number;
+  sentiment: number;
+  confirms_existing: boolean;
+  highlights: Array<{ author: string; text: string; likes: number }>;
+  timestamp: number;
+}
+
+interface PremarketPlan {
+  timestamp: number;
+  recommendations: Array<{
+    action: "BUY" | "SELL" | "HOLD";
+    symbol: string;
+    confidence: number;
+    reasoning: string;
+    suggested_size_pct?: number;
+  }>;
+  market_summary: string;
+  high_conviction: string[];
+  researched_buys: ResearchResult[];
+}
+
+interface AgentState {
+  config: AgentConfig;
+  signalCache: Signal[];
+  positionEntries: Record<string, PositionEntry>;
+  socialHistory: Record<string, SocialHistoryEntry[]>;
+  logs: LogEntry[];
+  costTracker: CostTracker;
+  portfolioEquityHistory: Array<{ timestamp_ms: number; equity: number }>;
+  lastPortfolioSnapshotAt: number;
+  lastDataGatherRun: number;
+  lastAnalystRun: number;
+  lastResearchRun: number;
+  signalResearch: Record<string, ResearchResult>;
+  positionResearch: Record<string, unknown>;
+  stalenessAnalysis: Record<string, unknown>;
+  twitterConfirmations: Record<string, TwitterConfirmation>;
+  twitterDailyReads: number;
+  twitterDailyReadReset: number;
+  premarketPlan: PremarketPlan | null;
+  lastBrokerAuthError?: { at: number; message: string };
+  lastLLMAuthError?: { at: number; message: string };
+  enabled: boolean;
+}
+
+// ============================================================================
+// [CUSTOMIZABLE] SOURCE_CONFIG - How much to trust each data source
+// ============================================================================
+const SOURCE_CONFIG = {
+  weights: {
+    stocktwits: 0.85,
+    reddit_wallstreetbets: 0.6,
+    reddit_stocks: 0.9,
+    reddit_investing: 0.8,
+    reddit_options: 0.85,
+    twitter_fintwit: 0.95,
+    twitter_news: 0.9,
+    sec_8k: 0.95,
+    sec_4: 0.9,
+    sec_13f: 0.7,
+  },
+  // [TUNE] Reddit flair multipliers - boost/penalize based on post type
+  flairMultipliers: {
+    DD: 1.5, // Due Diligence - high value
+    "Technical Analysis": 1.3,
+    Fundamentals: 1.3,
+    News: 1.2,
+    Discussion: 1.0,
+    Chart: 1.1,
+    "Daily Discussion": 0.7, // Low signal
+    "Weekend Discussion": 0.6,
+    YOLO: 0.6, // Entertainment, not alpha
+    Gain: 0.5, // Loss porn - inverse signal?
+    Loss: 0.5,
+    Meme: 0.4,
+    Shitpost: 0.3,
+  } as Record<string, number>,
+  // [TUNE] Engagement multipliers - more engagement = more trusted
+  engagement: {
+    upvotes: { 1000: 1.5, 500: 1.3, 200: 1.2, 100: 1.1, 50: 1.0, 0: 0.8 } as Record<number, number>,
+    comments: { 200: 1.4, 100: 1.25, 50: 1.15, 20: 1.05, 0: 0.9 } as Record<number, number>,
+  },
+  // [TUNE] How fast old posts lose weight (minutes). Lower = faster decay.
+  decayHalfLifeMinutes: 120,
+};
+
+const DEFAULT_CONFIG: AgentConfig = {
+  data_poll_interval_ms: 30_000,
+  analyst_interval_ms: 120_000,
+  broker: "alpaca",
+  max_position_value: 5000,
+  max_positions: 5,
+  min_sentiment_score: 0.3,
+  min_analyst_confidence: 0.6,
+  take_profit_pct: 10,
+  stop_loss_pct: 5,
+  position_size_pct_of_cash: 25,
+  stale_position_enabled: true,
+  stale_min_hold_hours: 24,
+  stale_max_hold_days: 3,
+  stale_min_gain_pct: 5,
+  stale_mid_hold_days: 2,
+  stale_mid_min_gain_pct: 3,
+  stale_social_volume_decay: 0.3,
+  llm_provider: "openai-raw",
+  llm_model: "gpt-4o-mini",
+  llm_analyst_model: "gpt-4o",
+  llm_min_hold_minutes: 30,
+  options_enabled: false,
+  options_min_confidence: 0.8,
+  options_max_pct_per_trade: 0.02,
+  options_min_dte: 30,
+  options_max_dte: 60,
+  options_target_delta: 0.45,
+  options_min_delta: 0.3,
+  options_max_delta: 0.7,
+  options_stop_loss_pct: 50,
+  options_take_profit_pct: 100,
+  crypto_enabled: false,
+  crypto_symbols: ["BTC/USD", "ETH/USD", "SOL/USD"],
+  crypto_momentum_threshold: 2.0,
+  crypto_max_position_value: 1000,
+  crypto_take_profit_pct: 10,
+  crypto_stop_loss_pct: 5,
+  ticker_blacklist: [],
+  allowed_exchanges: ["NYSE", "NASDAQ", "ARCA", "AMEX", "BATS"],
+};
+
+const DEFAULT_STATE: AgentState = {
+  config: DEFAULT_CONFIG,
+  signalCache: [],
+  positionEntries: {},
+  socialHistory: {},
+  logs: [],
+  costTracker: { total_usd: 0, calls: 0, tokens_in: 0, tokens_out: 0 },
+  portfolioEquityHistory: [],
+  lastPortfolioSnapshotAt: 0,
+  lastDataGatherRun: 0,
+  lastAnalystRun: 0,
+  lastResearchRun: 0,
+  signalResearch: {},
+  positionResearch: {},
+  stalenessAnalysis: {},
+  twitterConfirmations: {},
+  twitterDailyReads: 0,
+  twitterDailyReadReset: 0,
+  premarketPlan: null,
+  enabled: false,
+};
+
+// Blacklist for ticker extraction - common English words and trading slang
+const TICKER_BLACKLIST = new Set([
+  // Finance/trading terms
+  "CEO",
+  "CFO",
+  "COO",
+  "CTO",
+  "IPO",
+  "EPS",
+  "GDP",
+  "SEC",
+  "FDA",
+  "USA",
+  "USD",
+  "ETF",
+  "NYSE",
+  "API",
+  "ATH",
+  "ATL",
+  "IMO",
+  "FOMO",
+  "YOLO",
+  "DD",
+  "TA",
+  "FA",
+  "ROI",
+  "PE",
+  "PB",
+  "PS",
+  "EV",
+  "DCF",
+  "WSB",
+  "RIP",
+  "LOL",
+  "OMG",
+  "WTF",
+  "FUD",
+  "HODL",
+  "APE",
+  "MOASS",
+  "DRS",
+  "NFT",
+  "DAO",
+  // Common English words (2-4 letters that look like tickers)
+  "THE",
+  "AND",
+  "FOR",
+  "ARE",
+  "BUT",
+  "NOT",
+  "YOU",
+  "ALL",
+  "CAN",
+  "HER",
+  "WAS",
+  "ONE",
+  "OUR",
+  "OUT",
+  "DAY",
+  "HAD",
+  "HAS",
+  "HIS",
+  "HOW",
+  "ITS",
+  "LET",
+  "MAY",
+  "NEW",
+  "NOW",
+  "OLD",
+  "SEE",
+  "WAY",
+  "WHO",
+  "BOY",
+  "DID",
+  "GET",
+  "HIM",
+  "HIT",
+  "LOW",
+  "MAN",
+  "RUN",
+  "SAY",
+  "SHE",
+  "TOO",
+  "USE",
+  "DAD",
+  "MOM",
+  "GOT",
+  "HAS",
+  "HAD",
+  "LET",
+  "PUT",
+  "SAW",
+  "SAT",
+  "SET",
+  "SIT",
+  "TRY",
+  "THAT",
+  "THIS",
+  "WITH",
+  "HAVE",
+  "FROM",
+  "THEY",
+  "BEEN",
+  "CALL",
+  "WILL",
+  "EACH",
+  "MAKE",
+  "LIKE",
+  "TIME",
+  "JUST",
+  "KNOW",
+  "TAKE",
+  "COME",
+  "MADE",
+  "FIND",
+  "MORE",
+  "LONG",
+  "HERE",
+  "MANY",
+  "SOME",
+  "THAN",
+  "THEM",
+  "THEN",
+  "ONLY",
+  "OVER",
+  "SUCH",
+  "YEAR",
+  "INTO",
+  "MOST",
+  "ALSO",
+  "BACK",
+  "GOOD",
+  "WELL",
+  "EVEN",
+  "WANT",
+  "GIVE",
+  "MUCH",
+  "WORK",
+  "FIRST",
+  "AFTER",
+  "AS",
+  "AT",
+  "BE",
+  "BY",
+  "DO",
+  "GO",
+  "IF",
+  "IN",
+  "IS",
+  "IT",
+  "MY",
+  "NO",
+  "OF",
+  "ON",
+  "OR",
+  "SO",
+  "TO",
+  "UP",
+  "US",
+  "WE",
+  "AN",
+  "AM",
+  "AH",
+  "OH",
+  "OK",
+  "HI",
+  "YA",
+  "YO",
+  // More trading slang
+  "BULL",
+  "BEAR",
+  "CALL",
+  "PUTS",
+  "HOLD",
+  "SELL",
+  "MOON",
+  "PUMP",
+  "DUMP",
+  "BAGS",
+  "TEND",
+  // Additional common words that appear as false positives
+  "START",
+  "ABOUT",
+  "NAME",
+  "NEXT",
+  "PLAY",
+  "LIVE",
+  "GAME",
+  "BEST",
+  "LINK",
+  "READ",
+  "POST",
+  "NEWS",
+  "FREE",
+  "LOOK",
+  "HELP",
+  "OPEN",
+  "FULL",
+  "VIEW",
+  "REAL",
+  "SEND",
+  "HIGH",
+  "DROP",
+  "FAST",
+  "SAFE",
+  "RISK",
+  "TURN",
+  "PLAN",
+  "DEAL",
+  "MOVE",
+  "HUGE",
+  "EASY",
+  "HARD",
+  "LATE",
+  "WAIT",
+  "SOON",
+  "STOP",
+  "EXIT",
+  "GAIN",
+  "LOSS",
+  "GROW",
+  "FALL",
+  "JUMP",
+  "KEEP",
+  "COPY",
+  "EDIT",
+  "SAVE",
+  "NOTE",
+  "TIPS",
+  "IDEA",
+  "PLUS",
+  "ZERO",
+  "SELF",
+  "BOTH",
+  "BETA",
+  "TEST",
+  "INFO",
+  "DATA",
+  "CASH",
+  "WHAT",
+  "WHEN",
+  "WHERE",
+  "WHY",
+  "WATCH",
+  "LOVE",
+  "HATE",
+  "TECH",
+  "HOPE",
+  "FEAR",
+  "WEEK",
+  "LAST",
+  "PART",
+  "SIDE",
+  "STEP",
+  "SURE",
+  "TELL",
+  "THINK",
+  "TOLD",
+  "TRUE",
+  "TURN",
+  "TYPE",
+  "UNIT",
+  "USED",
+  "VERY",
+  "WANT",
+  "WENT",
+  "WERE",
+  "YEAH",
+  "YOUR",
+  "ELSE",
+  "AWAY",
+  "OTHER",
+  "PRICE",
+  "THEIR",
+  "STILL",
+  "CHEAP",
+  "THESE",
+  "LEAP",
+  "EVERY",
+  "SINCE",
+  "BEING",
+  "THOSE",
+  "DOING",
+  "COULD",
+  "WOULD",
+  "SHOULD",
+  "MIGHT",
+  "MUST",
+  "SHALL",
+]);
+
+class ValidTickerCache {
+  private secTickers: Set<string> | null = null;
+  private lastSecRefresh = 0;
+  private alpacaCache: Map<string, boolean> = new Map();
+  private readonly SEC_REFRESH_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
+
+  async refreshSecTickersIfNeeded(): Promise<void> {
+    if (this.secTickers && Date.now() - this.lastSecRefresh < this.SEC_REFRESH_INTERVAL_MS) {
+      return;
+    }
+    try {
+      const res = await fetch("https://www.sec.gov/files/company_tickers.json", {
+        headers: { "User-Agent": "Owokx Trading Bot" },
+      });
+      if (!res.ok) return;
+      const data = (await res.json()) as Record<string, { cik_str: number; ticker: string; title: string }>;
+      this.secTickers = new Set(Object.values(data).map((e) => e.ticker.toUpperCase()));
+      this.lastSecRefresh = Date.now();
+    } catch {
+      // Keep existing cache on failure
+    }
+  }
+
+  isKnownSecTicker(symbol: string): boolean {
+    return this.secTickers?.has(symbol.toUpperCase()) ?? false;
+  }
+
+  getCachedValidation(symbol: string): boolean | undefined {
+    return this.alpacaCache.get(symbol.toUpperCase());
+  }
+
+  setCachedValidation(symbol: string, isValid: boolean): void {
+    this.alpacaCache.set(symbol.toUpperCase(), isValid);
+  }
+
+  async validateWithBroker(
+    symbol: string,
+    broker: { trading: { getAsset(s: string): Promise<{ tradable: boolean } | null> } }
+  ): Promise<boolean> {
+    const upper = symbol.toUpperCase();
+    const cached = this.alpacaCache.get(upper);
+    if (cached !== undefined) return cached;
+
+    try {
+      const asset = await broker.trading.getAsset(upper);
+      const isValid = asset !== null && asset.tradable;
+      this.alpacaCache.set(upper, isValid);
+      return isValid;
+    } catch {
+      this.alpacaCache.set(upper, false);
+      return false;
+    }
+  }
+}
+
+const tickerCache = new ValidTickerCache();
+
+// ============================================================================
+// SECTION 2: HELPER FUNCTIONS
+// ============================================================================
+// [CUSTOMIZABLE] These utilities calculate sentiment weights and extract tickers.
+// Modify these to change how posts are scored and filtered.
+// ============================================================================
+
+function normalizeCryptoSymbol(symbol: string): string {
+  // Handle UI/ingestion variants like "PEPE.X" -> "PEPE"
+  let cleaned = symbol.toUpperCase().trim();
+  if (cleaned.endsWith(".X")) {
+    cleaned = cleaned.slice(0, -2);
+  }
+
+  // Fix common configuration typos (e.g. BTC/USDTTT from dashboard bug)
+  if (cleaned.endsWith("USDTT") || cleaned.endsWith("USDTTT")) {
+    cleaned = cleaned.replace(/USDT+$/, "USDT");
+  }
+
+  if (cleaned.includes("/")) {
+    return cleaned;
+  }
+  const match = cleaned.match(/^([A-Z]{2,10})(USD|USDT|USDC)$/);
+  if (match) {
+    return `${match[1]}/${match[2]}`;
+  }
+  return cleaned;
+}
+
+function isCryptoSymbol(symbol: string, cryptoSymbols: string[]): boolean {
+  // StockTwits crypto suffix
+  if (symbol.endsWith(".X")) return true;
+  
+  const normalizedInput = normalizeCryptoSymbol(symbol);
+  for (const configSymbol of cryptoSymbols) {
+    if (normalizeCryptoSymbol(configSymbol) === normalizedInput) {
+      return true;
+    }
+  }
+  return /^[A-Z]{2,5}\/(USD|USDT|USDC)$/.test(normalizedInput);
+}
+
+/**
+ * [TUNE] Time decay - how quickly old posts lose weight
+ * Uses exponential decay with half-life from SOURCE_CONFIG.decayHalfLifeMinutes
+ * Modify the min/max clamp values (0.2-1.0) to change bounds
+ */
+function calculateTimeDecay(postTimestamp: number): number {
+  const ageMinutes = (Date.now() - postTimestamp * 1000) / 60000;
+  const halfLife = SOURCE_CONFIG.decayHalfLifeMinutes;
+  const decay = 0.5 ** (ageMinutes / halfLife);
+  return Math.max(0.2, Math.min(1.0, decay));
+}
+
+function getEngagementMultiplier(upvotes: number, comments: number): number {
+  let upvoteMultiplier = 0.8;
+  const upvoteThresholds = Object.entries(SOURCE_CONFIG.engagement.upvotes).sort(([a], [b]) => Number(b) - Number(a));
+  for (const [threshold, mult] of upvoteThresholds) {
+    if (upvotes >= parseInt(threshold, 10)) {
+      upvoteMultiplier = mult;
+      break;
+    }
+  }
+
+  let commentMultiplier = 0.9;
+  const commentThresholds = Object.entries(SOURCE_CONFIG.engagement.comments).sort(([a], [b]) => Number(b) - Number(a));
+  for (const [threshold, mult] of commentThresholds) {
+    if (comments >= parseInt(threshold, 10)) {
+      commentMultiplier = mult;
+      break;
+    }
+  }
+
+  return (upvoteMultiplier + commentMultiplier) / 2;
+}
+
+/** [TUNE] Flair multiplier - boost/penalize based on Reddit post flair */
+function getFlairMultiplier(flair: string | null | undefined): number {
+  if (!flair) return 1.0;
+  return SOURCE_CONFIG.flairMultipliers[flair.trim()] || 1.0;
+}
+
+/**
+ * [CUSTOMIZABLE] Ticker extraction - modify regex to change what counts as a ticker
+ * Current: $SYMBOL or SYMBOL followed by trading keywords
+ * Add patterns for your data sources (e.g., cashtags, mentions)
+ */
+function extractTickers(text: string, customBlacklist: string[] = []): string[] {
+  const matches = new Set<string>();
+  const customSet = new Set(customBlacklist.map((t) => t.toUpperCase()));
+  const regex =
+    /\$([A-Z]{1,5})\b|\b([A-Z]{2,5})\b(?=\s+(?:calls?|puts?|stock|shares?|moon|rocket|yolo|buy|sell|long|short))/gi;
+  let match;
+  while ((match = regex.exec(text)) !== null) {
+    const ticker = (match[1] || match[2] || "").toUpperCase();
+    if (ticker.length >= 2 && ticker.length <= 5 && !TICKER_BLACKLIST.has(ticker) && !customSet.has(ticker)) {
+      matches.add(ticker);
+    }
+  }
+  return Array.from(matches);
+}
+
+/**
+ * [CUSTOMIZABLE] Sentiment detection - keyword-based bullish/bearish scoring
+ * Add/remove words to match your trading style
+ * Returns -1 (bearish) to +1 (bullish)
+ */
+function detectSentiment(text: string): number {
+  const lower = text.toLowerCase();
+  const bullish = [
+    "moon",
+    "rocket",
+    "buy",
+    "calls",
+    "long",
+    "bullish",
+    "yolo",
+    "tendies",
+    "gains",
+    "diamond",
+    "squeeze",
+    "pump",
+    "green",
+    "up",
+    "breakout",
+    "undervalued",
+    "accumulate",
+  ];
+  const bearish = [
+    "puts",
+    "short",
+    "sell",
+    "bearish",
+    "crash",
+    "dump",
+    "drill",
+    "tank",
+    "rip",
+    "red",
+    "down",
+    "bag",
+    "overvalued",
+    "bubble",
+    "avoid",
+  ];
+
+  let bull = 0,
+    bear = 0;
+  for (const w of bullish) if (lower.includes(w)) bull++;
+  for (const w of bearish) if (lower.includes(w)) bear++;
+
+  const total = bull + bear;
+  if (total === 0) return 0;
+  return (bull - bear) / total;
+}
+
+// ============================================================================
+// SECTION 3: DURABLE OBJECT CLASS
+// ============================================================================
+// The main agent class. Modify alarm() to change the core loop.
+// Add new HTTP endpoints in fetch() for custom dashboard controls.
+// ============================================================================
+
+export class OwokxHarness extends DurableObject<Env> {
+  private state: AgentState = { ...DEFAULT_STATE };
+  private _llm: LLMProvider | null = null;
+
+  constructor(ctx: DurableObjectState, env: Env) {
+    super(ctx, env);
+
+    this._llm = createLLMProvider(env);
+    if (this._llm) {
+      console.log(`[OwokxHarness] LLM Provider initialized: ${env.LLM_PROVIDER || "openai-raw"}`);
+    } else {
+      console.log("[OwokxHarness] WARNING: No valid LLM provider configured - research disabled");
+    }
+
+    this.ctx.blockConcurrencyWhile(async () => {
+      const stored = await this.ctx.storage.get<AgentState>("state");
+      if (stored) {
+        this.state = { ...DEFAULT_STATE, ...stored };
+      }
+      this.initializeLLM();
+
+      // Reschedule alarm if stale - in local dev, past alarms don't fire on restart;
+      // in production this is a defensive check for edge cases (long inactivity, redeployments)
+      if (this.state.enabled) {
+        const existingAlarm = await this.ctx.storage.getAlarm();
+        const now = Date.now();
+        if (!existingAlarm || existingAlarm < now) {
+          await this.ctx.storage.setAlarm(now + 5_000);
+        }
+      }
+    });
+  }
+
+  private initializeLLM() {
+    const provider = this.state.config.llm_provider || this.env.LLM_PROVIDER || "openai-raw";
+    const model = this.state.config.llm_model || this.env.LLM_MODEL || "gpt-4o-mini";
+
+    const effectiveEnv: Env = {
+      ...this.env,
+      LLM_PROVIDER: provider as Env["LLM_PROVIDER"],
+      LLM_MODEL: model,
+    };
+
+    this._llm = createLLMProvider(effectiveEnv);
+    if (this._llm) {
+      console.log(`[OwokxHarness] LLM Provider initialized: ${provider} (${model})`);
+    } else {
+      console.log("[OwokxHarness] WARNING: No valid LLM provider configured");
+    }
+  }
+
+  // ============================================================================
+  // [CUSTOMIZABLE] ALARM HANDLER - Main entry point for scheduled work
+  // ============================================================================
+  // This runs every 30 seconds. Modify to change:
+  // - What runs and when (intervals, market hours checks)
+  // - Order of operations (data → research → trading)
+  // - Add new features (e.g., portfolio rebalancing, alerts)
+  // ============================================================================
+
+  async alarm(): Promise<void> {
+    if (!this.state.enabled) {
+      this.log("System", "alarm_skipped", { reason: "Agent not enabled" });
+      return;
+    }
+
+    const now = Date.now();
+    const RESEARCH_INTERVAL_MS = 120_000;
+    const POSITION_RESEARCH_INTERVAL_MS = 300_000;
+
+    try {
+      const broker = createBrokerProviders(this.env, this.state.config.broker);
+      const clock = await broker.trading.getClock();
+
+      if (now - this.state.lastDataGatherRun >= this.state.config.data_poll_interval_ms) {
+        await this.runDataGatherers();
+        this.state.lastDataGatherRun = now;
+      }
+
+      if (now - this.state.lastResearchRun >= RESEARCH_INTERVAL_MS) {
+        await this.researchTopSignals(5);
+        this.state.lastResearchRun = now;
+      }
+
+      if (this.isPreMarketWindow(broker.broker, clock) && !this.state.premarketPlan) {
+        await this.runPreMarketAnalysis();
+      }
+
+      const positions = await broker.trading.getPositions();
+
+      if (this.state.config.crypto_enabled) {
+        await this.runCryptoTrading(broker, positions);
+      }
+
+      if (clock.is_open) {
+        if (this.isMarketJustOpened(broker.broker, clock) && this.state.premarketPlan) {
+          await this.executePremarketPlan();
+        }
+
+        if (now - this.state.lastAnalystRun >= this.state.config.analyst_interval_ms) {
+          await this.runAnalyst();
+          this.state.lastAnalystRun = now;
+        }
+
+        if (positions.length > 0 && now - this.state.lastResearchRun >= POSITION_RESEARCH_INTERVAL_MS) {
+          for (const pos of positions) {
+            if (pos.asset_class !== "us_option") {
+              await this.researchPosition(pos.symbol, pos);
+            }
+          }
+        }
+
+        if (this.isOptionsEnabled()) {
+          const optionsExits = await this.checkOptionsExits(positions);
+          for (const exit of optionsExits) {
+            await this.executeSell(broker, exit.symbol, exit.reason);
+          }
+        }
+
+        if (this.isTwitterEnabled()) {
+          const heldSymbols = positions.map((p) => p.symbol);
+          const breakingNews = await this.checkTwitterBreakingNews(heldSymbols);
+          for (const news of breakingNews) {
+            if (news.is_breaking) {
+              this.log("System", "twitter_breaking_news", {
+                symbol: news.symbol,
+                headline: news.headline.slice(0, 100),
+              });
+            }
+          }
+        }
+      }
+
+      await this.persist();
+    } catch (error) {
+      this.log("System", "alarm_error", { error: String(error) });
+    }
+
+    await this.scheduleNextAlarm();
+  }
+
+  private async scheduleNextAlarm(): Promise<void> {
+    const nextRun = Date.now() + 30_000; // 30 seconds
+    await this.ctx.storage.setAlarm(nextRun);
+  }
+
+  // ============================================================================
+  // HTTP HANDLER (for dashboard/control)
+  // ============================================================================
+  // Add new endpoints here for custom dashboard controls.
+  // Example: /webhook for external alerts, /backtest for simulation
+  // ============================================================================
+
+  private constantTimeCompare(a: string, b: string): boolean {
+    if (a.length !== b.length) return false;
+    let mismatch = 0;
+    for (let i = 0; i < a.length; i++) {
+      mismatch |= a.charCodeAt(i) ^ b.charCodeAt(i);
+    }
+    return mismatch === 0;
+  }
+
+  private isAuthorized(request: Request, scope: "read" | "trade"): boolean {
+    return isRequestAuthorized(request, this.env, scope);
+  }
+
+  private isKillSwitchAuthorized(request: Request): boolean {
+    const secret = this.env.KILL_SWITCH_SECRET;
+    if (!secret) {
+      return false;
+    }
+    const authHeader = request.headers.get("Authorization");
+    if (!authHeader?.startsWith("Bearer ")) {
+      return false;
+    }
+    return this.constantTimeCompare(authHeader.slice(7), secret);
+  }
+
+  private unauthorizedResponse(): Response {
+    return new Response(JSON.stringify({ error: "Unauthorized. Requires: Authorization: Bearer <OWOKX_API_TOKEN>" }), {
+      status: 401,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
+  async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    const action = url.pathname.slice(1);
+
+    const readActions = ["status", "logs", "costs", "signals", "history", "setup/status", "metrics"];
+    const tradeActions = ["enable", "disable", "trigger"];
+    let requiredScope: "read" | "trade" | null = null;
+
+    if (readActions.includes(action)) {
+      requiredScope = "read";
+    } else if (tradeActions.includes(action)) {
+      requiredScope = "trade";
+    } else if (action === "config") {
+      requiredScope = request.method === "POST" ? "trade" : "read";
+    }
+
+    if (requiredScope) {
+      if (!this.isAuthorized(request, requiredScope)) {
+        return this.unauthorizedResponse();
+      }
+    }
+
+    try {
+      switch (action) {
+        case "status":
+          return this.handleStatus();
+
+        case "setup/status":
+          return this.jsonResponse({ ok: true, data: { configured: true } });
+
+        case "config":
+          if (request.method === "POST") {
+            return this.handleUpdateConfig(request);
+          }
+          return this.jsonResponse({ ok: true, data: this.state.config });
+
+        case "enable":
+          return this.handleEnable();
+
+        case "disable":
+          return this.handleDisable();
+
+        case "logs":
+          return this.handleGetLogs(url);
+
+        case "costs":
+          return this.jsonResponse({ costs: this.state.costTracker });
+
+        case "signals":
+          return this.jsonResponse({ signals: this.state.signalCache });
+
+        case "history":
+          return this.handleGetHistory(url);
+
+        case "metrics":
+          return this.handleMetrics();
+
+        case "trigger":
+          await this.alarm();
+          return this.jsonResponse({ ok: true, message: "Alarm triggered" });
+
+        case "kill":
+          if (!this.isKillSwitchAuthorized(request)) {
+            return new Response(
+              JSON.stringify({ error: "Forbidden. Requires: Authorization: Bearer <KILL_SWITCH_SECRET>" }),
+              { status: 403, headers: { "Content-Type": "application/json" } }
+            );
+          }
+          return this.handleKillSwitch();
+
+        default:
+          return new Response("Not found", { status: 404 });
+      }
+    } catch (error) {
+      return new Response(JSON.stringify({ error: String(error) }), {
+        status: 500,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+  }
+
+  private handleMetrics(): Response {
+    const now = Date.now();
+    const recentLogs = this.state.logs.slice(-100);
+    const recentErrors = recentLogs.filter((l) => l.action.includes("error") || l.action.includes("failed")).length;
+    const signals = Array.isArray(this.state.signalCache) ? this.state.signalCache.length : 0;
+    const positionEntries = this.state.positionEntries ? Object.keys(this.state.positionEntries).length : 0;
+
+    return this.jsonResponse({
+      ok: true,
+      data: {
+        enabled: this.state.enabled,
+        environment: this.env.ENVIRONMENT,
+        costs: this.state.costTracker,
+        signals,
+        position_entries: positionEntries,
+        logs_total: this.state.logs.length,
+        logs_recent_errors: recentErrors,
+        last_analyst_run_ms: this.state.lastAnalystRun ?? null,
+        last_research_run_ms: this.state.lastResearchRun ?? null,
+        now_ms: now,
+      },
+    });
+  }
+
+  private maybeRecordPortfolioSnapshot(equity: number): void {
+    const now = Date.now();
+    const minIntervalMs = 60_000;
+    if (now - this.state.lastPortfolioSnapshotAt < minIntervalMs) return;
+
+    this.state.lastPortfolioSnapshotAt = now;
+    this.state.portfolioEquityHistory.push({ timestamp_ms: now, equity });
+
+    const cutoffMs = now - 35 * 24 * 60 * 60 * 1000;
+    this.state.portfolioEquityHistory = this.state.portfolioEquityHistory
+      .filter((p) => p.timestamp_ms >= cutoffMs)
+      .slice(-5000);
+
+    this.ctx.waitUntil(this.persist());
+  }
+
+  private async handleStatus(): Promise<Response> {
+    let broker: BrokerProviders;
+    try {
+      broker = createBrokerProviders(this.env, this.state.config.broker);
+    } catch (error) {
+      this.log("System", "broker_unconfigured", { error: String(error) });
+      return this.jsonResponse({
+        ok: false,
+        error: String(error),
+        data: {
+          enabled: this.state.enabled,
+          account: null,
+          positions: [],
+          clock: null,
+          config: this.state.config,
+          signals: this.state.signalCache,
+          logs: this.state.logs.slice(-100),
+          costs: this.state.costTracker,
+          lastAnalystRun: this.state.lastAnalystRun,
+          lastResearchRun: this.state.lastResearchRun,
+          signalResearch: this.state.signalResearch,
+          positionResearch: this.state.positionResearch,
+          positionEntries: this.state.positionEntries,
+          twitterConfirmations: this.state.twitterConfirmations,
+          premarketPlan: this.state.premarketPlan,
+          stalenessAnalysis: this.state.stalenessAnalysis,
+        },
+      });
+    }
+
+    let account: Account | null = null;
+    let positions: Position[] = [];
+    let clock: MarketClock | null = null;
+
+    const cachedAuthError = this.state.lastBrokerAuthError;
+    if (cachedAuthError && Date.now() - cachedAuthError.at < 60_000) {
+      return this.jsonResponse({
+        ok: true,
+        data: {
+          enabled: this.state.enabled,
+          account,
+          positions,
+          clock,
+          config: this.state.config,
+          signals: this.state.signalCache,
+          logs: this.state.logs.slice(-100),
+          costs: this.state.costTracker,
+          lastAnalystRun: this.state.lastAnalystRun,
+          lastResearchRun: this.state.lastResearchRun,
+          signalResearch: this.state.signalResearch,
+          positionResearch: this.state.positionResearch,
+          positionEntries: this.state.positionEntries,
+          twitterConfirmations: this.state.twitterConfirmations,
+          premarketPlan: this.state.premarketPlan,
+          stalenessAnalysis: this.state.stalenessAnalysis,
+          broker_error: cachedAuthError.message,
+        },
+      });
+    }
+
+    try {
+      [account, positions, clock] = await Promise.all([
+        broker.trading.getAccount(),
+        broker.trading.getPositions(),
+        broker.trading.getClock(),
+      ]);
+      this.state.lastBrokerAuthError = undefined;
+      if (account) {
+        this.maybeRecordPortfolioSnapshot(account.equity);
+      }
+
+      for (const pos of positions || []) {
+        const entry = this.state.positionEntries[pos.symbol];
+        if (entry && entry.entry_price === 0 && pos.avg_entry_price) {
+          entry.entry_price = pos.avg_entry_price;
+          entry.peak_price = Math.max(entry.peak_price, pos.current_price);
+        }
+      }
+    } catch (error) {
+      const code = (error as { code?: string } | null)?.code;
+      if (code === ErrorCode.UNAUTHORIZED || code === ErrorCode.FORBIDDEN) {
+        this.state.lastBrokerAuthError = { at: Date.now(), message: String(error) };
+      }
+    }
+
+    return this.jsonResponse({
+      ok: true,
+      data: {
+        enabled: this.state.enabled,
+        account,
+        positions,
+        clock,
+        config: this.state.config,
+        signals: this.state.signalCache,
+        logs: this.state.logs.slice(-100),
+        costs: this.state.costTracker,
+        lastAnalystRun: this.state.lastAnalystRun,
+        lastResearchRun: this.state.lastResearchRun,
+        signalResearch: this.state.signalResearch,
+        positionResearch: this.state.positionResearch,
+        positionEntries: this.state.positionEntries,
+        twitterConfirmations: this.state.twitterConfirmations,
+        premarketPlan: this.state.premarketPlan,
+        stalenessAnalysis: this.state.stalenessAnalysis,
+      },
+    });
+  }
+
+  private async handleUpdateConfig(request: Request): Promise<Response> {
+    const body = (await request.json()) as Partial<AgentConfig>;
+    this.state.config = { ...this.state.config, ...body };
+    this.initializeLLM();
+    await this.persist();
+    return this.jsonResponse({ ok: true, config: this.state.config });
+  }
+
+  private async handleEnable(): Promise<Response> {
+    this.state.enabled = true;
+    await this.persist();
+    await this.scheduleNextAlarm();
+    this.log("System", "agent_enabled", {});
+    return this.jsonResponse({ ok: true, enabled: true });
+  }
+
+  private async handleDisable(): Promise<Response> {
+    this.state.enabled = false;
+    await this.ctx.storage.deleteAlarm();
+    await this.persist();
+    this.log("System", "agent_disabled", {});
+    return this.jsonResponse({ ok: true, enabled: false });
+  }
+
+  private handleGetLogs(url: URL): Response {
+    const limit = parseInt(url.searchParams.get("limit") || "100", 10);
+    const logs = this.state.logs.slice(-limit);
+    return this.jsonResponse({ logs });
+  }
+
+  private async handleGetHistory(url: URL): Promise<Response> {
+    let broker: BrokerProviders;
+    try {
+      broker = createBrokerProviders(this.env, this.state.config.broker);
+    } catch (error) {
+      this.log("System", "history_broker_unconfigured", { error: String(error) });
+      return this.jsonResponse({ ok: false, error: String(error) });
+    }
+    const period = url.searchParams.get("period") || "1M";
+    const timeframe = url.searchParams.get("timeframe") || "1D";
+    const intradayReporting = url.searchParams.get("intraday_reporting") as
+      | "market_hours"
+      | "extended_hours"
+      | "continuous"
+      | null;
+
+    const cachedAuthError = this.state.lastBrokerAuthError;
+    if (cachedAuthError && Date.now() - cachedAuthError.at < 60_000) {
+      return this.jsonResponse({ ok: false, error: cachedAuthError.message });
+    }
+
+    try {
+      const history = await broker.trading.getPortfolioHistory({
+        period,
+        timeframe,
+        intraday_reporting: intradayReporting || "extended_hours",
+      });
+      this.state.lastBrokerAuthError = undefined;
+
+      const hasTimeseries =
+        Array.isArray(history.timestamp) &&
+        Array.isArray(history.equity) &&
+        history.timestamp.length > 1 &&
+        history.equity.length > 1;
+
+      if (!hasTimeseries) {
+        const windowMs = periodWindowMs(period);
+        const cutoffMs = windowMs ? Date.now() - windowMs : 0;
+        const bucketMs = timeframeBucketMs(timeframe);
+        const points = downsampleEquityPoints(
+          this.state.portfolioEquityHistory.filter((p) => (cutoffMs ? p.timestamp_ms >= cutoffMs : true)),
+          bucketMs
+        );
+        const nowMs = Date.now();
+        const latestEquity = history.equity?.[history.equity.length - 1];
+        const ensuredPoints =
+          points.length > 0
+            ? points.length > 1
+              ? points
+              : [...points, { timestamp_ms: nowMs, equity: points[0]!.equity }]
+            : Number.isFinite(latestEquity)
+              ? [
+                  { timestamp_ms: nowMs - (bucketMs || 60_000), equity: latestEquity as number },
+                  { timestamp_ms: nowMs, equity: latestEquity as number },
+                ]
+              : [];
+
+        const baseValue = this.state.config.starting_equity ?? ensuredPoints[0]?.equity ?? 0;
+
+        return this.jsonResponse({
+          ok: true,
+          data: {
+            snapshots: buildPortfolioSnapshots(ensuredPoints, baseValue),
+            base_value: baseValue,
+            timeframe,
+          },
+        });
+      }
+
+      const snapshots = history.timestamp.map((ts, i) => ({
+        timestamp: ts * 1000,
+        equity: history.equity[i],
+        pl: history.profit_loss[i],
+        pl_pct: history.profit_loss_pct[i],
+      }));
+
+      return this.jsonResponse({
+        ok: true,
+        data: {
+          snapshots,
+          base_value: history.base_value,
+          timeframe: history.timeframe,
+        },
+      });
+    } catch (error) {
+      this.log("System", "history_error", { error: String(error) });
+      const code = (error as { code?: string } | null)?.code;
+      if (code === ErrorCode.UNAUTHORIZED || code === ErrorCode.FORBIDDEN) {
+        this.state.lastBrokerAuthError = { at: Date.now(), message: String(error) };
+      }
+      if (code !== ErrorCode.UNAUTHORIZED && code !== ErrorCode.FORBIDDEN) {
+        const windowMs = periodWindowMs(period);
+        const cutoffMs = windowMs ? Date.now() - windowMs : 0;
+        const bucketMs = timeframeBucketMs(timeframe);
+        const points = downsampleEquityPoints(
+          this.state.portfolioEquityHistory.filter((p) => (cutoffMs ? p.timestamp_ms >= cutoffMs : true)),
+          bucketMs
+        );
+        if (points.length > 1) {
+          const baseValue = this.state.config.starting_equity ?? points[0]?.equity ?? 0;
+          return this.jsonResponse({
+            ok: true,
+            data: {
+              snapshots: buildPortfolioSnapshots(points, baseValue),
+              base_value: baseValue,
+              timeframe,
+            },
+          });
+        }
+      }
+      return this.jsonResponse({ ok: false, error: String(error) });
+    }
+  }
+
+  private async handleKillSwitch(): Promise<Response> {
+    this.state.enabled = false;
+    await this.ctx.storage.deleteAlarm();
+    this.state.signalCache = [];
+    this.state.signalResearch = {};
+    this.state.premarketPlan = null;
+    await this.persist();
+    this.log("System", "kill_switch_activated", { timestamp: new Date().toISOString() });
+    return this.jsonResponse({
+      ok: true,
+      message: "KILL SWITCH ACTIVATED. Agent disabled, alarms cancelled, signal cache cleared.",
+      note: "Existing positions are NOT automatically closed. Review and close manually if needed.",
+    });
+  }
+
+  // ============================================================================
+  // SECTION 4: DATA GATHERING
+  // ============================================================================
+  // [CUSTOMIZABLE] This is where you add NEW DATA SOURCES.
+  //
+  // To add a new source:
+  // 1. Create a new gather method (e.g., gatherNewsAPI)
+  // 2. Add it to runDataGatherers() Promise.all
+  // 3. Add source weight to SOURCE_CONFIG.weights
+  // 4. Return Signal[] with your source name
+  //
+  // Each gatherer returns Signal[] which get merged into signalCache.
+  // ============================================================================
+
+  private async runDataGatherers(): Promise<void> {
+    this.log("System", "gathering_data", {});
+
+    await tickerCache.refreshSecTickersIfNeeded();
+
+    const [stocktwitsSignals, redditSignals, cryptoSignals, secSignals] = await Promise.all([
+      this.gatherStockTwits(),
+      this.gatherReddit(),
+      this.gatherCrypto(),
+      this.gatherSECFilings(),
+    ]);
+
+    const allSignals = [...stocktwitsSignals, ...redditSignals, ...cryptoSignals, ...secSignals];
+
+    const MAX_SIGNALS = 200;
+    const MAX_AGE_MS = 24 * 60 * 60 * 1000;
+    const now = Date.now();
+
+    const freshSignals = allSignals
+      .filter((s) => now - s.timestamp < MAX_AGE_MS)
+      .sort((a, b) => Math.abs(b.sentiment) - Math.abs(a.sentiment))
+      .slice(0, MAX_SIGNALS);
+
+    this.state.signalCache = freshSignals;
+
+    this.log("System", "data_gathered", {
+      stocktwits: stocktwitsSignals.length,
+      reddit: redditSignals.length,
+      crypto: cryptoSignals.length,
+      sec: secSignals.length,
+      total: this.state.signalCache.length,
+    });
+  }
+
+  private async gatherStockTwits(): Promise<Signal[]> {
+    const signals: Signal[] = [];
+    const sourceWeight = SOURCE_CONFIG.weights.stocktwits;
+
+    const stocktwitsHeaders = {
+      "User-Agent":
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+      Accept: "application/json",
+      "Accept-Language": "en-US,en;q=0.9",
+    };
+
+    const fetchWithRetry = async (url: string, maxRetries = 3): Promise<Response | null> => {
+      for (let i = 0; i < maxRetries; i++) {
+        try {
+          const res = await fetch(url, { headers: stocktwitsHeaders });
+          if (res.ok) return res;
+          if (res.status === 403) {
+            await this.sleep(1000 * 2 ** i);
+            continue;
+          }
+          return null;
+        } catch (error) {
+          this.log("StockTwits", "fetch_retry", { url, attempt: i + 1, error: String(error) });
+          await this.sleep(1000 * 2 ** i);
+        }
+      }
+      return null;
+    };
+
+    try {
+      const trendingRes = await fetchWithRetry("https://api.stocktwits.com/api/2/trending/symbols.json");
+      if (!trendingRes) {
+        this.log("StockTwits", "cloudflare_blocked", {
+          message: "StockTwits API blocked by Cloudflare - using Reddit only",
+        });
+        return [];
+      }
+      const trendingData = (await trendingRes.json()) as { symbols?: Array<{ symbol: string }> };
+      const trending = trendingData.symbols || [];
+
+      for (const sym of trending.slice(0, 15)) {
+        try {
+          const streamRes = await fetchWithRetry(
+            `https://api.stocktwits.com/api/2/streams/symbol/${sym.symbol}.json?limit=30`
+          );
+          if (!streamRes) continue;
+          const streamData = (await streamRes.json()) as {
+            messages?: Array<{ entities?: { sentiment?: { basic?: string } }; created_at?: string }>;
+          };
+          const messages = streamData.messages || [];
+
+          let bullish = 0,
+            bearish = 0,
+            totalTimeDecay = 0;
+          for (const msg of messages) {
+            const sentiment = msg.entities?.sentiment?.basic;
+            const msgTime = new Date(msg.created_at || Date.now()).getTime() / 1000;
+            const timeDecay = calculateTimeDecay(msgTime);
+            totalTimeDecay += timeDecay;
+
+            if (sentiment === "Bullish") bullish += timeDecay;
+            else if (sentiment === "Bearish") bearish += timeDecay;
+          }
+
+          const total = messages.length;
+          const effectiveTotal = totalTimeDecay || 1;
+          const score = effectiveTotal > 0 ? (bullish - bearish) / effectiveTotal : 0;
+          const avgFreshness = total > 0 ? totalTimeDecay / total : 0;
+
+          if (total >= 5) {
+            const weightedSentiment = score * sourceWeight * avgFreshness;
+
+            signals.push({
+              symbol: sym.symbol,
+              source: "stocktwits",
+              source_detail: "stocktwits_trending",
+              sentiment: weightedSentiment,
+              raw_sentiment: score,
+              volume: total,
+              bullish: Math.round(bullish),
+              bearish: Math.round(bearish),
+              freshness: avgFreshness,
+              source_weight: sourceWeight,
+              reason: `StockTwits: ${Math.round(bullish)}B/${Math.round(bearish)}b (${(score * 100).toFixed(0)}%) [fresh:${(avgFreshness * 100).toFixed(0)}%]`,
+              timestamp: Date.now(),
+            });
+          }
+
+          await this.sleep(200);
+        } catch (error) {
+          this.log("StockTwits", "symbol_error", { symbol: sym.symbol, error: String(error) });
+        }
+      }
+    } catch (error) {
+      this.log("StockTwits", "error", { message: String(error) });
+    }
+
+    return signals;
+  }
+
+  private async gatherReddit(): Promise<Signal[]> {
+    const subreddits = ["wallstreetbets", "stocks", "investing", "options"];
+    const tickerData = new Map<
+      string,
+      {
+        mentions: number;
+        weightedSentiment: number;
+        rawSentiment: number;
+        totalQuality: number;
+        upvotes: number;
+        comments: number;
+        sources: Set<string>;
+        bestFlair: string | null;
+        bestFlairMult: number;
+        freshestPost: number;
+      }
+    >();
+
+    for (const sub of subreddits) {
+      const sourceWeight = SOURCE_CONFIG.weights[`reddit_${sub}` as keyof typeof SOURCE_CONFIG.weights] || 0.7;
+
+      try {
+        const res = await fetch(`https://www.reddit.com/r/${sub}/hot.json?limit=25`, {
+          headers: { "User-Agent": "Owokx/2.0" },
+        });
+        if (!res.ok) continue;
+        const data = (await res.json()) as {
+          data?: {
+            children?: Array<{
+              data: {
+                title?: string;
+                selftext?: string;
+                created_utc?: number;
+                ups?: number;
+                num_comments?: number;
+                link_flair_text?: string;
+              };
+            }>;
+          };
+        };
+        const posts = data.data?.children?.map((c) => c.data) || [];
+
+        for (const post of posts) {
+          const text = `${post.title || ""} ${post.selftext || ""}`;
+          const tickers = extractTickers(text, this.state.config.ticker_blacklist);
+          const rawSentiment = detectSentiment(text);
+
+          const timeDecay = calculateTimeDecay(post.created_utc || Date.now() / 1000);
+          const engagementMult = getEngagementMultiplier(post.ups || 0, post.num_comments || 0);
+          const flairMult = getFlairMultiplier(post.link_flair_text);
+          const qualityScore = timeDecay * engagementMult * flairMult * sourceWeight;
+
+          for (const ticker of tickers) {
+            if (!tickerData.has(ticker)) {
+              tickerData.set(ticker, {
+                mentions: 0,
+                weightedSentiment: 0,
+                rawSentiment: 0,
+                totalQuality: 0,
+                upvotes: 0,
+                comments: 0,
+                sources: new Set(),
+                bestFlair: null,
+                bestFlairMult: 0,
+                freshestPost: 0,
+              });
+            }
+            const d = tickerData.get(ticker)!;
+            d.mentions++;
+            d.rawSentiment += rawSentiment;
+            d.weightedSentiment += rawSentiment * qualityScore;
+            d.totalQuality += qualityScore;
+            d.upvotes += post.ups || 0;
+            d.comments += post.num_comments || 0;
+            d.sources.add(sub);
+
+            if (flairMult > d.bestFlairMult) {
+              d.bestFlair = post.link_flair_text || null;
+              d.bestFlairMult = flairMult;
+            }
+
+            if ((post.created_utc || 0) > d.freshestPost) {
+              d.freshestPost = post.created_utc || 0;
+            }
+          }
+        }
+
+        await this.sleep(1000);
+      } catch (error) {
+        this.log("Reddit", "subreddit_error", { subreddit: sub, error: String(error) });
+      }
+    }
+
+    const signals: Signal[] = [];
+    const broker = createBrokerProviders(this.env, this.state.config.broker);
+
+    for (const [symbol, data] of tickerData) {
+      if (data.mentions >= 2) {
+        if (!tickerCache.isKnownSecTicker(symbol) && broker.broker === "alpaca") {
+          const cached = tickerCache.getCachedValidation(symbol);
+          if (cached === false) continue;
+          if (cached === undefined) {
+            const isValid = await tickerCache.validateWithBroker(symbol, broker);
+            if (!isValid) {
+              this.log("Reddit", "invalid_ticker_filtered", { symbol });
+              continue;
+            }
+          }
+        }
+
+        const avgRawSentiment = data.rawSentiment / data.mentions;
+        const avgQuality = data.totalQuality / data.mentions;
+        const finalSentiment = data.totalQuality > 0 ? data.weightedSentiment / data.mentions : avgRawSentiment * 0.5;
+        const freshness = calculateTimeDecay(data.freshestPost);
+
+        signals.push({
+          symbol,
+          source: "reddit",
+          source_detail: `reddit_${Array.from(data.sources).join("+")}`,
+          sentiment: finalSentiment,
+          raw_sentiment: avgRawSentiment,
+          volume: data.mentions,
+          upvotes: data.upvotes,
+          comments: data.comments,
+          quality_score: avgQuality,
+          freshness,
+          best_flair: data.bestFlair,
+          subreddits: Array.from(data.sources),
+          source_weight: avgQuality,
+          reason: `Reddit(${Array.from(data.sources).join(",")}): ${data.mentions} mentions, ${data.upvotes} upvotes, quality:${(avgQuality * 100).toFixed(0)}%`,
+          timestamp: Date.now(),
+        });
+      }
+    }
+
+    return signals;
+  }
+
+  private async gatherCrypto(): Promise<Signal[]> {
+    if (!this.state.config.crypto_enabled) return [];
+
+    const signals: Signal[] = [];
+    const symbols = this.state.config.crypto_symbols || ["BTC/USD", "ETH/USD", "SOL/USD"];
+    const broker = createBrokerProviders(this.env, this.state.config.broker);
+
+    for (const symbol of symbols) {
+      try {
+        const snapshot = await broker.marketData.getCryptoSnapshot(symbol);
+        if (!snapshot) continue;
+
+        const price = snapshot.latest_trade?.price || 0;
+        const prevClose = snapshot.prev_daily_bar?.c || 0;
+
+        if (!price || !prevClose) continue;
+
+        const momentum = ((price - prevClose) / prevClose) * 100;
+        const threshold = this.state.config.crypto_momentum_threshold || 2.0;
+        const hasSignificantMove = Math.abs(momentum) >= threshold;
+        const isBullish = momentum > 0;
+
+        const rawSentiment = hasSignificantMove && isBullish ? Math.min(Math.abs(momentum) / 5, 1) : 0.1;
+
+        signals.push({
+          symbol,
+          source: "crypto",
+          source_detail: "crypto_momentum",
+          sentiment: rawSentiment,
+          raw_sentiment: rawSentiment,
+          volume: snapshot.daily_bar?.v || 0,
+          freshness: 1.0,
+          source_weight: 0.8,
+          reason: `Crypto: ${momentum >= 0 ? "+" : ""}${momentum.toFixed(2)}% (24h)`,
+          bullish: isBullish ? 1 : 0,
+          bearish: isBullish ? 0 : 1,
+          isCrypto: true,
+          momentum,
+          price,
+          timestamp: Date.now(),
+        });
+
+        await this.sleep(200);
+      } catch (error) {
+        this.log("Crypto", "error", { symbol, message: String(error) });
+      }
+    }
+
+    this.log("Crypto", "gathered_signals", { count: signals.length });
+    return signals;
+  }
+
+  private async gatherSECFilings(): Promise<Signal[]> {
+    const signals: Signal[] = [];
+
+    try {
+      const response = await fetch(
+        "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=8-K&company=&dateb=&owner=include&count=40&output=atom",
+        {
+          headers: {
+            "User-Agent": "Owokx Trading Bot (contact@example.com)",
+            Accept: "application/atom+xml",
+          },
+        }
+      );
+
+      if (!response.ok) {
+        this.log("SEC", "fetch_error", { status: response.status });
+        return signals;
+      }
+
+      const text = await response.text();
+      const entries = this.parseSECAtomFeed(text);
+
+      const broker = createBrokerProviders(this.env, this.state.config.broker);
+      if (broker.broker !== "alpaca") return signals;
+
+      for (const entry of entries.slice(0, 15)) {
+        const ticker = await this.resolveTickerFromCompanyName(entry.company);
+        if (!ticker) continue;
+
+        const cached = tickerCache.getCachedValidation(ticker);
+        if (cached === false) continue;
+        if (cached === undefined) {
+          const isValid = await tickerCache.validateWithBroker(ticker, broker);
+          if (!isValid) continue;
+        }
+
+        const sourceWeight = entry.form === "8-K" ? SOURCE_CONFIG.weights.sec_8k : SOURCE_CONFIG.weights.sec_4;
+        const freshness = this.calculateSECFreshness(entry.updated);
+
+        const sentiment = entry.form === "8-K" ? 0.3 : 0.2;
+        const weightedSentiment = sentiment * sourceWeight * freshness;
+
+        signals.push({
+          symbol: ticker,
+          source: "sec_edgar",
+          source_detail: `sec_${entry.form.toLowerCase().replace("-", "")}`,
+          sentiment: weightedSentiment,
+          raw_sentiment: sentiment,
+          volume: 1,
+          freshness,
+          source_weight: sourceWeight,
+          reason: `SEC ${entry.form}: ${entry.company.slice(0, 50)}`,
+          timestamp: Date.now(),
+        });
+      }
+
+      this.log("SEC", "gathered_signals", { count: signals.length });
+    } catch (error) {
+      this.log("SEC", "error", { message: String(error) });
+    }
+
+    return signals;
+  }
+
+  private parseSECAtomFeed(xml: string): Array<{
+    id: string;
+    title: string;
+    updated: string;
+    form: string;
+    company: string;
+  }> {
+    const entries: Array<{
+      id: string;
+      title: string;
+      updated: string;
+      form: string;
+      company: string;
+    }> = [];
+
+    const entryRegex = /<entry>([\s\S]*?)<\/entry>/g;
+    let match;
+
+    while ((match = entryRegex.exec(xml)) !== null) {
+      const entryXml = match[1];
+      if (!entryXml) continue;
+
+      const id = this.extractXmlTag(entryXml, "id") || `sec_${Date.now()}_${Math.random()}`;
+      const title = this.extractXmlTag(entryXml, "title") || "";
+      const updated = this.extractXmlTag(entryXml, "updated") || new Date().toISOString();
+
+      const formMatch = title.match(/\((\d+-\w+|\w+)\)/);
+      const form = formMatch ? (formMatch[1] ?? "") : "";
+
+      const companyMatch = title.match(/^([^(]+)/);
+      const company = companyMatch ? (companyMatch[1]?.trim() ?? "") : "";
+
+      if (form && company) {
+        entries.push({ id, title, updated, form, company });
+      }
+    }
+
+    return entries;
+  }
+
+  private extractXmlTag(xml: string, tag: string): string | null {
+    const regex = new RegExp(`<${tag}[^>]*>([^<]*)</${tag}>`);
+    const match = xml.match(regex);
+    return match ? (match[1] ?? null) : null;
+  }
+
+  private companyToTickerCache: Map<string, string | null> = new Map();
+
+  private async resolveTickerFromCompanyName(companyName: string): Promise<string | null> {
+    const normalized = companyName.toUpperCase().trim();
+
+    if (this.companyToTickerCache.has(normalized)) {
+      return this.companyToTickerCache.get(normalized) ?? null;
+    }
+
+    try {
+      const response = await fetch("https://www.sec.gov/files/company_tickers.json", {
+        headers: { "User-Agent": "Owokx Trading Bot" },
+      });
+
+      if (!response.ok) return null;
+
+      const data = (await response.json()) as Record<string, { cik_str: number; ticker: string; title: string }>;
+
+      for (const entry of Object.values(data)) {
+        const entryTitle = entry.title.toUpperCase();
+        if (entryTitle === normalized || normalized.includes(entryTitle) || entryTitle.includes(normalized)) {
+          this.companyToTickerCache.set(normalized, entry.ticker);
+          return entry.ticker;
+        }
+      }
+
+      const firstWord = normalized.split(/[\s,]+/)[0];
+      for (const entry of Object.values(data)) {
+        if (entry.title.toUpperCase().startsWith(firstWord || "")) {
+          this.companyToTickerCache.set(normalized, entry.ticker);
+          return entry.ticker;
+        }
+      }
+
+      this.companyToTickerCache.set(normalized, null);
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
+  private calculateSECFreshness(updatedDate: string): number {
+    const ageMs = Date.now() - new Date(updatedDate).getTime();
+    const ageHours = ageMs / (1000 * 60 * 60);
+
+    if (ageHours < 1) return 1.0;
+    if (ageHours < 4) return 0.9;
+    if (ageHours < 12) return 0.7;
+    if (ageHours < 24) return 0.5;
+    return 0.3;
+  }
+
+  private async runCryptoTrading(broker: BrokerProviders, positions: Position[]): Promise<void> {
+    if (!this.state.config.crypto_enabled) return;
+
+    // Check circuit breaker first
+    if (this.state.lastLLMAuthError && Date.now() - this.state.lastLLMAuthError.at < 300_000) {
+      // Only log if we would have otherwise traded, or just silent skip
+      return;
+    }
+
+    const cryptoSymbols = new Set(this.state.config.crypto_symbols || []);
+    const cryptoPositions = positions.filter((p) => cryptoSymbols.has(p.symbol) || p.symbol.includes("/"));
+    const heldCrypto = new Set(cryptoPositions.map((p) => p.symbol));
+
+    for (const pos of cryptoPositions) {
+      const entry = this.state.positionEntries[pos.symbol];
+      const plPct =
+        entry?.entry_price && entry.entry_price > 0
+          ? ((pos.current_price - entry.entry_price) / entry.entry_price) * 100
+          : pos.market_value - pos.unrealized_pl > 0
+            ? (pos.unrealized_pl / (pos.market_value - pos.unrealized_pl)) * 100
+            : 0;
+
+      if (plPct >= this.state.config.crypto_take_profit_pct) {
+        this.log("Crypto", "take_profit", { symbol: pos.symbol, pnl: plPct.toFixed(2) });
+        await this.executeSell(broker, pos.symbol, `Crypto take profit at +${plPct.toFixed(1)}%`);
+        continue;
+      }
+
+      if (plPct <= -this.state.config.crypto_stop_loss_pct) {
+        this.log("Crypto", "stop_loss", { symbol: pos.symbol, pnl: plPct.toFixed(2) });
+        await this.executeSell(broker, pos.symbol, `Crypto stop loss at ${plPct.toFixed(1)}%`);
+      }
+    }
+
+    const maxCryptoPositions = Math.min(this.state.config.crypto_symbols?.length || 3, 3);
+    if (cryptoPositions.length >= maxCryptoPositions) return;
+
+    const cryptoSignals = this.state.signalCache
+      .filter((s) => s.isCrypto)
+      .filter((s) => !heldCrypto.has(s.symbol))
+      .filter((s) => s.sentiment > 0)
+      .sort((a, b) => (b.momentum || 0) - (a.momentum || 0));
+
+    for (const signal of cryptoSignals.slice(0, 2)) {
+      if (cryptoPositions.length >= maxCryptoPositions) break;
+
+      const existingResearch = this.state.signalResearch[signal.symbol];
+      const CRYPTO_RESEARCH_TTL_MS = 300_000;
+
+      let research: ResearchResult | null = existingResearch ?? null;
+      if (!existingResearch || Date.now() - existingResearch.timestamp > CRYPTO_RESEARCH_TTL_MS) {
+        research = await this.researchCrypto(signal.symbol, signal.momentum || 0, signal.sentiment);
+      }
+
+      if (!research || research.verdict !== "BUY") {
+        this.log("Crypto", "research_skip", {
+          symbol: signal.symbol,
+          verdict: research?.verdict || "NO_RESEARCH",
+          confidence: research?.confidence || 0,
+        });
+        continue;
+      }
+
+      if (research.confidence < this.state.config.min_analyst_confidence) {
+        this.log("Crypto", "low_confidence", { symbol: signal.symbol, confidence: research.confidence });
+        continue;
+      }
+
+      const account = await broker.trading.getAccount();
+      const result = await this.executeCryptoBuy(broker, signal.symbol, research.confidence, account);
+
+      if (result) {
+        heldCrypto.add(signal.symbol);
+        cryptoPositions.push({ symbol: signal.symbol } as Position);
+        break;
+      }
+    }
+  }
+
+  private async researchCrypto(symbol: string, momentum: number, sentiment: number): Promise<ResearchResult | null> {
+    if (!this._llm) {
+      this.log("Crypto", "skipped_no_llm", { symbol, reason: "LLM Provider not configured" });
+      return null;
+    }
+
+    if (this.state.lastLLMAuthError && Date.now() - this.state.lastLLMAuthError.at < 300_000) {
+      return null; // Silent skip to avoid log spam during outage
+    }
+
+    try {
+      const broker = createBrokerProviders(this.env, this.state.config.broker);
+      const snapshot = await broker.marketData.getCryptoSnapshot(symbol).catch(() => null);
+      const price = snapshot?.latest_trade?.price || 0;
+      const dailyChange = snapshot
+        ? ((snapshot.daily_bar.c - snapshot.prev_daily_bar.c) / snapshot.prev_daily_bar.c) * 100
+        : 0;
+
+      const prompt = `Should we BUY this cryptocurrency based on momentum and market conditions?
+
+SYMBOL: ${symbol}
+PRICE: $${price.toFixed(2)}
+24H CHANGE: ${dailyChange.toFixed(2)}%
+MOMENTUM SCORE: ${(momentum * 100).toFixed(0)}%
+SENTIMENT: ${(sentiment * 100).toFixed(0)}% bullish
+
+Evaluate if this is a good entry. Consider:
+- Is the momentum sustainable or a trap?
+- Any major news/events affecting this crypto?
+- Risk/reward at current price level?
+
+JSON response:
+{
+  "verdict": "BUY|SKIP|WAIT",
+  "confidence": 0.0-1.0,
+  "entry_quality": "excellent|good|fair|poor",
+  "reasoning": "brief reason",
+  "red_flags": ["any concerns"],
+  "catalysts": ["positive factors"]
+}`;
+
+      const response = await this._llm.complete({
+        model: this.state.config.llm_model, // Use config model (usually cheap one)
+        messages: [
+          {
+            role: "system",
+            content:
+              "You are a crypto analyst. Be skeptical of FOMO. Crypto is volatile - only recommend BUY for strong setups. Output valid JSON only.",
+          },
+          { role: "user", content: prompt },
+        ],
+        max_tokens: 250,
+        temperature: 0.3,
+        response_format: { type: "json_object" },
+      });
+
+      const usage = response.usage;
+      if (usage) {
+        this.trackLLMCost(this.state.config.llm_model, usage.prompt_tokens, usage.completion_tokens);
+      }
+
+      const content = response.content || "{}";
+      const analysis = JSON.parse(content.replace(/```json\n?|```/g, "").trim()) as {
+        verdict: "BUY" | "SKIP" | "WAIT";
+        confidence: number;
+        entry_quality: "excellent" | "good" | "fair" | "poor";
+        reasoning: string;
+        red_flags: string[];
+        catalysts: string[];
+      };
+
+      const result: ResearchResult = {
+        symbol,
+        verdict: analysis.verdict,
+        confidence: analysis.confidence,
+        entry_quality: analysis.entry_quality,
+        reasoning: analysis.reasoning,
+        red_flags: analysis.red_flags || [],
+        catalysts: analysis.catalysts || [],
+        timestamp: Date.now(),
+      };
+
+      this.state.signalResearch[symbol] = result;
+      this.log("Crypto", "researched", {
+        symbol,
+        verdict: result.verdict,
+        confidence: result.confidence,
+        quality: result.entry_quality,
+      });
+
+      return result;
+    } catch (error) {
+      const errorMsg = String(error);
+      if (errorMsg.includes("Authentication Fails") || errorMsg.includes("401") || errorMsg.includes("invalid api key")) {
+        this.state.lastLLMAuthError = { at: Date.now(), message: errorMsg };
+        this.log("Crypto", "auth_error", { 
+          symbol, 
+          message: "ACTION REQUIRED: Invalid LLM API Key. Research disabled for 5 minutes.",
+          details: errorMsg
+        });
+        return null;
+      }
+      this.log("Crypto", "research_error", { symbol, error: errorMsg });
+      return null;
+    }
+  }
+
+  private async executeCryptoBuy(
+    broker: BrokerProviders,
+    symbol: string,
+    confidence: number,
+    account: Account,
+    idempotencySuffix?: string
+  ): Promise<boolean> {
+    const sizePct = Math.min(20, this.state.config.position_size_pct_of_cash);
+    const positionSize = Math.min(
+      account.cash * (sizePct / 100) * confidence,
+      this.state.config.crypto_max_position_value
+    );
+
+    if (positionSize < 10) {
+      this.log("Crypto", "buy_skipped", { symbol, reason: "Position too small" });
+      return false;
+    }
+
+    try {
+      const notional = Math.round(positionSize * 100) / 100;
+      const db = createD1Client(this.env.DB);
+      const suffix = idempotencySuffix ?? String(Math.floor(Date.now() / 300_000));
+      const idempotency_key = `harness:buy:${symbol}:${suffix}`;
+      const execution = await executeOrder({
+        env: this.env,
+        db,
+        broker,
+        source: "harness",
+        idempotency_key,
+        order: {
+          symbol,
+          asset_class: "crypto",
+          side: "buy",
+          notional,
+          order_type: "market",
+          time_in_force: "gtc",
+        },
+      });
+
+      this.log("Crypto", "buy_executed", {
+        symbol,
+        size: positionSize,
+        submission_state: execution.submission.state,
+        broker_order_id: execution.broker_order_id ?? null,
+      });
+      return execution.submission.state === "SUBMITTED" || execution.submission.state === "SUBMITTING";
+    } catch (error) {
+      this.log("Crypto", "buy_failed", { symbol, error: String(error) });
+      return false;
+    }
+  }
+
+  // ============================================================================
+  // SECTION 5: TWITTER INTEGRATION
+  // ============================================================================
+  // [TOGGLE] Enable with TWITTER_BEARER_TOKEN secret
+  // [TUNE] MAX_DAILY_READS controls API budget (default: 200/day)
+  //
+  // Twitter is used for CONFIRMATION only - it boosts/reduces confidence
+  // on signals from other sources, doesn't generate signals itself.
+  // ============================================================================
+
+  private isTwitterEnabled(): boolean {
+    return !!(this.env.X_BEARER_TOKEN || this.env.TWITTER_BEARER_TOKEN);
+  }
+
+  private canSpendTwitterRead(): boolean {
+    const ONE_DAY_MS = 86400_000;
+    const MAX_DAILY_READS = 200;
+
+    const now = Date.now();
+    if (now - this.state.twitterDailyReadReset > ONE_DAY_MS) {
+      this.state.twitterDailyReads = 0;
+      this.state.twitterDailyReadReset = now;
+    }
+    return this.state.twitterDailyReads < MAX_DAILY_READS;
+  }
+
+  private spendTwitterRead(count = 1): void {
+    this.state.twitterDailyReads += count;
+    this.log("X", "read_spent", {
+      count,
+      daily_total: this.state.twitterDailyReads,
+      budget_remaining: 200 - this.state.twitterDailyReads,
+    });
+  }
+
+  private async twitterSearchRecent(
+    query: string,
+    maxResults = 10
+  ): Promise<
+    Array<{
+      id: string;
+      text: string;
+      created_at: string;
+      author: string;
+      author_followers: number;
+      retweets: number;
+      likes: number;
+    }>
+  > {
+    if (!this.isTwitterEnabled() || !this.canSpendTwitterRead()) return [];
+
+    try {
+      const params = new URLSearchParams({
+        query,
+        max_results: Math.max(10, Math.min(maxResults, 100)).toString(),
+        "tweet.fields": "created_at,public_metrics,author_id",
+        expansions: "author_id",
+        "user.fields": "username,public_metrics",
+      });
+
+      const res = await fetch(`https://api.x.com/2/tweets/search/recent?${params}`, {
+        headers: {
+          Authorization: `Bearer ${this.env.X_BEARER_TOKEN || this.env.TWITTER_BEARER_TOKEN}`,
+          "Content-Type": "application/json",
+        },
+      });
+
+      if (!res.ok) {
+        let title = "";
+        let detail = "";
+        let errors: unknown;
+        let raw = "";
+        try {
+          const body = await res.text();
+          raw = body.slice(0, 500);
+          try {
+            const parsed = JSON.parse(body);
+            title = (parsed.title as string) || "";
+            detail = (parsed.detail as string) || "";
+            errors = parsed.errors;
+          } catch {
+          }
+        } catch {
+        }
+        const rateRemaining = res.headers.get("x-rate-limit-remaining") || "";
+        const rateReset = res.headers.get("x-rate-limit-reset") || "";
+        this.log("X", "api_error", {
+          status: res.status,
+          title,
+          detail,
+          errors,
+          rate_limit_remaining: rateRemaining,
+          rate_limit_reset: rateReset,
+          body_preview: raw,
+        });
+        return [];
+      }
+
+      const data = (await res.json()) as {
+        data?: Array<{
+          id: string;
+          text: string;
+          created_at: string;
+          author_id: string;
+          public_metrics?: { retweet_count?: number; like_count?: number };
+        }>;
+        includes?: {
+          users?: Array<{
+            id: string;
+            username: string;
+            public_metrics?: { followers_count?: number };
+          }>;
+        };
+      };
+
+      this.spendTwitterRead(1);
+
+      return (data.data || []).map((tweet) => {
+        const user = data.includes?.users?.find((u) => u.id === tweet.author_id);
+        return {
+          id: tweet.id,
+          text: tweet.text,
+          created_at: tweet.created_at,
+          author: user?.username || "unknown",
+          author_followers: user?.public_metrics?.followers_count || 0,
+          retweets: tweet.public_metrics?.retweet_count || 0,
+          likes: tweet.public_metrics?.like_count || 0,
+        };
+      });
+    } catch (error) {
+      this.log("X", "error", { message: String(error) });
+      return [];
+    }
+  }
+
+  private async gatherTwitterConfirmation(
+    symbol: string,
+    existingSentiment: number
+  ): Promise<TwitterConfirmation | null> {
+    const MIN_SENTIMENT_FOR_CONFIRMATION = 0.3;
+    const CACHE_TTL_MS = 300_000;
+
+    if (!this.isTwitterEnabled() || !this.canSpendTwitterRead()) return null;
+    if (Math.abs(existingSentiment) < MIN_SENTIMENT_FOR_CONFIRMATION) return null;
+
+    const cached = this.state.twitterConfirmations[symbol];
+    if (cached && Date.now() - cached.timestamp < CACHE_TTL_MS) {
+      return cached;
+    }
+
+    const actionableKeywords = [
+      "unusual",
+      "flow",
+      "sweep",
+      "block",
+      "whale",
+      "breaking",
+      "alert",
+      "upgrade",
+      "downgrade",
+    ];
+    const query = `$${symbol} (${actionableKeywords.slice(0, 5).join(" OR ")}) -is:retweet lang:en`;
+    const tweets = await this.twitterSearchRecent(query, 10);
+
+    if (tweets.length === 0) return null;
+
+    let bullish = 0,
+      bearish = 0,
+      totalWeight = 0;
+    const highlights: Array<{ author: string; text: string; likes: number }> = [];
+
+    const bullWords = ["buy", "call", "long", "bullish", "upgrade", "beat", "squeeze", "moon", "breakout"];
+    const bearWords = ["sell", "put", "short", "bearish", "downgrade", "miss", "crash", "dump", "breakdown"];
+
+    for (const tweet of tweets) {
+      const text = tweet.text.toLowerCase();
+
+      const authorWeight = Math.min(1.5, Math.log10(tweet.author_followers + 1) / 5);
+      const engagementWeight = Math.min(1.3, 1 + (tweet.likes + tweet.retweets * 2) / 1000);
+      const weight = authorWeight * engagementWeight;
+
+      let sentiment = 0;
+      for (const w of bullWords) if (text.includes(w)) sentiment += 1;
+      for (const w of bearWords) if (text.includes(w)) sentiment -= 1;
+
+      if (sentiment > 0) bullish += weight;
+      else if (sentiment < 0) bearish += weight;
+      totalWeight += weight;
+
+      if (tweet.likes > 50 || tweet.author_followers > 10000) {
+        highlights.push({
+          author: tweet.author,
+          text: tweet.text.slice(0, 150),
+          likes: tweet.likes,
+        });
+      }
+    }
+
+    const twitterSentiment = totalWeight > 0 ? (bullish - bearish) / totalWeight : 0;
+    const twitterBullish = twitterSentiment > 0.2;
+    const twitterBearish = twitterSentiment < -0.2;
+    const existingBullish = existingSentiment > 0;
+
+    const result: TwitterConfirmation = {
+      symbol,
+      tweet_count: tweets.length,
+      sentiment: twitterSentiment,
+      confirms_existing: (twitterBullish && existingBullish) || (twitterBearish && !existingBullish),
+      highlights: highlights.slice(0, 3),
+      timestamp: Date.now(),
+    };
+
+    this.state.twitterConfirmations[symbol] = result;
+    this.log("X", "signal_confirmed", {
+      symbol,
+      sentiment: twitterSentiment.toFixed(2),
+      confirms: result.confirms_existing,
+      tweet_count: tweets.length,
+    });
+
+    return result;
+  }
+
+  private async checkTwitterBreakingNews(symbols: string[]): Promise<
+    Array<{
+      symbol: string;
+      headline: string;
+      author: string;
+      age_minutes: number;
+      is_breaking: boolean;
+    }>
+  > {
+    if (!this.isTwitterEnabled() || !this.canSpendTwitterRead() || symbols.length === 0) return [];
+
+    const toCheck = symbols.slice(0, 3);
+    const newsQuery = `(from:FirstSquawk OR from:DeItaone OR from:Newsquawk) (${toCheck.map((s) => `$${s}`).join(" OR ")}) -is:retweet`;
+    const tweets = await this.twitterSearchRecent(newsQuery, 5);
+
+    const results: Array<{
+      symbol: string;
+      headline: string;
+      author: string;
+      age_minutes: number;
+      is_breaking: boolean;
+    }> = [];
+
+    const MAX_NEWS_AGE_MS = 1800_000;
+    const BREAKING_THRESHOLD_MS = 600_000;
+
+    for (const tweet of tweets) {
+      const tweetAge = Date.now() - new Date(tweet.created_at).getTime();
+      if (tweetAge > MAX_NEWS_AGE_MS) continue;
+
+      const mentionedSymbol = toCheck.find(
+        (s) => tweet.text.toUpperCase().includes(`$${s}`) || tweet.text.toUpperCase().includes(` ${s} `)
+      );
+
+      if (mentionedSymbol) {
+        results.push({
+          symbol: mentionedSymbol,
+          headline: tweet.text.slice(0, 200),
+          author: tweet.author,
+          age_minutes: Math.round(tweetAge / 60000),
+          is_breaking: tweetAge < BREAKING_THRESHOLD_MS,
+        });
+      }
+    }
+
+    if (results.length > 0) {
+      this.log("X", "breaking_news_found", {
+        count: results.length,
+        symbols: results.map((r) => r.symbol),
+      });
+    }
+
+    return results;
+  }
+
+  // ============================================================================
+  // SECTION 6: LLM RESEARCH
+  // ============================================================================
+  // [CUSTOMIZABLE] Modify prompts to change how the AI analyzes signals.
+  //
+  // Key methods:
+  // - researchSignal(): Evaluates individual symbols (BUY/SKIP/WAIT)
+  // - researchPosition(): Analyzes held positions (HOLD/SELL/ADD)
+  // - analyzeSignalsWithLLM(): Batch analysis for trading decisions
+  //
+  // [TUNE] Change llm_model and llm_analyst_model in config for cost/quality
+  // ============================================================================
+
+  private async researchSignal(
+    symbol: string,
+    sentimentScore: number,
+    sources: string[]
+  ): Promise<ResearchResult | null> {
+    if (!this._llm) {
+      this.log("SignalResearch", "skipped_no_llm", { symbol, reason: "LLM Provider not configured" });
+      return null;
+    }
+
+    if (this.state.lastLLMAuthError && Date.now() - this.state.lastLLMAuthError.at < 300_000) {
+      return null; // Silent skip
+    }
+
+    const cached = this.state.signalResearch[symbol];
+    const CACHE_TTL_MS = 180_000;
+    if (cached && Date.now() - cached.timestamp < CACHE_TTL_MS) {
+      return cached;
+    }
+
+    try {
+      const broker = createBrokerProviders(this.env, this.state.config.broker);
+      const isCrypto = isCryptoSymbol(symbol, this.state.config.crypto_symbols || []);
+      let price = 0;
+      if (isCrypto) {
+        const normalized = normalizeCryptoSymbol(symbol);
+        const snapshot = await broker.marketData.getCryptoSnapshot(normalized).catch(() => null);
+        price =
+          snapshot?.latest_trade?.price || snapshot?.latest_quote?.ask_price || snapshot?.latest_quote?.bid_price || 0;
+      } else {
+        const snapshot = await broker.marketData.getSnapshot(symbol).catch(() => null);
+        price =
+          snapshot?.latest_trade?.price || snapshot?.latest_quote?.ask_price || snapshot?.latest_quote?.bid_price || 0;
+      }
+
+      const prompt = `Should we BUY this ${isCrypto ? "crypto" : "stock"} based on social sentiment and fundamentals?
+
+SYMBOL: ${symbol}
+SENTIMENT: ${(sentimentScore * 100).toFixed(0)}% bullish (sources: ${sources.join(", ")})
+
+CURRENT DATA:
+- Price: $${price}
+
+Evaluate if this is a good entry. Consider: Is the sentiment justified? Is it too late (already pumped)? Any red flags?
+
+JSON response:
+{
+  "verdict": "BUY|SKIP|WAIT",
+  "confidence": 0.0-1.0,
+  "entry_quality": "excellent|good|fair|poor",
+  "reasoning": "brief reason",
+  "red_flags": ["any concerns"],
+  "catalysts": ["positive factors"]
+}`;
+
+      const response = await this._llm.complete({
+        model: this.state.config.llm_model,
+        messages: [
+          {
+            role: "system",
+            content: "You are a stock research analyst. Be skeptical of hype. Output valid JSON only.",
+          },
+          { role: "user", content: prompt },
+        ],
+        max_tokens: 250,
+        temperature: 0.3,
+        response_format: { type: "json_object" },
+      });
+
+      const usage = response.usage;
+      if (usage) {
+        this.trackLLMCost(this.state.config.llm_model, usage.prompt_tokens, usage.completion_tokens);
+      }
+
+      const content = response.content || "{}";
+      const analysis = JSON.parse(content.replace(/```json\n?|```/g, "").trim()) as {
+        verdict: "BUY" | "SKIP" | "WAIT";
+        confidence: number;
+        entry_quality: "excellent" | "good" | "fair" | "poor";
+        reasoning: string;
+        red_flags: string[];
+        catalysts: string[];
+      };
+
+      const result: ResearchResult = {
+        symbol,
+        verdict: analysis.verdict,
+        confidence: analysis.confidence,
+        entry_quality: analysis.entry_quality,
+        reasoning: analysis.reasoning,
+        red_flags: analysis.red_flags || [],
+        catalysts: analysis.catalysts || [],
+        timestamp: Date.now(),
+      };
+
+      this.state.signalResearch[symbol] = result;
+      this.log("SignalResearch", "signal_researched", {
+        symbol,
+        verdict: result.verdict,
+        confidence: result.confidence,
+        quality: result.entry_quality,
+      });
+
+      if (result.verdict === "BUY") {
+        await this.sendDiscordNotification("research", {
+          symbol: result.symbol,
+          verdict: result.verdict,
+          confidence: result.confidence,
+          quality: result.entry_quality,
+          sentiment: sentimentScore,
+          sources,
+          reasoning: result.reasoning,
+          catalysts: result.catalysts,
+          red_flags: result.red_flags,
+        });
+      }
+
+      return result;
+    } catch (error) {
+      const errorMsg = String(error);
+      if (errorMsg.includes("Authentication Fails") || errorMsg.includes("401") || errorMsg.includes("invalid api key")) {
+        this.state.lastLLMAuthError = { at: Date.now(), message: errorMsg };
+        this.log("SignalResearch", "auth_error", { 
+          symbol, 
+          message: "ACTION REQUIRED: Invalid LLM API Key. Research disabled for 5 minutes.",
+          details: errorMsg
+        });
+        return null;
+      }
+      this.log("SignalResearch", "error", { symbol, message: errorMsg });
+      return null;
+    }
+  }
+
+  private async researchTopSignals(limit = 5): Promise<ResearchResult[]> {
+    if (this.state.lastLLMAuthError && Date.now() - this.state.lastLLMAuthError.at < 300_000) {
+      this.log("SignalResearch", "research_skipped_circuit_breaker", {
+        reason: "Recent auth error",
+        time_remaining_ms: 300_000 - (Date.now() - this.state.lastLLMAuthError.at),
+      });
+      return [];
+    }
+
+    const broker = createBrokerProviders(this.env, this.state.config.broker);
+    const positions = await broker.trading.getPositions();
+    const heldSymbols = new Set(positions.map((p) => p.symbol));
+    for (const sym of Object.keys(this.state.positionEntries)) {
+      heldSymbols.add(sym);
+    }
+
+    const allSignals = this.state.signalCache;
+    const notHeld = allSignals.filter((s) => !heldSymbols.has(s.symbol));
+    // Use raw_sentiment for threshold (before weighting), weighted sentiment for sorting
+    const aboveThreshold = notHeld.filter((s) => s.raw_sentiment >= this.state.config.min_sentiment_score);
+    const candidates = aboveThreshold.sort((a, b) => b.sentiment - a.sentiment).slice(0, limit);
+
+    if (candidates.length === 0) {
+      this.log("SignalResearch", "no_candidates", {
+        total_signals: allSignals.length,
+        not_held: notHeld.length,
+        above_threshold: aboveThreshold.length,
+        min_sentiment: this.state.config.min_sentiment_score,
+      });
+      return [];
+    }
+
+    this.log("SignalResearch", "researching_signals", { count: candidates.length });
+
+    const aggregated = new Map<string, { symbol: string; sentiment: number; sources: string[] }>();
+    for (const sig of candidates) {
+      if (!aggregated.has(sig.symbol)) {
+        aggregated.set(sig.symbol, { symbol: sig.symbol, sentiment: sig.sentiment, sources: [sig.source] });
+      } else {
+        aggregated.get(sig.symbol)!.sources.push(sig.source);
+      }
+    }
+
+    const results: ResearchResult[] = [];
+    for (const [symbol, data] of aggregated) {
+      const analysis = await this.researchSignal(symbol, data.sentiment, data.sources);
+      if (analysis) {
+        results.push(analysis);
+      }
+      await this.sleep(500);
+    }
+
+    return results;
+  }
+
+  private async researchPosition(
+    symbol: string,
+    position: Position
+  ): Promise<{
+    recommendation: "SELL" | "HOLD" | "ADD";
+    risk_level: "low" | "medium" | "high";
+    reasoning: string;
+    key_factors: string[];
+  } | null> {
+    if (!this._llm) return null;
+
+    const plPct = (position.unrealized_pl / (position.market_value - position.unrealized_pl)) * 100;
+
+    const prompt = `Analyze this position for risk and opportunity:
+
+POSITION: ${symbol}
+- Shares: ${position.qty}
+- Market Value: $${position.market_value.toFixed(2)}
+- P&L: $${position.unrealized_pl.toFixed(2)} (${plPct.toFixed(1)}%)
+- Current Price: $${position.current_price}
+
+Provide a brief risk assessment and recommendation (HOLD, SELL, or ADD). JSON format:
+{
+  "recommendation": "HOLD|SELL|ADD",
+  "risk_level": "low|medium|high",
+  "reasoning": "brief reason",
+  "key_factors": ["factor1", "factor2"]
+}`;
+
+    try {
+      const response = await this._llm.complete({
+        model: this.state.config.llm_model,
+        messages: [
+          { role: "system", content: "You are a position risk analyst. Be concise. Output valid JSON only." },
+          { role: "user", content: prompt },
+        ],
+        max_tokens: 200,
+        temperature: 0.3,
+        response_format: { type: "json_object" },
+      });
+
+      const usage = response.usage;
+      if (usage) {
+        this.trackLLMCost(this.state.config.llm_model, usage.prompt_tokens, usage.completion_tokens);
+      }
+
+      const content = response.content || "{}";
+      const analysis = JSON.parse(content.replace(/```json\n?|```/g, "").trim()) as {
+        recommendation: "HOLD" | "SELL" | "ADD";
+        risk_level: "low" | "medium" | "high";
+        reasoning: string;
+        key_factors: string[];
+      };
+
+      this.state.positionResearch[symbol] = { ...analysis, timestamp: Date.now() };
+      this.log("PositionResearch", "position_analyzed", {
+        symbol,
+        recommendation: analysis.recommendation,
+        risk: analysis.risk_level,
+      });
+
+      return analysis;
+    } catch (error) {
+      this.log("PositionResearch", "error", { symbol, message: String(error) });
+      return null;
+    }
+  }
+
+  private async analyzeSignalsWithLLM(
+    signals: Signal[],
+    positions: Position[],
+    account: Account
+  ): Promise<{
+    decision_id: string | null;
+    recommendations: Array<{
+      action: "BUY" | "SELL" | "HOLD";
+      symbol: string;
+      confidence: number;
+      reasoning: string;
+      suggested_size_pct?: number;
+    }>;
+    market_summary: string;
+    high_conviction: string[];
+  }> {
+    if (!this._llm || signals.length === 0) {
+      return { decision_id: null, recommendations: [], market_summary: "No signals to analyze", high_conviction: [] };
+    }
+
+    const aggregated = new Map<string, { symbol: string; sources: string[]; totalSentiment: number; count: number }>();
+    for (const sig of signals) {
+      if (!aggregated.has(sig.symbol)) {
+        aggregated.set(sig.symbol, { symbol: sig.symbol, sources: [], totalSentiment: 0, count: 0 });
+      }
+      const agg = aggregated.get(sig.symbol)!;
+      agg.sources.push(sig.source);
+      agg.totalSentiment += sig.sentiment;
+      agg.count++;
+    }
+
+    const candidates = Array.from(aggregated.values())
+      .map((a) => ({ ...a, avgSentiment: a.totalSentiment / a.count }))
+      .filter((a) => a.avgSentiment >= this.state.config.min_sentiment_score * 0.5)
+      .sort((a, b) => b.avgSentiment - a.avgSentiment)
+      .slice(0, 10);
+
+    if (candidates.length === 0) {
+      return {
+        decision_id: null,
+        recommendations: [],
+        market_summary: "No candidates above threshold",
+        high_conviction: [],
+      };
+    }
+
+    const positionSymbols = new Set(positions.map((p) => p.symbol));
+    const prompt = `Current Time: ${new Date().toISOString()}
+
+ACCOUNT STATUS:
+- Equity: $${account.equity.toFixed(2)}
+- Cash: $${account.cash.toFixed(2)}
+- Current Positions: ${positions.length}/${this.state.config.max_positions}
+
+CURRENT POSITIONS:
+${
+  positions.length === 0
+    ? "None"
+    : positions
+        .map((p) => {
+          const entry = this.state.positionEntries[p.symbol];
+          const holdMinutes = entry ? Math.round((Date.now() - entry.entry_time) / (1000 * 60)) : 0;
+          const holdStr = holdMinutes >= 60 ? `${(holdMinutes / 60).toFixed(1)}h` : `${holdMinutes}m`;
+          return `- ${p.symbol}: ${p.qty} shares, P&L: $${p.unrealized_pl.toFixed(2)} (${((p.unrealized_pl / (p.market_value - p.unrealized_pl)) * 100).toFixed(1)}%), held ${holdStr}`;
+        })
+        .join("\n")
+}
+
+TOP SENTIMENT CANDIDATES:
+${candidates
+  .map(
+    (c) =>
+      `- ${c.symbol}: avg sentiment ${(c.avgSentiment * 100).toFixed(0)}%, sources: ${c.sources.join(", ")}, ${positionSymbols.has(c.symbol) ? "[CURRENTLY HELD]" : "[NOT HELD]"}`
+  )
+  .join("\n")}
+
+RAW SIGNALS (top 20):
+${signals
+  .slice(0, 20)
+  .map((s) => `- ${s.symbol} (${s.source}): ${s.reason}`)
+  .join("\n")}
+
+TRADING RULES:
+- Max position size: $${this.state.config.max_position_value}
+- Take profit target: ${this.state.config.take_profit_pct}%
+- Stop loss: ${this.state.config.stop_loss_pct}%
+- Min confidence to trade: ${this.state.config.min_analyst_confidence}
+- Min hold time before selling: ${this.state.config.llm_min_hold_minutes ?? 30} minutes
+
+Analyze and provide BUY/SELL/HOLD recommendations:`;
+
+    try {
+      const temperature = 0;
+      const response = await this._llm.complete({
+        model: this.state.config.llm_analyst_model,
+        messages: [
+          {
+            role: "system",
+            content: `You are a senior trading analyst AI. Make the FINAL trading decisions based on social sentiment signals.
+
+Rules:
+- Only recommend BUY for symbols with strong conviction from multiple data points
+- Recommend SELL only for positions that have been held long enough AND show deteriorating sentiment or major red flags
+- Give positions time to develop - avoid selling too early just because gains are small
+- Positions held less than 1-2 hours should generally be given more time unless hitting stop loss
+- Consider the QUALITY of sentiment, not just quantity
+- Output valid JSON only
+
+Response format:
+{
+  "recommendations": [
+    { "action": "BUY"|"SELL"|"HOLD", "symbol": "TICKER", "confidence": 0.0-1.0, "reasoning": "detailed reasoning", "suggested_size_pct": 10-30 }
+  ],
+  "market_summary": "overall market read and sentiment",
+  "high_conviction_plays": ["symbols you feel strongest about"]
+}`,
+          },
+          { role: "user", content: prompt },
+        ],
+        max_tokens: 800,
+        temperature,
+        response_format: { type: "json_object" },
+      });
+
+      const usage = response.usage;
+      if (usage) {
+        this.trackLLMCost(this.state.config.llm_analyst_model, usage.prompt_tokens, usage.completion_tokens);
+      }
+
+      const content = response.content || "{}";
+      const analysis = JSON.parse(content.replace(/```json\n?|```/g, "").trim()) as {
+        recommendations: Array<{
+          action: "BUY" | "SELL" | "HOLD";
+          symbol: string;
+          confidence: number;
+          reasoning: string;
+          suggested_size_pct?: number;
+        }>;
+        market_summary: string;
+        high_conviction_plays?: string[];
+      };
+
+      this.log("Analyst", "analysis_complete", {
+        candidates: candidates.length,
+        recommendations: analysis.recommendations?.length || 0,
+      });
+
+      let decisionId: string | null = null;
+      try {
+        const db = createD1Client(this.env.DB);
+        decisionId = await createDecision(db, {
+          source: "harness",
+          kind: "signal_batch_analysis",
+          model: this.state.config.llm_analyst_model,
+          temperature,
+          input: {
+            now: new Date().toISOString(),
+            broker: this.state.config.broker,
+            account: { equity: account.equity, cash: account.cash },
+            positions: positions.map((p) => ({
+              symbol: p.symbol,
+              qty: p.qty,
+              market_value: p.market_value,
+              unrealized_pl: p.unrealized_pl,
+            })),
+            candidates,
+            signals: signals.slice(0, 20).map((s) => ({
+              symbol: s.symbol,
+              source: s.source,
+              sentiment: s.sentiment,
+              volume: s.volume,
+              reason: s.reason,
+            })),
+            rules: {
+              max_position_value: this.state.config.max_position_value,
+              take_profit_pct: this.state.config.take_profit_pct,
+              stop_loss_pct: this.state.config.stop_loss_pct,
+              min_analyst_confidence: this.state.config.min_analyst_confidence,
+              llm_min_hold_minutes: this.state.config.llm_min_hold_minutes ?? 30,
+            },
+          },
+          output: {
+            recommendations: analysis.recommendations || [],
+            market_summary: analysis.market_summary || "",
+            high_conviction_plays: analysis.high_conviction_plays || [],
+          },
+        });
+      } catch (error) {
+        this.log("Analyst", "decision_persist_failed", { message: String(error) });
+      }
+
+      return {
+        decision_id: decisionId,
+        recommendations: analysis.recommendations || [],
+        market_summary: analysis.market_summary || "",
+        high_conviction: analysis.high_conviction_plays || [],
+      };
+    } catch (error) {
+      this.log("Analyst", "error", { message: String(error) });
+      return {
+        decision_id: null,
+        recommendations: [],
+        market_summary: `Analysis failed: ${error}`,
+        high_conviction: [],
+      };
+    }
+  }
+
+  // ============================================================================
+  // SECTION 7: ANALYST & TRADING LOGIC
+  // ============================================================================
+  // [CUSTOMIZABLE] Core trading decision logic lives here.
+  //
+  // runAnalyst(): Main trading loop - checks exits, then looks for entries
+  // executeBuy(): Position sizing and order execution
+  // executeSell(): Closes positions with reason logging
+  //
+  // [TUNE] Position sizing formula in executeBuy()
+  // [TUNE] Entry/exit conditions in runAnalyst()
+  // ============================================================================
+
+  private async runAnalyst(): Promise<void> {
+    const broker = createBrokerProviders(this.env, this.state.config.broker);
+
+    const [account, positions, clock] = await Promise.all([
+      broker.trading.getAccount(),
+      broker.trading.getPositions(),
+      broker.trading.getClock(),
+    ]);
+
+    if (!account || !clock.is_open) {
+      this.log("System", "analyst_skipped", { reason: "Account unavailable or market closed" });
+      return;
+    }
+
+    const heldSymbols = new Set(positions.map((p) => p.symbol));
+
+    // Check position exits
+    for (const pos of positions) {
+      if (pos.asset_class === "us_option") continue; // Options handled separately
+      if (isCryptoSymbol(pos.symbol, this.state.config.crypto_symbols || [])) continue;
+
+      const plPct = (pos.unrealized_pl / (pos.market_value - pos.unrealized_pl)) * 100;
+
+      // Take profit
+      if (plPct >= this.state.config.take_profit_pct) {
+        await this.executeSell(broker, pos.symbol, `Take profit at +${plPct.toFixed(1)}%`);
+        continue;
+      }
+
+      // Stop loss
+      if (plPct <= -this.state.config.stop_loss_pct) {
+        await this.executeSell(broker, pos.symbol, `Stop loss at ${plPct.toFixed(1)}%`);
+        continue;
+      }
+
+      // Check staleness
+      if (this.state.config.stale_position_enabled) {
+        const stalenessResult = this.analyzeStaleness(pos.symbol, pos.current_price, 0);
+        this.state.stalenessAnalysis[pos.symbol] = stalenessResult;
+
+        if (stalenessResult.isStale) {
+          await this.executeSell(broker, pos.symbol, `STALE: ${stalenessResult.reason}`);
+        }
+      }
+    }
+
+    if (positions.length < this.state.config.max_positions && this.state.signalCache.length > 0) {
+      const researchedBuys = Object.values(this.state.signalResearch)
+        .filter((r) => r.verdict === "BUY" && r.confidence >= this.state.config.min_analyst_confidence)
+        .filter((r) => !heldSymbols.has(r.symbol))
+        .sort((a, b) => b.confidence - a.confidence);
+
+      for (const research of researchedBuys.slice(0, 3)) {
+        if (positions.length >= this.state.config.max_positions) break;
+        if (heldSymbols.has(research.symbol)) continue;
+
+        const originalSignal = this.state.signalCache.find((s) => s.symbol === research.symbol);
+        let finalConfidence = research.confidence;
+
+        if (this.isTwitterEnabled() && originalSignal) {
+          const twitterConfirm = await this.gatherTwitterConfirmation(research.symbol, originalSignal.sentiment);
+          if (twitterConfirm?.confirms_existing) {
+            finalConfidence = Math.min(1.0, finalConfidence * 1.15);
+            this.log("System", "twitter_boost", { symbol: research.symbol, new_confidence: finalConfidence });
+          } else if (twitterConfirm && !twitterConfirm.confirms_existing && twitterConfirm.sentiment !== 0) {
+            finalConfidence = finalConfidence * 0.85;
+          }
+        }
+
+        if (finalConfidence < this.state.config.min_analyst_confidence) continue;
+
+        const shouldUseOptions =
+          this.isOptionsEnabled() &&
+          finalConfidence >= this.state.config.options_min_confidence &&
+          research.entry_quality === "excellent";
+
+        if (shouldUseOptions) {
+          const contract = await this.findBestOptionsContract(research.symbol, "bullish", account.equity);
+          if (contract) {
+            const optionsResult = await this.executeOptionsOrder(contract, 1, account.equity);
+            if (optionsResult) {
+              this.log("System", "options_position_opened", { symbol: research.symbol, contract: contract.symbol });
+            }
+          }
+        }
+
+        const result = await this.executeBuy(broker, research.symbol, finalConfidence, account);
+        if (result) {
+          heldSymbols.add(research.symbol);
+          this.state.positionEntries[research.symbol] = {
+            symbol: research.symbol,
+            entry_time: Date.now(),
+            entry_price: 0,
+            entry_sentiment: originalSignal?.sentiment || finalConfidence,
+            entry_social_volume: originalSignal?.volume || 0,
+            entry_sources: originalSignal?.subreddits || [originalSignal?.source || "research"],
+            entry_reason: research.reasoning,
+            peak_price: 0,
+            peak_sentiment: originalSignal?.sentiment || finalConfidence,
+          };
+        }
+      }
+
+      const analysis = await this.analyzeSignalsWithLLM(this.state.signalCache, positions, account);
+      const decisionId = analysis.decision_id ?? undefined;
+      const researchedSymbols = new Set(researchedBuys.map((r) => r.symbol));
+
+      for (const rec of analysis.recommendations) {
+        if (rec.confidence < this.state.config.min_analyst_confidence) continue;
+
+        if (rec.action === "SELL" && heldSymbols.has(rec.symbol)) {
+          const entry = this.state.positionEntries[rec.symbol];
+          const holdMinutes = entry ? (Date.now() - entry.entry_time) / (1000 * 60) : 0;
+          const minHoldMinutes = this.state.config.llm_min_hold_minutes ?? 30;
+
+          if (holdMinutes < minHoldMinutes) {
+            this.log("Analyst", "llm_sell_blocked", {
+              symbol: rec.symbol,
+              holdMinutes: Math.round(holdMinutes),
+              minRequired: minHoldMinutes,
+              reason: "Position held less than minimum hold time",
+            });
+            continue;
+          }
+
+          const result = await this.executeSell(broker, rec.symbol, `LLM recommendation: ${rec.reasoning}`, decisionId);
+          if (result) {
+            heldSymbols.delete(rec.symbol);
+            this.log("Analyst", "llm_sell_executed", {
+              symbol: rec.symbol,
+              confidence: rec.confidence,
+              reasoning: rec.reasoning,
+            });
+          }
+          continue;
+        }
+
+        if (rec.action === "BUY") {
+          if (positions.length >= this.state.config.max_positions) continue;
+          if (heldSymbols.has(rec.symbol)) continue;
+          if (researchedSymbols.has(rec.symbol)) continue;
+
+          const result = await this.executeBuy(broker, rec.symbol, rec.confidence, account, decisionId);
+          if (result) {
+            const originalSignal = this.state.signalCache.find((s) => s.symbol === rec.symbol);
+            heldSymbols.add(rec.symbol);
+            this.state.positionEntries[rec.symbol] = {
+              symbol: rec.symbol,
+              entry_time: Date.now(),
+              entry_price: 0,
+              entry_sentiment: originalSignal?.sentiment || rec.confidence,
+              entry_social_volume: originalSignal?.volume || 0,
+              entry_sources: originalSignal?.subreddits || [originalSignal?.source || "analyst"],
+              entry_reason: rec.reasoning,
+              peak_price: 0,
+              peak_sentiment: originalSignal?.sentiment || rec.confidence,
+            };
+          }
+        }
+      }
+    }
+  }
+
+  private async executeBuy(
+    broker: BrokerProviders,
+    symbol: string,
+    confidence: number,
+    account: Account,
+    idempotencySuffix?: string
+  ): Promise<boolean> {
+    if (!symbol || symbol.trim().length === 0) {
+      this.log("Executor", "buy_blocked", { reason: "INVARIANT: Empty symbol" });
+      return false;
+    }
+
+    if (account.cash <= 0) {
+      this.log("Executor", "buy_blocked", { symbol, reason: "INVARIANT: No cash available", cash: account.cash });
+      return false;
+    }
+
+    if (confidence <= 0 || confidence > 1 || !Number.isFinite(confidence)) {
+      this.log("Executor", "buy_blocked", { symbol, reason: "INVARIANT: Invalid confidence", confidence });
+      return false;
+    }
+
+    const sizePct = Math.min(20, this.state.config.position_size_pct_of_cash);
+    const positionSize = Math.min(account.cash * (sizePct / 100) * confidence, this.state.config.max_position_value);
+
+    if (positionSize < 100) {
+      this.log("Executor", "buy_skipped", { symbol, reason: "Position too small" });
+      return false;
+    }
+
+    const maxAllowed = this.state.config.max_position_value * 1.01;
+    if (positionSize <= 0 || positionSize > maxAllowed || !Number.isFinite(positionSize)) {
+      this.log("Executor", "buy_blocked", {
+        symbol,
+        reason: "INVARIANT: Invalid position size",
+        positionSize,
+        maxAllowed,
+      });
+      return false;
+    }
+
+    try {
+      const isCrypto = isCryptoSymbol(symbol, this.state.config.crypto_symbols || []);
+      const orderSymbol = isCrypto ? normalizeCryptoSymbol(symbol) : symbol;
+      const timeInForce = isCrypto ? "gtc" : "day";
+
+      if (!isCrypto) {
+        const allowedExchanges = this.state.config.allowed_exchanges ?? ["NYSE", "NASDAQ", "ARCA", "AMEX", "BATS"];
+        if (allowedExchanges.length > 0) {
+          const asset = await broker.trading.getAsset(symbol);
+          if (!asset) {
+            this.log("Executor", "buy_blocked", { symbol, reason: "Asset not found" });
+            return false;
+          }
+          if (!allowedExchanges.includes(asset.exchange)) {
+            this.log("Executor", "buy_blocked", {
+              symbol,
+              reason: "Exchange not allowed (OTC/foreign stocks have data issues)",
+              exchange: asset.exchange,
+              allowedExchanges,
+            });
+            return false;
+          }
+        }
+      }
+
+      const notional = Math.round(positionSize * 100) / 100;
+      const db = createD1Client(this.env.DB);
+      const suffix = idempotencySuffix ?? String(Math.floor(Date.now() / 300_000));
+      const idempotency_key = `harness:buy:${orderSymbol}:${suffix}`;
+      const execution = await executeOrder({
+        env: this.env,
+        db,
+        broker,
+        source: "harness",
+        idempotency_key,
+        order: {
+          symbol: orderSymbol,
+          asset_class: isCrypto ? "crypto" : "us_equity",
+          side: "buy",
+          notional,
+          order_type: "market",
+          time_in_force: timeInForce,
+        },
+      });
+
+      this.log("Executor", "buy_executed", {
+        symbol: orderSymbol,
+        isCrypto,
+        size: positionSize,
+        submission_state: execution.submission.state,
+        broker_order_id: execution.broker_order_id ?? null,
+      });
+      return execution.submission.state === "SUBMITTED" || execution.submission.state === "SUBMITTING";
+    } catch (error) {
+      this.log("Executor", "buy_failed", { symbol, error: String(error) });
+      return false;
+    }
+  }
+
+  private async executeSell(
+    broker: BrokerProviders,
+    symbol: string,
+    reason: string,
+    idempotencySuffix?: string
+  ): Promise<boolean> {
+    if (!symbol || symbol.trim().length === 0) {
+      this.log("Executor", "sell_blocked", { reason: "INVARIANT: Empty symbol" });
+      return false;
+    }
+
+    if (!reason || reason.trim().length === 0) {
+      this.log("Executor", "sell_blocked", { symbol, reason: "INVARIANT: No sell reason provided" });
+      return false;
+    }
+
+    try {
+      const pos = await broker.trading.getPosition(symbol);
+      if (!pos) {
+        this.log("Executor", "sell_skipped", { symbol, reason: "Position not found" });
+        return false;
+      }
+
+      const isCrypto = isCryptoSymbol(pos.symbol, this.state.config.crypto_symbols || []) || pos.symbol.includes("/");
+      const timeInForce = isCrypto ? "gtc" : "day";
+
+      const entry = this.state.positionEntries[pos.symbol];
+      const db = createD1Client(this.env.DB);
+      const suffix = idempotencySuffix ?? String(entry?.entry_time ?? Math.floor(Date.now() / 300_000));
+      const idempotency_key = `harness:sell:${pos.symbol}:${suffix}`;
+
+      const execution = await executeOrder({
+        env: this.env,
+        db,
+        broker,
+        source: "harness",
+        idempotency_key,
+        order: {
+          symbol: pos.symbol,
+          asset_class: isCrypto ? "crypto" : "us_equity",
+          side: "sell",
+          qty: pos.qty,
+          order_type: "market",
+          time_in_force: timeInForce,
+        },
+      });
+
+      this.log("Executor", "sell_executed", {
+        symbol: pos.symbol,
+        reason,
+        submission_state: execution.submission.state,
+        broker_order_id: execution.broker_order_id ?? null,
+      });
+
+      if (execution.submission.state === "SUBMITTED") {
+        delete this.state.positionEntries[pos.symbol];
+        delete this.state.socialHistory[pos.symbol];
+        delete this.state.stalenessAnalysis[pos.symbol];
+      }
+
+      return execution.submission.state === "SUBMITTED" || execution.submission.state === "SUBMITTING";
+    } catch (error) {
+      this.log("Executor", "sell_failed", { symbol, error: String(error) });
+      return false;
+    }
+  }
+
+  // ============================================================================
+  // SECTION 8: STALENESS DETECTION
+  // ============================================================================
+  // [TOGGLE] Enable with stale_position_enabled in config
+  // [TUNE] Staleness thresholds (hold time, volume decay, gain requirements)
+  //
+  // Staleness = positions that lost momentum. Scored 0-100 based on:
+  // - Time held (vs max hold days)
+  // - Price action (P&L vs targets)
+  // - Social volume decay (vs entry volume)
+  // ============================================================================
+
+  private analyzeStaleness(
+    symbol: string,
+    currentPrice: number,
+    currentSocialVolume: number
+  ): {
+    isStale: boolean;
+    reason: string;
+    staleness_score: number;
+  } {
+    const entry = this.state.positionEntries[symbol];
+    if (!entry) {
+      return { isStale: false, reason: "No entry data", staleness_score: 0 };
+    }
+
+    const holdHours = (Date.now() - entry.entry_time) / (1000 * 60 * 60);
+    const holdDays = holdHours / 24;
+    const pnlPct = entry.entry_price > 0 ? ((currentPrice - entry.entry_price) / entry.entry_price) * 100 : 0;
+
+    if (holdHours < this.state.config.stale_min_hold_hours) {
+      return { isStale: false, reason: `Too early (${holdHours.toFixed(1)}h)`, staleness_score: 0 };
+    }
+
+    let stalenessScore = 0;
+
+    // Time-based (max 40 points)
+    if (holdDays >= this.state.config.stale_max_hold_days) {
+      stalenessScore += 40;
+    } else if (holdDays >= this.state.config.stale_mid_hold_days) {
+      stalenessScore +=
+        (20 * (holdDays - this.state.config.stale_mid_hold_days)) /
+        (this.state.config.stale_max_hold_days - this.state.config.stale_mid_hold_days);
+    }
+
+    // Price action (max 30 points)
+    if (pnlPct < 0) {
+      stalenessScore += Math.min(30, Math.abs(pnlPct) * 3);
+    } else if (pnlPct < this.state.config.stale_mid_min_gain_pct && holdDays >= this.state.config.stale_mid_hold_days) {
+      stalenessScore += 15;
+    }
+
+    // Social volume decay (max 30 points)
+    const volumeRatio = entry.entry_social_volume > 0 ? currentSocialVolume / entry.entry_social_volume : 1;
+    if (volumeRatio <= this.state.config.stale_social_volume_decay) {
+      stalenessScore += 30;
+    } else if (volumeRatio <= 0.5) {
+      stalenessScore += 15;
+    }
+
+    stalenessScore = Math.min(100, stalenessScore);
+
+    const isStale =
+      stalenessScore >= 70 ||
+      (holdDays >= this.state.config.stale_max_hold_days && pnlPct < this.state.config.stale_min_gain_pct);
+
+    return {
+      isStale,
+      reason: isStale
+        ? `Staleness score ${stalenessScore}/100, held ${holdDays.toFixed(1)} days`
+        : `OK (score ${stalenessScore}/100)`,
+      staleness_score: stalenessScore,
+    };
+  }
+
+  // ============================================================================
+  // SECTION 9: OPTIONS TRADING
+  // ============================================================================
+  // [TOGGLE] Enable with options_enabled in config
+  // [TUNE] Delta, DTE, and position size limits in config
+  //
+  // Options are used for HIGH CONVICTION plays only (confidence >= 0.8).
+  // Finds ATM/ITM calls for bullish signals, puts for bearish.
+  // Wider stop-loss (50%) and higher take-profit (100%) than stocks.
+  // ============================================================================
+
+  private isOptionsEnabled(): boolean {
+    if (this.state.config.options_enabled !== true) return false;
+    const broker = createBrokerProviders(this.env, this.state.config.broker);
+    return broker.options.isConfigured();
+  }
+
+  private async findBestOptionsContract(
+    symbol: string,
+    direction: "bullish" | "bearish",
+    equity: number
+  ): Promise<{
+    symbol: string;
+    strike: number;
+    expiration: string;
+    delta: number;
+    mid_price: number;
+    max_contracts: number;
+  } | null> {
+    if (!this.isOptionsEnabled()) return null;
+
+    try {
+      const broker = createBrokerProviders(this.env, this.state.config.broker);
+      const expirations = await broker.options.getExpirations(symbol);
+
+      if (!expirations || expirations.length === 0) {
+        this.log("Options", "no_expirations", { symbol });
+        return null;
+      }
+
+      const today = new Date();
+      const validExpirations = expirations.filter((exp) => {
+        const expDate = new Date(exp);
+        const dte = Math.ceil((expDate.getTime() - today.getTime()) / (1000 * 60 * 60 * 24));
+        return dte >= this.state.config.options_min_dte && dte <= this.state.config.options_max_dte;
+      });
+
+      if (validExpirations.length === 0) {
+        this.log("Options", "no_valid_expirations", { symbol });
+        return null;
+      }
+
+      const targetDTE = (this.state.config.options_min_dte + this.state.config.options_max_dte) / 2;
+      const bestExpiration = validExpirations.reduce((best: string, exp: string) => {
+        const expDate = new Date(exp);
+        const dte = Math.ceil((expDate.getTime() - today.getTime()) / (1000 * 60 * 60 * 24));
+        const currentBestDte = Math.ceil((new Date(best).getTime() - today.getTime()) / (1000 * 60 * 60 * 24));
+        return Math.abs(dte - targetDTE) < Math.abs(currentBestDte - targetDTE) ? exp : best;
+      }, validExpirations[0]!);
+
+      const chain = await broker.options.getChain(symbol, bestExpiration);
+      if (!chain) {
+        this.log("Options", "chain_failed", { symbol, expiration: bestExpiration });
+        return null;
+      }
+
+      const contracts = direction === "bullish" ? chain.calls : chain.puts;
+      if (!contracts || contracts.length === 0) {
+        this.log("Options", "no_contracts", { symbol, direction });
+        return null;
+      }
+
+      const snapshot = await broker.marketData.getSnapshot(symbol).catch(() => null);
+      const stockPrice =
+        snapshot?.latest_trade?.price || snapshot?.latest_quote?.ask_price || snapshot?.latest_quote?.bid_price || 0;
+      if (stockPrice === 0) return null;
+
+      const targetStrike =
+        direction === "bullish"
+          ? stockPrice * (1 - (this.state.config.options_target_delta - 0.5) * 0.2)
+          : stockPrice * (1 + (this.state.config.options_target_delta - 0.5) * 0.2);
+
+      const sortedContracts = contracts
+        .filter((c) => c.strike > 0)
+        .sort((a, b) => Math.abs(a.strike - targetStrike) - Math.abs(b.strike - targetStrike));
+
+      for (const contract of sortedContracts.slice(0, 5)) {
+        const snapshot = await broker.options.getSnapshot(contract.symbol);
+        if (!snapshot) continue;
+
+        const delta = snapshot.greeks?.delta;
+        const absDelta = delta !== undefined ? Math.abs(delta) : null;
+
+        if (
+          absDelta === null ||
+          absDelta < this.state.config.options_min_delta ||
+          absDelta > this.state.config.options_max_delta
+        ) {
+          continue;
+        }
+
+        const bid = snapshot.latest_quote?.bid_price || 0;
+        const ask = snapshot.latest_quote?.ask_price || 0;
+        if (bid === 0 || ask === 0) continue;
+
+        const spread = (ask - bid) / ask;
+        if (spread > 0.1) continue;
+
+        const midPrice = (bid + ask) / 2;
+        const maxCost = equity * this.state.config.options_max_pct_per_trade;
+        const maxContracts = Math.floor(maxCost / (midPrice * 100));
+
+        if (maxContracts < 1) continue;
+
+        this.log("Options", "contract_selected", {
+          symbol,
+          contract: contract.symbol,
+          strike: contract.strike,
+          expiration: bestExpiration,
+          delta: delta?.toFixed(3),
+          mid_price: midPrice.toFixed(2),
+        });
+
+        return {
+          symbol: contract.symbol,
+          strike: contract.strike,
+          expiration: bestExpiration,
+          delta: delta!,
+          mid_price: midPrice,
+          max_contracts: maxContracts,
+        };
+      }
+
+      return null;
+    } catch (error) {
+      this.log("Options", "error", { symbol, message: String(error) });
+      return null;
+    }
+  }
+
+  private async executeOptionsOrder(
+    contract: { symbol: string; mid_price: number },
+    quantity: number,
+    equity: number
+  ): Promise<boolean> {
+    if (!this.isOptionsEnabled()) return false;
+
+    const totalCost = contract.mid_price * quantity * 100;
+    const maxAllowed = equity * this.state.config.options_max_pct_per_trade;
+
+    if (totalCost > maxAllowed) {
+      quantity = Math.floor(maxAllowed / (contract.mid_price * 100));
+      if (quantity < 1) {
+        this.log("Options", "skipped_size", { contract: contract.symbol, cost: totalCost, max: maxAllowed });
+        return false;
+      }
+    }
+
+    try {
+      const broker = createBrokerProviders(this.env, this.state.config.broker);
+      const order = await broker.trading.createOrder({
+        symbol: contract.symbol,
+        qty: quantity,
+        side: "buy",
+        type: "limit",
+        limit_price: Math.round(contract.mid_price * 100) / 100,
+        time_in_force: "day",
+      });
+
+      this.log("Options", "options_buy_executed", {
+        contract: contract.symbol,
+        qty: quantity,
+        status: order.status,
+        estimated_cost: (contract.mid_price * quantity * 100).toFixed(2),
+      });
+
+      return true;
+    } catch (error) {
+      this.log("Options", "options_buy_failed", { contract: contract.symbol, error: String(error) });
+      return false;
+    }
+  }
+
+  private async checkOptionsExits(positions: Position[]): Promise<
+    Array<{
+      symbol: string;
+      reason: string;
+      type: string;
+      pnl_pct: number;
+    }>
+  > {
+    if (!this.isOptionsEnabled()) return [];
+
+    const exits: Array<{ symbol: string; reason: string; type: string; pnl_pct: number }> = [];
+    const optionsPositions = positions.filter((p) => p.asset_class === "us_option");
+
+    for (const pos of optionsPositions) {
+      const entryPrice = pos.avg_entry_price || pos.current_price;
+      const plPct = entryPrice > 0 ? ((pos.current_price - entryPrice) / entryPrice) * 100 : 0;
+
+      if (plPct <= -this.state.config.options_stop_loss_pct) {
+        exits.push({
+          symbol: pos.symbol,
+          reason: `Options stop loss at ${plPct.toFixed(1)}%`,
+          type: "stop_loss",
+          pnl_pct: plPct,
+        });
+        continue;
+      }
+
+      if (plPct >= this.state.config.options_take_profit_pct) {
+        exits.push({
+          symbol: pos.symbol,
+          reason: `Options take profit at +${plPct.toFixed(1)}%`,
+          type: "take_profit",
+          pnl_pct: plPct,
+        });
+      }
+    }
+
+    return exits;
+  }
+
+  // ============================================================================
+  // SECTION 10: PRE-MARKET ANALYSIS
+  // ============================================================================
+  // Runs 9:25-9:29 AM ET to prepare a trading plan before market open.
+  // Executes the plan at 9:30-9:32 AM when market opens.
+  //
+  // [TUNE] Change time windows in isPreMarketWindow() / isMarketJustOpened()
+  // [TUNE] Plan staleness (PLAN_STALE_MS) in executePremarketPlan()
+  // ============================================================================
+
+  private nyTimeParts(clockTimestamp: string): { weekday: number; hour: number; minute: number } | null {
+    const date = new Date(clockTimestamp);
+    if (!Number.isFinite(date.getTime())) return null;
+
+    const parts = new Intl.DateTimeFormat("en-US", {
+      timeZone: "America/New_York",
+      weekday: "short",
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: false,
+    }).formatToParts(date);
+
+    const weekdayText = parts.find((p) => p.type === "weekday")?.value;
+    const hourText = parts.find((p) => p.type === "hour")?.value;
+    const minuteText = parts.find((p) => p.type === "minute")?.value;
+
+    const weekdayMap: Record<string, number> = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
+    const weekday = weekdayText ? weekdayMap[weekdayText] : undefined;
+    const hour = hourText ? Number.parseInt(hourText, 10) : NaN;
+    const minute = minuteText ? Number.parseInt(minuteText, 10) : NaN;
+
+    if (weekday === undefined || !Number.isFinite(hour) || !Number.isFinite(minute)) return null;
+    return { weekday, hour, minute };
+  }
+
+  private isPreMarketWindow(broker: string, clock: MarketClock): boolean {
+    if (broker !== "alpaca") return false;
+    const parts = this.nyTimeParts(clock.timestamp);
+    if (!parts) return false;
+    if (parts.weekday < 1 || parts.weekday > 5) return false;
+    return parts.hour === 9 && parts.minute >= 25 && parts.minute <= 29;
+  }
+
+  private isMarketJustOpened(broker: string, clock: MarketClock): boolean {
+    if (broker !== "alpaca") return false;
+    const parts = this.nyTimeParts(clock.timestamp);
+    if (!parts) return false;
+    if (parts.weekday < 1 || parts.weekday > 5) return false;
+    return parts.hour === 9 && parts.minute >= 30 && parts.minute <= 32;
+  }
+
+  private async runPreMarketAnalysis(): Promise<void> {
+    const broker = createBrokerProviders(this.env, this.state.config.broker);
+    if (broker.broker !== "alpaca") return;
+    const [account, positions] = await Promise.all([broker.trading.getAccount(), broker.trading.getPositions()]);
+
+    if (!account || this.state.signalCache.length === 0) return;
+
+    this.log("System", "premarket_analysis_starting", {
+      signals: this.state.signalCache.length,
+      researched: Object.keys(this.state.signalResearch).length,
+    });
+
+    const signalResearch = await this.researchTopSignals(10);
+    const analysis = await this.analyzeSignalsWithLLM(this.state.signalCache, positions, account);
+
+    this.state.premarketPlan = {
+      timestamp: Date.now(),
+      recommendations: analysis.recommendations.map((r) => ({
+        action: r.action,
+        symbol: r.symbol,
+        confidence: r.confidence,
+        reasoning: r.reasoning,
+        suggested_size_pct: r.suggested_size_pct,
+      })),
+      market_summary: analysis.market_summary,
+      high_conviction: analysis.high_conviction,
+      researched_buys: signalResearch.filter((r) => r.verdict === "BUY"),
+    };
+
+    const buyRecs = this.state.premarketPlan.recommendations.filter((r) => r.action === "BUY").length;
+    const sellRecs = this.state.premarketPlan.recommendations.filter((r) => r.action === "SELL").length;
+
+    this.log("System", "premarket_analysis_complete", {
+      buy_recommendations: buyRecs,
+      sell_recommendations: sellRecs,
+      high_conviction: this.state.premarketPlan.high_conviction,
+    });
+  }
+
+  private async executePremarketPlan(): Promise<void> {
+    const PLAN_STALE_MS = 600_000;
+
+    if (!this.state.premarketPlan || Date.now() - this.state.premarketPlan.timestamp > PLAN_STALE_MS) {
+      this.log("System", "no_premarket_plan", { reason: "Plan missing or stale" });
+      return;
+    }
+
+    const broker = createBrokerProviders(this.env, this.state.config.broker);
+    if (broker.broker !== "alpaca") return;
+    const [account, positions] = await Promise.all([broker.trading.getAccount(), broker.trading.getPositions()]);
+
+    if (!account) return;
+
+    const heldSymbols = new Set(positions.map((p) => p.symbol));
+
+    this.log("System", "executing_premarket_plan", {
+      recommendations: this.state.premarketPlan.recommendations.length,
+    });
+
+    const idempotencySuffix = `premarket:${this.state.premarketPlan.timestamp}`;
+
+    for (const rec of this.state.premarketPlan.recommendations) {
+      if (rec.action === "SELL" && rec.confidence >= this.state.config.min_analyst_confidence) {
+        await this.executeSell(broker, rec.symbol, `Pre-market plan: ${rec.reasoning}`, idempotencySuffix);
+      }
+    }
+
+    for (const rec of this.state.premarketPlan.recommendations) {
+      if (rec.action === "BUY" && rec.confidence >= this.state.config.min_analyst_confidence) {
+        if (heldSymbols.has(rec.symbol)) continue;
+        if (positions.length >= this.state.config.max_positions) break;
+
+        const result = await this.executeBuy(broker, rec.symbol, rec.confidence, account, idempotencySuffix);
+        if (result) {
+          heldSymbols.add(rec.symbol);
+
+          const originalSignal = this.state.signalCache.find((s) => s.symbol === rec.symbol);
+          this.state.positionEntries[rec.symbol] = {
+            symbol: rec.symbol,
+            entry_time: Date.now(),
+            entry_price: 0,
+            entry_sentiment: originalSignal?.sentiment || 0,
+            entry_social_volume: originalSignal?.volume || 0,
+            entry_sources: originalSignal?.subreddits || [originalSignal?.source || "premarket"],
+            entry_reason: rec.reasoning,
+            peak_price: 0,
+            peak_sentiment: originalSignal?.sentiment || 0,
+          };
+        }
+      }
+    }
+
+    this.state.premarketPlan = null;
+  }
+
+  // ============================================================================
+  // SECTION 11: UTILITIES
+  // ============================================================================
+  // Logging, cost tracking, persistence, and Discord notifications.
+  // Generally don't need to modify unless adding new notification channels.
+  // ============================================================================
+
+  private log(agent: string, action: string, details: Record<string, unknown>): void {
+    const entry: LogEntry = {
+      timestamp: new Date().toISOString(),
+      agent,
+      action,
+      ...details,
+    };
+    this.state.logs.push(entry);
+
+    // Keep last 500 logs
+    if (this.state.logs.length > 500) {
+      this.state.logs = this.state.logs.slice(-500);
+    }
+
+    // Log to console for wrangler tail
+    console.log(`[${entry.timestamp}] [${agent}] ${action}`, JSON.stringify(details));
+  }
+
+  public trackLLMCost(model: string, tokensIn: number, tokensOut: number): number {
+    const pricing: Record<string, { input: number; output: number }> = {
+      "gpt-4o": { input: 2.5, output: 10 },
+      "gpt-4o-mini": { input: 0.15, output: 0.6 },
+    };
+
+    const rates = pricing[model] ?? pricing["gpt-4o"]!;
+    const cost = (tokensIn * rates.input + tokensOut * rates.output) / 1_000_000;
+
+    this.state.costTracker.total_usd += cost;
+    this.state.costTracker.calls++;
+    this.state.costTracker.tokens_in += tokensIn;
+    this.state.costTracker.tokens_out += tokensOut;
+
+    return cost;
+  }
+
+  private async persist(): Promise<void> {
+    await this.ctx.storage.put("state", this.state);
+  }
+
+  private jsonResponse(data: unknown): Response {
+    return new Response(JSON.stringify(data, null, 2), {
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
+  private sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  get llm(): LLMProvider | null {
+    return this._llm;
+  }
+
+  private discordCooldowns: Map<string, number> = new Map();
+  private readonly DISCORD_COOLDOWN_MS = 30 * 60 * 1000;
+
+  private async sendDiscordNotification(
+    type: "signal" | "research",
+    data: {
+      symbol: string;
+      sentiment?: number;
+      sources?: string[];
+      verdict?: string;
+      confidence?: number;
+      quality?: string;
+      reasoning?: string;
+      catalysts?: string[];
+      red_flags?: string[];
+    }
+  ): Promise<void> {
+    if (!this.env.DISCORD_WEBHOOK_URL) return;
+
+    const cacheKey = data.symbol;
+    const lastNotification = this.discordCooldowns.get(cacheKey);
+    if (lastNotification && Date.now() - lastNotification < this.DISCORD_COOLDOWN_MS) {
+      return;
+    }
+
+    try {
+      let embed: {
+        title: string;
+        color: number;
+        fields: Array<{ name: string; value: string; inline: boolean }>;
+        description?: string;
+        timestamp: string;
+        footer: { text: string };
+      };
+
+      if (type === "signal") {
+        embed = {
+          title: `🔔 SIGNAL: $${data.symbol}`,
+          color: 0xfbbf24,
+          fields: [
+            { name: "Sentiment", value: `${((data.sentiment || 0) * 100).toFixed(0)}% bullish`, inline: true },
+            { name: "Sources", value: data.sources?.join(", ") || "StockTwits", inline: true },
+          ],
+          description: "High sentiment detected, researching...",
+          timestamp: new Date().toISOString(),
+          footer: { text: "Owokx • Not financial advice • DYOR" },
+        };
+      } else {
+        const verdictEmoji = data.verdict === "BUY" ? "✅" : data.verdict === "SKIP" ? "⏭️" : "⏸️";
+        const color = data.verdict === "BUY" ? 0x22c55e : data.verdict === "SKIP" ? 0x6b7280 : 0xfbbf24;
+
+        embed = {
+          title: `${verdictEmoji} $${data.symbol} → ${data.verdict}`,
+          color,
+          fields: [
+            { name: "Confidence", value: `${((data.confidence || 0) * 100).toFixed(0)}%`, inline: true },
+            { name: "Quality", value: data.quality || "N/A", inline: true },
+            { name: "Sentiment", value: `${((data.sentiment || 0) * 100).toFixed(0)}%`, inline: true },
+          ],
+          timestamp: new Date().toISOString(),
+          footer: { text: "Owokx • Not financial advice • DYOR" },
+        };
+
+        if (data.reasoning) {
+          embed.description = data.reasoning.substring(0, 300) + (data.reasoning.length > 300 ? "..." : "");
+        }
+
+        if (data.catalysts && data.catalysts.length > 0) {
+          embed.fields.push({ name: "Catalysts", value: data.catalysts.slice(0, 3).join(", "), inline: false });
+        }
+
+        if (data.red_flags && data.red_flags.length > 0) {
+          embed.fields.push({ name: "⚠️ Red Flags", value: data.red_flags.slice(0, 3).join(", "), inline: false });
+        }
+      }
+
+      await fetch(this.env.DISCORD_WEBHOOK_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ embeds: [embed] }),
+      });
+
+      this.discordCooldowns.set(cacheKey, Date.now());
+      this.log("Discord", "notification_sent", { type, symbol: data.symbol });
+    } catch (err) {
+      this.log("Discord", "notification_failed", { error: String(err) });
+    }
+  }
+}
+
+// ============================================================================
+// SECTION 12: EXPORTS & HELPERS
+// ============================================================================
+// Helper functions to interact with the DO from your worker.
+// ============================================================================
+
+export function getHarnessStub(env: Env): DurableObjectStub {
+  if (!env.OWOKX_HARNESS) {
+    throw new Error("OWOKX_HARNESS binding not configured - check wrangler.toml");
+  }
+  const id = env.OWOKX_HARNESS.idFromName("main");
+  return env.OWOKX_HARNESS.get(id);
+}
+
+export async function getHarnessStatus(env: Env): Promise<unknown> {
+  const stub = getHarnessStub(env);
+  const response = await stub.fetch(new Request("http://harness/status"));
+  return response.json();
+}
+
+export async function enableHarness(env: Env): Promise<void> {
+  const stub = getHarnessStub(env);
+  await stub.fetch(new Request("http://harness/enable"));
+}
+
+export async function disableHarness(env: Env): Promise<void> {
+  const stub = getHarnessStub(env);
+  await stub.fetch(new Request("http://harness/disable"));
+}

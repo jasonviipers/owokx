@@ -1,0 +1,55 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: owokx-dashboard-green
+  labels:
+    app: owokx-dashboard
+    track: green
+spec:
+  replicas: 2
+  revisionHistoryLimit: 10
+  selector:
+    matchLabels:
+      app: owokx-dashboard
+      track: green
+  template:
+    metadata:
+      labels:
+        app: owokx-dashboard
+        track: green
+    spec:
+      containers:
+        - name: dashboard
+          image: ghcr.io/example/owokx-dashboard:latest
+          env:
+            - name: OWOKX_API_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: owokx-dashboard-config
+                  key: OWOKX_API_URL
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi

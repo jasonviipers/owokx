@@ -1,0 +1,277 @@
+import type { Env } from "../env.d";
+import { getDefaultPolicyConfig } from "../policy/config";
+import { createBrokerProviders } from "../providers/broker-factory";
+import { createSECEdgarProvider } from "../providers/news/sec-edgar";
+import { createD1Client } from "../storage/d1/client";
+import { cleanupExpiredApprovals } from "../storage/d1/queries/approvals";
+import { insertRawEvent, rawEventExists } from "../storage/d1/queries/events";
+import { getSubmittedOrderSubmissionsMissingTrades } from "../storage/d1/queries/order-submissions";
+import { getPolicyConfig } from "../storage/d1/queries/policy-config";
+import { getRiskState, resetDailyLoss, setDailyLossAbsolute } from "../storage/d1/queries/risk-state";
+import { createTrade, updateTradeStatus } from "../storage/d1/queries/trades";
+
+export async function handleCronEvent(cronId: string, env: Env): Promise<void> {
+  switch (cronId) {
+    case "*/5 13-20 * * 1-5":
+      await runEventIngestion(env);
+      break;
+
+    case "0 14 * * 1-5":
+      await runMarketOpenPrep(env);
+      break;
+
+    case "30 21 * * 1-5":
+      await runMarketCloseCleanup(env);
+      break;
+
+    case "0 5 * * *":
+      await runMidnightReset(env);
+      break;
+
+    case "0 * * * *":
+      await runHourlyCacheRefresh(env);
+      break;
+
+    default:
+      console.log(`Unknown cron: ${cronId}`);
+  }
+}
+
+async function runEventIngestion(env: Env): Promise<void> {
+  console.log("Starting event ingestion...");
+
+  const db = createD1Client(env.DB);
+  const broker = createBrokerProviders(env);
+
+  try {
+    const clock = await broker.trading.getClock();
+
+    if (!clock.is_open) {
+      console.log("Market closed, skipping event ingestion");
+      return;
+    }
+
+    const riskState = await getRiskState(db);
+    if (riskState.kill_switch_active) {
+      console.log("Kill switch active, skipping event ingestion");
+      return;
+    }
+
+    const secProvider = createSECEdgarProvider();
+    const events = await secProvider.poll();
+
+    let newEvents = 0;
+    for (const event of events) {
+      const exists = await rawEventExists(db, event.source, event.source_id);
+      if (!exists) {
+        await insertRawEvent(db, {
+          source: event.source,
+          source_id: event.source_id,
+          raw_content: event.content,
+        });
+        newEvents++;
+      }
+    }
+
+    console.log(`Event ingestion complete: ${newEvents} new events`);
+  } catch (error) {
+    console.error("Event ingestion error:", error);
+  }
+}
+
+async function runMarketOpenPrep(env: Env): Promise<void> {
+  console.log("Running market open prep...");
+
+  const db = createD1Client(env.DB);
+
+  try {
+    const riskState = await getRiskState(db);
+    console.log(
+      `Risk state at open: kill_switch=${riskState.kill_switch_active}, daily_loss=${riskState.daily_loss_usd}`
+    );
+
+    const cleaned = await cleanupExpiredApprovals(db);
+    console.log(`Cleaned up ${cleaned} expired approvals`);
+  } catch (error) {
+    console.error("Market open prep error:", error);
+  }
+}
+
+async function runMarketCloseCleanup(env: Env): Promise<void> {
+  console.log("Running market close cleanup...");
+
+  const db = createD1Client(env.DB);
+  const broker = createBrokerProviders(env);
+
+  try {
+    const positions = await broker.trading.getPositions();
+    const account = await broker.trading.getAccount();
+
+    console.log(`End of day: ${positions.length} positions, equity=${account.equity}`);
+
+    const cleaned = await cleanupExpiredApprovals(db);
+    console.log(`Cleaned up ${cleaned} expired approvals`);
+  } catch (error) {
+    console.error("Market close cleanup error:", error);
+  }
+}
+
+async function runMidnightReset(env: Env): Promise<void> {
+  console.log("Running midnight reset...");
+
+  const db = createD1Client(env.DB);
+  let equityStartUsd: number | null = null;
+
+  try {
+    try {
+      const broker = createBrokerProviders(env);
+      const account = await broker.trading.getAccount();
+      equityStartUsd = Number.isFinite(account.equity) ? account.equity : null;
+    } catch {
+      equityStartUsd = null;
+    }
+
+    await resetDailyLoss(db, { equityStartUsd });
+    console.log("Daily loss counter reset", { equityStartUsd });
+
+    const cleaned = await cleanupExpiredApprovals(db);
+    console.log(`Cleaned up ${cleaned} expired approvals`);
+  } catch (error) {
+    console.error("Midnight reset error:", error);
+  }
+}
+
+function nyDateString(d: Date): string {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/New_York",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(d);
+}
+
+async function runHourlyCacheRefresh(env: Env): Promise<void> {
+  console.log("Running hourly cache refresh...");
+  const db = createD1Client(env.DB);
+
+  let broker: ReturnType<typeof createBrokerProviders>;
+  try {
+    broker = createBrokerProviders(env);
+  } catch (error) {
+    console.error("Hourly refresh: broker init failed:", error);
+    return;
+  }
+
+  try {
+    const [riskState, account, policyConfigStored] = await Promise.all([
+      getRiskState(db),
+      broker.trading.getAccount(),
+      getPolicyConfig(db),
+    ]);
+    const policyConfig = policyConfigStored ?? getDefaultPolicyConfig(env);
+
+    const now = new Date();
+    const nowNy = nyDateString(now);
+    const resetNy = riskState.daily_loss_reset_at ? nyDateString(new Date(riskState.daily_loss_reset_at)) : null;
+    if (resetNy !== nowNy) {
+      await resetDailyLoss(db, { equityStartUsd: account.equity });
+    }
+
+    let dailyLossUsd = 0;
+    if (broker.broker === "alpaca") {
+      try {
+        const history = await broker.trading.getPortfolioHistory({
+          period: "1D",
+          timeframe: "1Min",
+          pnl_reset: "per_day",
+        });
+        const last = history.profit_loss[history.profit_loss.length - 1] ?? 0;
+        dailyLossUsd = Math.max(0, -last);
+      } catch {
+        const baseline = riskState.daily_equity_start ?? account.equity;
+        dailyLossUsd = Math.max(0, baseline - account.equity);
+      }
+    } else {
+      const baseline = riskState.daily_equity_start ?? account.equity;
+      dailyLossUsd = Math.max(0, baseline - account.equity);
+    }
+
+    const shouldUpdate = Math.abs((riskState.daily_loss_usd ?? 0) - dailyLossUsd) > 0.01;
+    if (shouldUpdate) {
+      const isNewLossEvent = dailyLossUsd > (riskState.daily_loss_usd ?? 0) + 0.01 && dailyLossUsd > 0;
+      const cooldownMinutes = policyConfig.cooldown_minutes_after_loss ?? 0;
+
+      if (isNewLossEvent && cooldownMinutes > 0) {
+        const cooldownUntil = new Date(Date.now() + cooldownMinutes * 60_000).toISOString();
+        await setDailyLossAbsolute(db, dailyLossUsd, {
+          last_loss_at: now.toISOString(),
+          cooldown_until: cooldownUntil,
+        });
+      } else {
+        await setDailyLossAbsolute(db, dailyLossUsd);
+      }
+    }
+
+    const missingTrades = await getSubmittedOrderSubmissionsMissingTrades(db, 100);
+    if (missingTrades.length > 0) {
+      const brokers = new Map<string, ReturnType<typeof createBrokerProviders>>();
+
+      for (const sub of missingTrades) {
+        const brokerId = sub.broker_provider;
+        const orderId = sub.broker_order_id;
+        if (!brokerId || !orderId) continue;
+
+        let brokerForRow = brokers.get(brokerId);
+        if (!brokerForRow) {
+          try {
+            brokerForRow = createBrokerProviders(env, brokerId);
+            brokers.set(brokerId, brokerForRow);
+          } catch {
+            continue;
+          }
+        }
+
+        let order;
+        try {
+          order = await brokerForRow.trading.getOrder(orderId);
+        } catch {
+          continue;
+        }
+
+        let requested: { order?: { notional?: number; qty?: number; asset_class?: string } } | null = null;
+        try {
+          requested = JSON.parse(sub.request_json) as {
+            order?: { notional?: number; qty?: number; asset_class?: string };
+          };
+        } catch {
+          requested = null;
+        }
+
+        const tradeId = await createTrade(db, {
+          approval_id: sub.approval_id ?? undefined,
+          alpaca_order_id: order.id,
+          submission_id: sub.id,
+          broker_provider: brokerId,
+          broker_order_id: order.id,
+          symbol: order.symbol,
+          side: order.side,
+          qty: order.qty ? parseFloat(order.qty) : undefined,
+          notional: requested?.order?.notional,
+          asset_class: requested?.order?.asset_class ?? order.asset_class,
+          quote_ccy:
+            (requested?.order?.asset_class ?? order.asset_class) === "crypto" ? env.OKX_DEFAULT_QUOTE_CCY : undefined,
+          order_type: order.type,
+          limit_price: order.limit_price ? parseFloat(order.limit_price) : undefined,
+          stop_price: order.stop_price ? parseFloat(order.stop_price) : undefined,
+          status: order.status,
+        });
+
+        const filledQty = order.filled_qty ? parseFloat(order.filled_qty) : undefined;
+        const filledAvgPrice = order.filled_avg_price ? parseFloat(order.filled_avg_price) : undefined;
+        await updateTradeStatus(db, tradeId, order.status, filledQty, filledAvgPrice);
+      }
+    }
+  } catch (error) {
+    console.error("Hourly refresh error:", error);
+  }
+}

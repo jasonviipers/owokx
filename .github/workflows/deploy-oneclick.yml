@@ -1,0 +1,287 @@
+name: Deploy (One-Click)
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Deployment environment
+        type: choice
+        required: true
+        options: [staging, production]
+      components:
+        description: Components to deploy
+        type: choice
+        required: true
+        default: all
+        options: [all, worker, dashboard]
+
+permissions:
+  contents: read
+  deployments: write
+  packages: write
+
+concurrency:
+  group: deploy-${{ github.ref }}-${{ inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    steps:
+      - name: Create GitHub deployment record
+        id: gh_deploy
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const env = core.getInput('environment') || '${{ inputs.environment }}';
+            const res = await github.rest.repos.createDeployment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: context.sha,
+              environment: env,
+              required_contexts: [],
+              auto_merge: false,
+              transient_environment: env !== 'production',
+              production_environment: env === 'production',
+              description: `One-click deploy (${env})`,
+            });
+            core.setOutput('deployment_id', String(res.data.id));
+
+      - name: Mark deployment in progress
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const deployment_id = Number('${{ steps.gh_deploy.outputs.deployment_id }}');
+            await github.rest.repos.createDeploymentStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              deployment_id,
+              state: 'in_progress',
+              description: 'Deployment started',
+            });
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run typecheck, tests, and lint
+        run: |
+          npm run typecheck
+          npm run test:run
+          npm run check
+
+      - name: Capture current Worker deployment version
+        id: worker_prev
+        if: inputs.components == 'all' || inputs.components == 'worker'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          node -e "const {execSync}=require('node:child_process'); const out=execSync('npx wrangler deployments list --name owokx --json',{stdio:['ignore','pipe','inherit']}).toString(); const data=JSON.parse(out); const current=data?.[0]?.id || ''; process.stdout.write(current);" > worker_prev_version.txt
+          echo "version_id=$(cat worker_prev_version.txt)" >> $GITHUB_OUTPUT
+
+      - name: Apply database migrations (staging)
+        if: (inputs.components == 'all' || inputs.components == 'worker') && inputs.environment == 'staging'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: npx wrangler d1 migrations apply owokx-db --remote
+
+      - name: Apply database migrations (production)
+        if: (inputs.components == 'all' || inputs.components == 'worker') && inputs.environment == 'production'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: npx wrangler d1 migrations apply owokx-db --remote --env production
+
+      - name: Deploy Worker (staging)
+        if: (inputs.components == 'all' || inputs.components == 'worker') && inputs.environment == 'staging'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: npx wrangler deploy
+
+      - name: Deploy Worker (production)
+        if: (inputs.components == 'all' || inputs.components == 'worker') && inputs.environment == 'production'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: npx wrangler deploy --env production
+
+      - name: Pre-deploy health check (Worker)
+        if: inputs.components == 'all' || inputs.components == 'worker'
+        env:
+          WORKER_URL: ${{ vars.OWOKX_WORKER_URL }}
+        run: |
+          test -n "$WORKER_URL"
+          curl -fsS "$WORKER_URL/health" | head -c 200
+
+      - name: Set up Docker Buildx
+        if: inputs.components == 'all' || inputs.components == 'dashboard'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: inputs.components == 'all' || inputs.components == 'dashboard'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push dashboard image
+        if: inputs.components == 'all' || inputs.components == 'dashboard'
+        id: dashboard_image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./dashboard
+          file: ./dashboard/Dockerfile
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/owokx-dashboard:${{ github.sha }}
+
+      - name: Setup kubectl
+        if: inputs.components == 'all' || inputs.components == 'dashboard'
+        uses: azure/setup-kubectl@v4
+        with:
+          version: v1.30.0
+
+      - name: Configure kubeconfig
+        if: inputs.components == 'all' || inputs.components == 'dashboard'
+        env:
+          KUBE_CONFIG: ${{ secrets.KUBE_CONFIG }}
+        run: |
+          test -n "$KUBE_CONFIG"
+          mkdir -p ~/.kube
+          echo "$KUBE_CONFIG" | base64 -d > ~/.kube/config
+
+      - name: Apply Kubernetes manifests
+        if: inputs.components == 'all' || inputs.components == 'dashboard'
+        run: |
+          kubectl apply -k deploy/k8s/dashboard/overlays/${{ inputs.environment }}
+
+      - name: Blue-green deploy dashboard
+        if: inputs.components == 'all' || inputs.components == 'dashboard'
+        env:
+          NS: ${{ inputs.environment == 'production' && 'owokx-prod' || 'owokx-staging' }}
+          IMAGE: ghcr.io/${{ github.repository_owner }}/owokx-dashboard:${{ github.sha }}
+        run: |
+          ACTIVE_TRACK=$(kubectl -n "$NS" get svc owokx-dashboard -o jsonpath='{.spec.selector.track}')
+          if [ "$ACTIVE_TRACK" = "blue" ]; then TARGET_TRACK="green"; else TARGET_TRACK="blue"; fi
+          echo "Active track: $ACTIVE_TRACK"
+          echo "Target track: $TARGET_TRACK"
+
+          kubectl -n "$NS" set image deployment/owokx-dashboard-$TARGET_TRACK dashboard="$IMAGE"
+          kubectl -n "$NS" rollout status deployment/owokx-dashboard-$TARGET_TRACK --timeout=5m
+
+          kubectl -n "$NS" patch svc owokx-dashboard --type merge -p "{\"spec\":{\"selector\":{\"app\":\"owokx-dashboard\",\"track\":\"$TARGET_TRACK\"}}}"
+          kubectl -n "$NS" get svc owokx-dashboard -o wide
+
+      - name: Post-deploy health check (Dashboard)
+        if: inputs.components == 'all' || inputs.components == 'dashboard'
+        env:
+          DASHBOARD_URL: ${{ vars.OWOKX_DASHBOARD_URL }}
+        run: |
+          test -n "$DASHBOARD_URL"
+          curl -fsS "$DASHBOARD_URL/health" | head -c 200
+
+      - name: Generate deployment report
+        if: always()
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          COMPONENTS: ${{ inputs.components }}
+          DEPLOYMENT_ID: ${{ steps.gh_deploy.outputs.deployment_id }}
+          WORKER_PREV_VERSION_ID: ${{ steps.worker_prev.outputs.version_id }}
+        run: |
+          node -e "const fs=require('node:fs'); const report={repo:process.env.GITHUB_REPOSITORY, sha:process.env.GITHUB_SHA, run_id:process.env.GITHUB_RUN_ID, environment:process.env.ENVIRONMENT, components:process.env.COMPONENTS, github_deployment_id:process.env.DEPLOYMENT_ID, worker_prev_version_id:process.env.WORKER_PREV_VERSION_ID || null, created_at:new Date().toISOString()}; fs.writeFileSync('deploy-report.json', JSON.stringify(report, null, 2));"
+
+      - name: Upload deployment report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deploy-report-${{ inputs.environment }}-${{ github.sha }}
+          path: deploy-report.json
+
+      - name: Notify Slack (success)
+        if: success() && secrets.SLACK_WEBHOOK_URL != ''
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          curl -fsS -X POST -H 'Content-Type: application/json' \
+            --data "{\"text\":\"✅ Deploy succeeded: ${{ github.repository }} @ ${{ github.sha }} → ${{ inputs.environment }}\"}" \
+            "$SLACK_WEBHOOK_URL"
+
+      - name: Mark deployment success
+        if: success()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const deployment_id = Number('${{ steps.gh_deploy.outputs.deployment_id }}');
+            await github.rest.repos.createDeploymentStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              deployment_id,
+              state: 'success',
+              description: 'Deployment succeeded',
+            });
+
+      - name: Rollback dashboard on failure
+        if: failure() && (inputs.components == 'all' || inputs.components == 'dashboard')
+        env:
+          NS: ${{ inputs.environment == 'production' && 'owokx-prod' || 'owokx-staging' }}
+        run: |
+          ACTIVE_TRACK=$(kubectl -n "$NS" get svc owokx-dashboard -o jsonpath='{.spec.selector.track}')
+          if [ "$ACTIVE_TRACK" = "blue" ]; then PREV_TRACK="green"; else PREV_TRACK="blue"; fi
+          kubectl -n "$NS" patch svc owokx-dashboard --type merge -p "{\"spec\":{\"selector\":{\"app\":\"owokx-dashboard\",\"track\":\"$PREV_TRACK\"}}}"
+          kubectl -n "$NS" rollout status deployment/owokx-dashboard-$PREV_TRACK --timeout=3m || true
+
+      - name: Rollback Worker on failure
+        if: failure() && (inputs.components == 'all' || inputs.components == 'worker') && steps.worker_prev.outputs.version_id != ''
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: npx wrangler rollback ${{ steps.worker_prev.outputs.version_id }}
+
+      - name: Notify Slack (failure)
+        if: failure() && secrets.SLACK_WEBHOOK_URL != ''
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          curl -fsS -X POST -H 'Content-Type: application/json' \
+            --data "{\"text\":\"❌ Deploy failed: ${{ github.repository }} @ ${{ github.sha }} → ${{ inputs.environment }}. Rolled back where possible.\"}" \
+            "$SLACK_WEBHOOK_URL"
+
+      - name: Notify email (failure)
+        if: failure() && secrets.SMTP_SERVER != '' && secrets.NOTIFY_EMAIL_TO != '' && secrets.NOTIFY_EMAIL_FROM != ''
+        uses: dawidd6/action-send-mail@v4
+        with:
+          server_address: ${{ secrets.SMTP_SERVER }}
+          server_port: ${{ secrets.SMTP_PORT }}
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          secure: true
+          to: ${{ secrets.NOTIFY_EMAIL_TO }}
+          from: ${{ secrets.NOTIFY_EMAIL_FROM }}
+          subject: Deploy failed (${{ github.repository }} → ${{ inputs.environment }})
+          body: |
+            Deploy failed.
+            Repo: ${{ github.repository }}
+            SHA: ${{ github.sha }}
+            Environment: ${{ inputs.environment }}
+            Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+      - name: Mark deployment failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const deployment_id = Number('${{ steps.gh_deploy.outputs.deployment_id }}');
+            await github.rest.repos.createDeploymentStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              deployment_id,
+              state: 'failure',
+              description: 'Deployment failed',
+            });

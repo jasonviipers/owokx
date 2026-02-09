@@ -1,0 +1,63 @@
+import { generateId, nowISO } from "../../../lib/utils";
+import type { OrderPreview, PolicyResult } from "../../../mcp/types";
+import type { D1Client, OrderApprovalRow } from "../client";
+
+export interface CreateApprovalParams {
+  preview: OrderPreview;
+  policyResult: PolicyResult;
+  previewHash: string;
+  tokenHash: string;
+  expiresAt: string;
+}
+
+export async function createApproval(db: D1Client, params: CreateApprovalParams): Promise<string> {
+  const id = generateId();
+
+  await db.run(
+    `INSERT INTO order_approvals (id, preview_hash, order_params_json, policy_result_json, approval_token, token_hash, expires_at, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      id,
+      params.previewHash,
+      JSON.stringify(params.preview),
+      JSON.stringify(params.policyResult),
+      params.tokenHash,
+      params.tokenHash,
+      params.expiresAt,
+      nowISO(),
+    ]
+  );
+
+  return id;
+}
+
+export async function getApprovalByTokenHash(db: D1Client, tokenHash: string): Promise<OrderApprovalRow | null> {
+  return db.executeOne<OrderApprovalRow>(`SELECT * FROM order_approvals WHERE token_hash = ?`, [tokenHash]);
+}
+
+export async function getApprovalByToken(db: D1Client, token: string): Promise<OrderApprovalRow | null> {
+  return db.executeOne<OrderApprovalRow>(`SELECT * FROM order_approvals WHERE approval_token = ?`, [token]);
+}
+
+export async function markApprovalUsed(db: D1Client, approvalId: string): Promise<void> {
+  const now = nowISO();
+  await db.run(
+    `UPDATE order_approvals
+     SET used_at = ?,
+         state = 'USED',
+         reserved_at = NULL,
+         reserved_by = NULL,
+         reserved_until = NULL
+     WHERE id = ?`,
+    [now, approvalId]
+  );
+}
+
+export async function cleanupExpiredApprovals(db: D1Client): Promise<number> {
+  const result = await db.run(`DELETE FROM order_approvals WHERE expires_at < ? AND used_at IS NULL`, [nowISO()]);
+  return result.meta.changes ?? 0;
+}
+
+export async function getRecentApprovals(db: D1Client, limit: number = 20): Promise<OrderApprovalRow[]> {
+  return db.execute<OrderApprovalRow>(`SELECT * FROM order_approvals ORDER BY created_at DESC LIMIT ?`, [limit]);
+}
