@@ -876,6 +876,22 @@ export class OwokxHarness extends DurableObject<Env> {
       const stored = await this.ctx.storage.get<AgentState>("state");
       if (stored) {
         this.state = { ...DEFAULT_STATE, ...stored };
+        
+        // AUTO-CORRECTION: Fix corrupted crypto_symbols in persisted state
+        if (this.state.config.crypto_symbols && Array.isArray(this.state.config.crypto_symbols)) {
+           const fixedSymbols = this.state.config.crypto_symbols.map(s => {
+              if (s.endsWith("USDTTT")) return s.replace("USDTTT", "USDT");
+              if (s.endsWith("USDTT")) return s.replace("USDTT", "USDT");
+              return s;
+           });
+           
+           // If changes were made, save them immediately
+           if (JSON.stringify(fixedSymbols) !== JSON.stringify(this.state.config.crypto_symbols)) {
+              this.state.config.crypto_symbols = fixedSymbols;
+              console.log("[OwokxHarness] Fixed corrupted crypto_symbols in state:", fixedSymbols);
+              await this.persist();
+           }
+        }
       }
       this.initializeLLM();
 
