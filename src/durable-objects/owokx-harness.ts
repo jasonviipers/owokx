@@ -942,6 +942,20 @@ export class OwokxHarness extends DurableObject<Env> {
        try {
          const id = this.env.SWARM_REGISTRY.idFromName("main");
          const stub = this.env.SWARM_REGISTRY.get(id);
+         
+         // Register ourselves first to ensure we count towards quorum
+         await stub.fetch("http://registry/register", {
+            method: "POST",
+            body: JSON.stringify({
+              id: "harness",
+              type: "orchestrator",
+              status: "active",
+              lastHeartbeat: Date.now(),
+              metadata: { version: "2.0", mode: "harness" }
+            }),
+            headers: { "Content-Type": "application/json" }
+         });
+
          const res = await stub.fetch("http://registry/health");
          if (res.ok) {
            const data = await res.json() as { healthy: boolean };
