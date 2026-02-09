@@ -211,4 +211,19 @@ export interface Status {
   stalenessAnalysis?: Record<string, StalenessAnalysis>
   overnightActivity?: OvernightActivity
   broker_error?: string
+  swarm?: SwarmStatus
+}
+
+export interface AgentStatus {
+  id: string
+  type: string
+  lastHeartbeat: number
+  status: string
+  metadata?: any
+}
+
+export interface SwarmStatus {
+  healthy: boolean
+  active_agents: number
+  agents: Record<string, AgentStatus>
 }

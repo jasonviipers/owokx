@@ -10,6 +10,7 @@ import { LineChart, Sparkline } from './components/LineChart'
 import { NotificationBell } from './components/NotificationBell'
 import { Tooltip, TooltipContent } from './components/Tooltip'
 import { AgentControls } from './components/AgentControls'
+import { SwarmDashboard } from './components/SwarmDashboard'
 import type { Status, Config, LogEntry, Signal, Position, SignalResearch, PortfolioSnapshot } from './types'
 
 const API_BASE = '/api'
@@ -663,6 +664,11 @@ export default function App() {
                 </div>
               )}
             </Panel>
+          </div>
+
+          {/* Row 2.5: Swarm Status */}
+          <div className="col-span-4 md:col-span-8 lg:col-span-12">
+             <SwarmDashboard swarm={status?.swarm} />
           </div>
 
           {/* Row 3: Signals, Activity, Research */}

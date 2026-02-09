@@ -232,6 +232,14 @@ interface AgentState {
   lastBrokerAuthError?: { at: number; message: string };
   lastLLMAuthError?: { at: number; message: string };
   enabled: boolean;
+  overnightActivity?: {
+    signalsGathered: number;
+    signalsResearched: number;
+    buySignals: number;
+    twitterConfirmations: number;
+    premarketPlanReady: boolean;
+    lastUpdated: number;
+  };
 }
 
 // ============================================================================
@@ -1305,6 +1313,25 @@ export class OwokxHarness extends DurableObject<Env> {
       }
     }
 
+    let swarm: any = undefined;
+    if (this.env.SWARM_REGISTRY) {
+      try {
+        const id = this.env.SWARM_REGISTRY.idFromName("main");
+        const stub = this.env.SWARM_REGISTRY.get(id);
+        const [healthRes, agentsRes] = await Promise.all([
+          stub.fetch("http://registry/health"),
+          stub.fetch("http://registry/agents"),
+        ]);
+        if (healthRes.ok && agentsRes.ok) {
+          const health = (await healthRes.json()) as { healthy: boolean; active_agents: number };
+          const agents = (await agentsRes.json()) as Record<string, any>;
+          swarm = { ...health, agents };
+        }
+      } catch (e) {
+        // ignore
+      }
+    }
+
     return this.jsonResponse({
       ok: true,
       data: {
@@ -1324,6 +1351,8 @@ export class OwokxHarness extends DurableObject<Env> {
         twitterConfirmations: this.state.twitterConfirmations,
         premarketPlan: this.state.premarketPlan,
         stalenessAnalysis: this.state.stalenessAnalysis,
+        overnightActivity: this.state.overnightActivity,
+        swarm,
       },
     });
   }
