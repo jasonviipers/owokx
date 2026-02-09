@@ -22,12 +22,16 @@ import { generateId } from "../lib/utils";
 export interface BacktestMarketDataConfig {
   now_ms: number;
   spread_bps?: number;
+  latency_ms?: number;
+  slippage_bps?: number;
 }
 
 export class BacktestMarketDataProvider implements MarketDataProvider {
   private readonly barsBySymbol: Map<string, Bar[]>;
   private nowMs: number;
   private readonly spreadBps: number;
+  private readonly latencyMs: number;
+  private readonly slippageBps: number;
 
   constructor(
     barsBySymbol: Record<string, Bar[]>,
@@ -38,6 +42,8 @@ export class BacktestMarketDataProvider implements MarketDataProvider {
     );
     this.nowMs = config.now_ms;
     this.spreadBps = config.spread_bps ?? 10;
+    this.latencyMs = config.latency_ms ?? 0;
+    this.slippageBps = config.slippage_bps ?? 0;
   }
 
   setNow(nowMs: number): void {
@@ -76,6 +82,10 @@ export class BacktestMarketDataProvider implements MarketDataProvider {
   }
 
   async getQuote(symbol: string): Promise<Quote> {
+    // Latency simulation
+    if (this.latencyMs > 0) {
+      await new Promise(resolve => setTimeout(resolve, Math.random() * this.latencyMs));
+    }
     const bar = await this.getLatestBar(symbol);
     const mid = bar.c;
     const halfSpread = (mid * (this.spreadBps / 10_000)) / 2;
@@ -292,13 +302,17 @@ export class BacktestBrokerProvider implements BrokerProvider {
       throw createError(ErrorCode.INVALID_INPUT, "Unable to determine order qty");
     }
 
+    // Slippage simulation
+    const slippage = this.marketData["slippageBps"] ? (fillPrice * this.marketData["slippageBps"]) / 10000 : 0;
+    const finalPrice = params.side === "buy" ? fillPrice + slippage : fillPrice - slippage;
+
     if (params.side === "buy") {
-      const cost = qty * fillPrice;
+      const cost = qty * finalPrice;
       if (cost > this.cash + 1e-9) {
         throw createError(ErrorCode.INSUFFICIENT_BUYING_POWER, "Insufficient buying power", { cost, cash: this.cash });
       }
       this.cash -= cost;
-      this.applyFillToPosition(symbol, "long", qty, fillPrice);
+      this.applyFillToPosition(symbol, "long", qty, finalPrice);
     } else {
       const pos = this.positions.get(symbol);
       if (!pos || pos.qty <= 0) {
@@ -307,8 +321,8 @@ export class BacktestBrokerProvider implements BrokerProvider {
       if (qty > pos.qty + 1e-9) {
         throw createError(ErrorCode.INVALID_INPUT, "Sell qty exceeds position qty", { qty, position_qty: pos.qty });
       }
-      this.cash += qty * fillPrice;
-      this.applyFillToPosition(symbol, "long", -qty, fillPrice);
+      this.cash += qty * finalPrice;
+      this.applyFillToPosition(symbol, "long", -qty, finalPrice);
     }
 
     const orderId = generateId();

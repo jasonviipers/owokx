@@ -305,6 +305,7 @@ export interface CompletionParams {
   }>;
   temperature?: number;
   max_tokens?: number;
+  seed?: number;
   response_format?: { type: "json_object" } | { type: "text" };
 }
 

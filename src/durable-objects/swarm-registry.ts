@@ -54,6 +54,13 @@ export class SwarmRegistry extends AgentBase<SwarmState & { lastHeartbeat: numbe
       });
     }
 
+    if (path === "/health") {
+      const activeAgents = Object.values(this.state.agents).filter(a => Date.now() - a.lastHeartbeat < 300_000).length;
+      return new Response(JSON.stringify({ healthy: activeAgents > 0, active_agents: activeAgents }), {
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+
     return super.handleCustomFetch(request, url);
   }
 

@@ -40,6 +40,7 @@ export class OpenAIProvider implements LLMProvider {
       messages: params.messages,
       temperature: params.temperature ?? 0.7,
       max_tokens: params.max_tokens ?? 1024,
+      seed: params.seed,
     };
 
     if (params.response_format) {

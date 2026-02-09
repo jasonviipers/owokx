@@ -86,4 +86,28 @@ export class RiskManager extends AgentBase<RiskManagerState> {
     
     await this.saveState();
   }
+
+  calculateRiskState(equity: number, positions: { unrealized_pl: number }[]): { approved: boolean; reason?: string } {
+    const unrealizedPnL = positions.reduce((sum, p) => sum + p.unrealized_pl, 0);
+    const currentDrawdown = this.state.dailyLoss - unrealizedPnL; // Assuming dailyLoss is realized losses (positive number)
+
+    if (this.state.killSwitchActive) {
+      return { approved: false, reason: "Kill switch active" };
+    }
+    
+    // Use equity to calculate % drawdown if needed
+    if (equity > 0) {
+        const drawdownPct = (currentDrawdown / equity) * 100;
+        if (drawdownPct > 10) { // Example 10% max drawdown
+            return { approved: false, reason: `Drawdown (${drawdownPct.toFixed(1)}%) exceeds limit` };
+        }
+    }
+
+    // Check open exposure or other risk metrics here
+    if (currentDrawdown > this.state.maxDailyLoss) {
+       return { approved: false, reason: `Drawdown ($${currentDrawdown.toFixed(2)}) exceeds max daily loss` };
+    }
+
+    return { approved: true };
+  }
 }

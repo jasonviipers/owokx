@@ -49,6 +49,7 @@ export interface Env {
   OWOKX_API_TOKEN_READONLY?: string;
   APPROVAL_SIGNING_SECRET?: string;
   KILL_SWITCH_SECRET: string;
+  KILL_SWITCH_ACTIVE?: string;
 
   ENVIRONMENT: string;
   FEATURE_LLM_RESEARCH: string;
