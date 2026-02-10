@@ -228,6 +228,27 @@ export default function App() {
     return () => clearInterval(historyInterval)
   }, [setupChecked, showSetup, portfolioPeriod])
 
+  const handleResetAgent = async () => {
+    setAgentMessage(null)
+    try {
+      const res = await authFetch(`${API_BASE}/reset`, { method: 'POST' })
+      const data = await res.json()
+      
+      if (!res.ok) {
+        throw new Error(data.error || 'Reset failed')
+      }
+      
+      await fetchStatus()
+      setAgentMessage({ type: 'success', text: 'Agent reset successfully' })
+      setPortfolioHistory([])
+      setStatus(null)
+      
+    } catch (e) {
+      setAgentMessage({ type: 'error', text: `Reset failed: ${String(e)}` })
+      throw e
+    }
+  }
+
   const handleSaveConfig = async (config: Config) => {
     const res = await authFetch(`${API_BASE}/config`, {
       method: 'POST',
@@ -930,6 +951,7 @@ export default function App() {
               config={config}
               onSave={handleSaveConfig}
               onClose={() => setShowSettings(false)}
+              onReset={handleResetAgent}
             />
           </motion.div>
         )}

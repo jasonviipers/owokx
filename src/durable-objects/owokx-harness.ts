@@ -703,44 +703,24 @@ const tickerCache = new ValidTickerCache();
 // ============================================================================
 
 function normalizeCryptoSymbol(symbol: string): string {
-  // Handle UI/ingestion variants like "PEPE.X" -> "PEPE"
-  let cleaned = symbol.toUpperCase().trim();
-  if (cleaned.endsWith(".X")) {
-    cleaned = cleaned.slice(0, -2);
+  if (symbol.includes("/")) {
+    return symbol.toUpperCase();
   }
-
-  // Fix common configuration typos (e.g. BTC/USDTTT from dashboard bug)
-  if (cleaned.endsWith("USDTT") || cleaned.endsWith("USDTTT")) {
-    cleaned = cleaned.replace(/USDT+$/, "USDT");
-  }
-
-  // Handle hyphenated symbols (BTC-USDT -> BTC/USDT)
-  if (cleaned.includes("-")) {
-    cleaned = cleaned.replace("-", "/");
-  }
-
-  if (cleaned.includes("/")) {
-    return cleaned;
-  }
-  const match = cleaned.match(/^([A-Z0-9]{2,10})(USD|USDT|USDC)$/);
+  const match = symbol.toUpperCase().match(/^([A-Z]{2,5})(USD|USDT|USDC)$/);
   if (match) {
     return `${match[1]}/${match[2]}`;
   }
-  return cleaned;
+  return symbol;
 }
 
 function isCryptoSymbol(symbol: string, cryptoSymbols: string[]): boolean {
-  // StockTwits crypto suffix
-  if (symbol.endsWith(".X")) return true;
-  
   const normalizedInput = normalizeCryptoSymbol(symbol);
   for (const configSymbol of cryptoSymbols) {
     if (normalizeCryptoSymbol(configSymbol) === normalizedInput) {
       return true;
     }
   }
-  // Allow 2-10 chars for ticker (e.g. PEPECOIN, RENDER)
-  return /^[A-Z0-9]{2,10}\/(USD|USDT|USDC)$/.test(normalizedInput);
+  return /^[A-Z]{2,5}\/(USD|USDT|USDC)$/.test(normalizedInput);
 }
 
 /**
@@ -945,51 +925,58 @@ export class OwokxHarness extends DurableObject<Env> {
   // ============================================================================
 
   private async checkKillSwitch(): Promise<boolean> {
-    // Check local state first
     if (!this.state.enabled) return true;
-    
-    // Check RiskManager via Swarm (simulated here as we don't have direct Swarm client in Harness yet, 
-    // assuming we might check a KV or call a DO directly if we had the ID).
-    // For now, we rely on local enabled state + environment variable override.
+
     if (this.env.KILL_SWITCH_ACTIVE === "true") return true;
-    
+
+    if (this.env.RISK_MANAGER) {
+      try {
+        const id = this.env.RISK_MANAGER.idFromName("default");
+        const stub = this.env.RISK_MANAGER.get(id);
+        const res = await stub.fetch("http://risk/status");
+        if (res.ok) {
+          const data = await res.json() as { killSwitchActive: boolean };
+          if (data.killSwitchActive) {
+            this.log("System", "kill_switch_from_risk_manager", {
+              reason: "RiskManager kill switch is active",
+            });
+            return true;
+          }
+        }
+      } catch (e) {
+        this.log("System", "kill_switch_check_failed", {
+          error: String(e),
+          action: "blocking_trading_as_precaution",
+        });
+        return true;
+      }
+    }
+
     return false;
   }
 
   private async checkSwarmHealth(): Promise<boolean> {
-    // In a full swarm implementation, we would query the registry.
-    // For this harness, we assume it's healthy if we can run.
-    // However, to satisfy the requirement:
-    if (this.env.SWARM_REGISTRY) {
-       try {
-         const id = this.env.SWARM_REGISTRY.idFromName("main");
-         const stub = this.env.SWARM_REGISTRY.get(id);
-         
-         // Register ourselves first to ensure we count towards quorum
-         await stub.fetch("http://registry/register", {
-            method: "POST",
-            body: JSON.stringify({
-              id: "harness",
-              type: "orchestrator",
-              status: "active",
-              lastHeartbeat: Date.now(),
-              metadata: { version: "2.0", mode: "harness" }
-            }),
-            headers: { "Content-Type": "application/json" }
-         });
-
-         const res = await stub.fetch("http://registry/health");
-         if (res.ok) {
-           const data = await res.json() as { healthy: boolean };
-           return data.healthy;
-         }
-       } catch (e) {
-         this.log("System", "swarm_health_check_failed", { error: String(e) });
-         // Fail open or closed? Closed for safety.
-         return false;
-       }
+    if (!this.env.SWARM_REGISTRY) {
+      // Standalone mode: assume healthy if no registry binding is configured
+      return true;
     }
-    return true; // Standalone mode
+
+    try {
+      const id = this.env.SWARM_REGISTRY.idFromName("default");
+      const stub = this.env.SWARM_REGISTRY.get(id);
+
+      const res = await stub.fetch("http://registry/health");
+      if (res.ok) {
+        const data = await res.json() as { healthy: boolean };
+        return data.healthy;
+      }
+      
+      this.log("System", "swarm_health_check_failed", { status: res.status });
+      return false;
+    } catch (e) {
+      this.log("System", "swarm_health_check_error", { error: String(e) });
+      return false;
+    }
   }
 
   private validateMarketData(snapshot: Snapshot | null): boolean {
@@ -1148,7 +1135,7 @@ export class OwokxHarness extends DurableObject<Env> {
     const action = url.pathname.slice(1);
 
     const readActions = ["status", "logs", "costs", "signals", "history", "setup/status", "metrics"];
-    const tradeActions = ["enable", "disable", "trigger"];
+    const tradeActions = ["enable", "disable", "trigger", "reset"];
     let requiredScope: "read" | "trade" | null = null;
 
     if (readActions.includes(action)) {
@@ -1184,6 +1171,9 @@ export class OwokxHarness extends DurableObject<Env> {
 
         case "disable":
           return this.handleDisable();
+
+        case "reset":
+          return this.handleReset();
 
         case "logs":
           return this.handleGetLogs(url);
@@ -1415,6 +1405,17 @@ export class OwokxHarness extends DurableObject<Env> {
     await this.persist();
     this.log("System", "agent_disabled", {});
     return this.jsonResponse({ ok: true, enabled: false });
+  }
+
+  private async handleReset(): Promise<Response> {
+    await this.ctx.storage.deleteAll();
+    this.state = { ...DEFAULT_STATE };
+    this.log("System", "agent_reset", { timestamp: new Date().toISOString() });
+    await this.persist();
+    return this.jsonResponse({
+      ok: true,
+      message: "Agent storage cleared and state reset to defaults.",
+    });
   }
 
   private handleGetLogs(url: URL): Response {
@@ -3254,47 +3255,8 @@ Response format:
     symbol: string,
     confidence: number,
     account: Account,
-    idempotencySuffix?: string,
-    existingPositions?: Position[]
+    idempotencySuffix?: string
   ): Promise<boolean> {
-    // Task 5: Risk Management Enforcement (Consult RiskManager)
-    if (this.env.RISK_MANAGER) {
-      try {
-        const positions = existingPositions || await broker.trading.getPositions();
-        const id = this.env.RISK_MANAGER.idFromName("main");
-        const stub = this.env.RISK_MANAGER.get(id);
-        
-        // We need to send a message to RiskManager. 
-        // Since we don't have the protocol types imported here easily without adding imports, 
-        // we'll assume standard fetch or use the handleMessage structure if exposed via fetch.
-        // Assuming RiskManager exposes a fetch endpoint for check or we use `stub.fetch`.
-        // We'll use a custom fetch endpoint if we added one, or rely on the agent protocol.
-        // But RiskManager.ts shows it handles "validate_order" message.
-        // We can't easily send an AgentMessage via stub.fetch unless we wrap it.
-        // Let's assume we can add a fetch handler to RiskManager or just skip for now and rely on "kill switch" check we added earlier.
-        // Actually, the kill switch check `checkKillSwitch` handles the "active" state.
-        // But we want to check `calculateRiskState` which involves daily PnL.
-        // Let's skip the complex RPC for now and rely on the fact that RiskManager updates the kill switch state 
-        // and `checkKillSwitch` reads it.
-        // Wait, `checkKillSwitch` reads `this.env.KILL_SWITCH_ACTIVE`. 
-        // Does RiskManager update that? No, it updates its own state.
-        // We need to query RiskManager.
-        // Let's skip modifying RiskManager to add fetch endpoint and instead rely on the local adaptive sizing for now
-        // to avoid introducing new bugs with RPC.
-        // The instructions say "Integrate RiskManager checks...".
-        // I will rely on `checkKillSwitch` which I implemented to check `this.env.KILL_SWITCH_ACTIVE`.
-        // I should update `RiskManager` to set that env var? No, Env vars are read-only.
-        // `RiskManager` should persist state to DB/KV where `checkKillSwitch` can read it.
-        // Or `checkKillSwitch` should call `RiskManager`.
-        // I'll leave it as is for now to avoid breaking changes, but I'll add the positions param to signature.
-        
-        // Placeholder log to use variables
-        this.log("Executor", "risk_check_placeholder", { positions_count: positions.length, stub_id: stub.id.toString() });
-      } catch (e) {
-        this.log("Executor", "risk_check_failed", { error: String(e) });
-      }
-    }
-    
     if (!symbol || symbol.trim().length === 0) {
       this.log("Executor", "buy_blocked", { reason: "INVARIANT: Empty symbol" });
       return false;
@@ -3328,6 +3290,44 @@ Response format:
         maxAllowed,
       });
       return false;
+    }
+
+    if (this.env.RISK_MANAGER) {
+      try {
+        const id = this.env.RISK_MANAGER.idFromName("default");
+        const stub = this.env.RISK_MANAGER.get(id);
+        const res = await stub.fetch("http://risk/validate", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            symbol,
+            notional: Math.round(positionSize * 100) / 100,
+            side: "buy",
+          }),
+        });
+
+        if (res.ok) {
+          const { approved, reason } = await res.json() as { approved: boolean; reason?: string };
+          if (!approved) {
+            this.log("Executor", "buy_blocked_by_risk_manager", { symbol, reason });
+            return false;
+          }
+        } else {
+          this.log("Executor", "risk_manager_http_error", {
+            symbol,
+            status: res.status,
+            action: "blocking_buy",
+          });
+          return false;
+        }
+      } catch (e) {
+        this.log("Executor", "risk_manager_unreachable", {
+          symbol,
+          error: String(e),
+          action: "blocking_buy",
+        });
+        return false;
+      }
     }
 
     try {
@@ -3447,6 +3447,21 @@ Response format:
         delete this.state.positionEntries[pos.symbol];
         delete this.state.socialHistory[pos.symbol];
         delete this.state.stalenessAnalysis[pos.symbol];
+
+        if (this.env.RISK_MANAGER) {
+          const realizedPnl = pos.unrealized_pl ?? 0;
+          const id = this.env.RISK_MANAGER.idFromName("default");
+          const stub = this.env.RISK_MANAGER.get(id);
+          stub
+            .fetch("http://risk/update-loss", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ profitLoss: realizedPnl }),
+            })
+            .catch((e) => {
+              this.log("Executor", "risk_pnl_report_failed", { symbol: pos.symbol, error: String(e) });
+            });
+        }
       }
 
       return execution.submission.state === "SUBMITTED" || execution.submission.state === "SUBMITTING";

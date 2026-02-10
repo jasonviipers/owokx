@@ -24,6 +24,48 @@ export class RiskManager extends AgentBase<RiskManagerState> {
     }
   }
 
+  async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+
+    if (url.pathname === "/validate") {
+      const order = await request.json() as {
+        symbol: string;
+        notional: number;
+        side: "buy" | "sell";
+      };
+      const result = this.validateOrder({
+        symbol: order.symbol,
+        size: order.notional,
+        side: order.side,
+        price: 1,
+      });
+      return new Response(JSON.stringify(result), {
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+
+    if (url.pathname === "/status") {
+      return new Response(
+        JSON.stringify({
+          killSwitchActive: this.state.killSwitchActive,
+          dailyLoss: this.state.dailyLoss,
+          maxDailyLoss: this.state.maxDailyLoss,
+        }),
+        { headers: { "Content-Type": "application/json" } }
+      );
+    }
+
+    if (url.pathname === "/update-loss" && request.method === "POST") {
+      const { profitLoss } = await request.json() as { profitLoss: number };
+      await this.updateDailyLoss({ profitLoss });
+      return new Response(JSON.stringify({ ok: true }), {
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+
+    return super.fetch(request);
+  }
+
   protected async onStart(): Promise<void> {
     await this.registerWithSwarm();
     this.log("info", "Risk Manager started");
@@ -51,13 +93,17 @@ export class RiskManager extends AgentBase<RiskManagerState> {
     }
 
     if (this.state.dailyLoss >= this.state.maxDailyLoss) {
-      return { approved: false, reason: "Max daily loss exceeded" };
+      return {
+        approved: false,
+        reason: `Max daily loss exceeded ($${this.state.dailyLoss.toFixed(2)} / $${this.state.maxDailyLoss})`,
+      };
     }
 
-    // Example check: Max order size
-    const notional = order.size * order.price;
-    if (notional > 5000) {
-      return { approved: false, reason: "Order size exceeds limit ($5000)" };
+    if (order.side === "buy" && order.size > 5000) {
+      return {
+        approved: false,
+        reason: `Order notional ($${order.size.toFixed(2)}) exceeds per-trade limit ($5000)`,
+      };
     }
 
     return { approved: true };

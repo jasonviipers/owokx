@@ -4,13 +4,15 @@ import { Panel } from './Panel'
 
 interface SettingsModalProps {
   config: Config
-  onSave: (config: Config) => void
+  onSave: (config: Config) => Promise<void>
   onClose: () => void
+  onReset?: () => Promise<void>
 }
 
-export function SettingsModal({ config, onSave, onClose }: SettingsModalProps) {
+export function SettingsModal({ config, onSave, onClose, onReset }: SettingsModalProps) {
   const [localConfig, setLocalConfig] = useState<Config>(config)
   const [saving, setSaving] = useState(false)
+  const [resetting, setResetting] = useState(false)
   const [apiToken, setApiToken] = useState(localStorage.getItem('OWOKX_API_TOKEN') || '')
 
   // Note: We intentionally do NOT sync localConfig with the config prop after initial mount.
@@ -47,8 +49,26 @@ export function SettingsModal({ config, onSave, onClose }: SettingsModalProps) {
     try {
       await onSave(localConfig)
       onClose()
+    } catch (error) {
+      console.error('Failed to save config:', error)
     } finally {
       setSaving(false)
+    }
+  }
+
+  const handleReset = async () => {
+    if (!onReset) return
+    if (!confirm("Are you sure you want to reset the agent? This will clear all history, logs, and restore default configuration. This action cannot be undone.")) return
+    
+    setResetting(true)
+    try {
+      await onReset()
+      onClose()
+    } catch (error) {
+      console.error('Failed to reset agent:', error)
+      alert('Failed to reset agent. Check console for details.')
+    } finally {
+      setResetting(false)
     }
   }
 
@@ -612,6 +632,26 @@ export function SettingsModal({ config, onSave, onClose }: SettingsModalProps) {
               </div>
             </div>
           </div>
+
+          {/* Danger Zone */}
+          {onReset && (
+            <div className="mt-6 pt-6 border-t border-hud-line/50">
+              <h3 className="hud-label mb-3 text-hud-error">Danger Zone</h3>
+              <div className="flex items-center justify-between p-3 border border-hud-error/30 bg-hud-error/5 rounded">
+                <div>
+                  <div className="text-sm text-hud-text font-medium">Reset Agent</div>
+                  <div className="text-[10px] text-hud-text-dim">Clears all history, logs, and restores default settings.</div>
+                </div>
+                <button
+                  className="px-3 py-1.5 bg-hud-error/20 hover:bg-hud-error/40 text-hud-error border border-hud-error/50 rounded text-xs transition-colors"
+                  onClick={handleReset}
+                  disabled={resetting}
+                >
+                  {resetting ? 'Resetting...' : 'Reset Everything'}
+                </button>
+              </div>
+            </div>
+          )}
 
           {/* Actions */}
           <div className="flex justify-end gap-4 pt-4 border-t border-hud-line">
