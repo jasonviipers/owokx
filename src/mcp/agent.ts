@@ -813,9 +813,9 @@ export class OwokxMcpAgent extends McpAgent<Env> {
   }
 
   private registerUtilityTools() {
-    this.server.tool("help-usage", "Get help information about using Mahoraga", {}, async () => {
+    this.server.tool("help-usage", "Get help information about using Okx", {}, async () => {
       const result = success({
-        name: "Mahoraga MCP Trading Server",
+        name: "Okx MCP Trading Server",
         version: "0.1.0",
         order_flow: ["1. orders-preview -> get approval_token", "2. orders-submit with token"],
         quick_start: ["auth-verify", "portfolio-get", "risk-status", "orders-preview", "orders-submit"],

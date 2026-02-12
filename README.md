@@ -1,12 +1,12 @@
 ⚠️ **Warning:** This software is provided for educational and informational purposes only. Nothing in this repository constitutes financial, investment, legal, or tax advice.
 
-# MAHORAGA
+# Okx
 
 An autonomous, LLM-powered trading agent that runs 24/7 on Cloudflare Workers.
 
 [![Discord](https://img.shields.io/discord/1467592472158015553?color=7289da&label=Discord&logo=discord&logoColor=white)](https://discord.gg/vMFnHe2YBh)
 
-MAHORAGA monitors social sentiment from StockTwits and Reddit, uses AI (OpenAI, Anthropic, Google, xAI, DeepSeek via AI SDK) to analyze signals, and executes trades through a configurable broker provider (Alpaca or OKX). It runs as a Cloudflare Durable Object with persistent state, automatic restarts, and 24/7 crypto trading support.
+Okx monitors social sentiment from StockTwits and Reddit, uses AI (OpenAI, Anthropic, Google, xAI, DeepSeek via AI SDK) to analyze signals, and executes trades through a configurable broker provider (Alpaca or OKX). It runs as a Cloudflare Durable Object with persistent state, automatic restarts, and 24/7 crypto trading support.
 
 <img width="1278" height="957" alt="dashboard" src="https://github.com/user-attachments/assets/56473ab6-e2c6-45fc-9e32-cf85e69f1a2d" />
 
@@ -35,8 +35,8 @@ MAHORAGA monitors social sentiment from StockTwits and Reddit, uses AI (OpenAI, 
 ### 1. Clone and install
 
 ```bash
-git clone https://github.com/ygwyg/MAHORAGA.git
-cd mahoraga
+git clone https://github.com/ygwyg/Okx.git
+cd Okx
 npm install
 ```
 
@@ -44,7 +44,7 @@ npm install
 
 ```bash
 # Create D1 database
-npx wrangler d1 create mahoraga-db
+npx wrangler d1 create Okx-db
 # Copy the database_id to wrangler.jsonc
 
 # Create KV namespace
@@ -52,7 +52,7 @@ npx wrangler kv namespace create CACHE
 # Copy the id to wrangler.jsonc
 
 # Run migrations
-npx wrangler d1 migrations apply mahoraga-db
+npx wrangler d1 migrations apply Okx-db
 ```
 
 ### 3. Set secrets
@@ -109,10 +109,10 @@ All API endpoints require authentication via Bearer token:
 
 ```bash
 # Set your API token as an env var for convenience
-export MAHORAGA_TOKEN="your-api-token"
+export Okx_TOKEN="your-api-token"
 
 # Enable the agent
-curl -H "Authorization: Bearer $MAHORAGA_TOKEN" \
+curl -H "Authorization: Bearer $Okx_TOKEN" \
    http://127.0.0.1:8787/agent/enable
 ```
 
@@ -120,11 +120,11 @@ curl -H "Authorization: Bearer $MAHORAGA_TOKEN" \
 
 ```bash
 # Check status
-curl -H "Authorization: Bearer $MAHORAGA_TOKEN" \
+curl -H "Authorization: Bearer $Okx_TOKEN" \
   http://127.0.0.1:8787/agent/status
 
 # View logs
-curl -H "Authorization: Bearer $MAHORAGA_TOKEN" \
+curl -H "Authorization: Bearer $Okx_TOKEN" \
   http://127.0.0.1:8787/agent/logs
 
 # Emergency kill switch (uses separate KILL_SWITCH_SECRET)
@@ -145,13 +145,13 @@ npx wrangler dev
 cd dashboard && npm run dev
 
 # Terminal 3 - Enable the agent
-curl -H "Authorization: Bearer $MAHORAGA_TOKEN" \
+curl -H "Authorization: Bearer $Okx_TOKEN" \
   http://localhost:8787/agent/enable
 ```
 
 ## Customizing the Harness
 
-The main trading logic is in `src/durable-objects/mahoraga-harness.ts`. It's documented with markers to help you find what to modify:
+The main trading logic is in `src/durable-objects/Okx-harness.ts`. It's documented with markers to help you find what to modify:
 
 | Marker | Meaning |
 |--------|---------|
@@ -184,7 +184,7 @@ See `docs/harness.html` for detailed customization guide.
 
 ### Broker Configuration
 
-MAHORAGA supports multiple broker providers:
+Okx supports multiple broker providers:
 
 - **Alpaca** (`broker=alpaca`) — US equities + crypto + options (if enabled)
 - **OKX** (`broker=okx`) — Crypto spot trading (24/7)
@@ -205,7 +205,7 @@ You can select the broker in two places:
 
 ### LLM Provider Configuration
 
-MAHORAGA supports multiple LLM providers via three modes:
+Okx supports multiple LLM providers via three modes:
 
 | Mode | Description | Required Env Vars |
 |------|-------------|-------------------|
@@ -261,7 +261,7 @@ npx wrangler secret put ANTHROPIC_API_KEY # Your Anthropic API key
 All `/agent/*` endpoints require Bearer token authentication using `OWOKX_API_TOKEN`:
 
 ```bash
-curl -H "Authorization: Bearer $MAHORAGA_TOKEN" https://mahoraga.bernardoalmeida2004.workers.dev/agent/status
+curl -H "Authorization: Bearer $Okx_TOKEN" https://Okx.bernardoalmeida2004.workers.dev/agent/status
 ```
 
 Generate a secure token: `openssl rand -base64 48`
@@ -271,7 +271,7 @@ Generate a secure token: `openssl rand -base64 48`
 The `/agent/kill` endpoint uses a separate `KILL_SWITCH_SECRET` for emergency shutdown:
 
 ```bash
-curl -H "Authorization: Bearer $KILL_SWITCH_SECRET" https://mahoraga.bernardoalmeida2004.workers.dev/agent/kill
+curl -H "Authorization: Bearer $KILL_SWITCH_SECRET" https://Okx.bernardoalmeida2004.workers.dev/agent/kill
 ```
 
 This immediately disables the agent, cancels all alarms, and clears the signal cache.
@@ -287,8 +287,8 @@ For additional security with SSO/email verification, set up Cloudflare Access:
 # 2. Run the setup script
 CLOUDFLARE_API_TOKEN=your-token \
 CLOUDFLARE_ACCOUNT_ID=your-account-id \
-MAHORAGA_WORKER_URL=https://mahoraga.your-subdomain.workers.dev \
-MAHORAGA_ALLOWED_EMAILS=you@example.com \
+Okx_WORKER_URL=https://Okx.your-subdomain.workers.dev \
+Okx_ALLOWED_EMAILS=you@example.com \
 npm run setup:access
 ```
 
@@ -297,12 +297,12 @@ This creates a Cloudflare Access Application with email verification or One-Time
 ## Project Structure
 
 ```
-mahoraga/
+Okx/
 ├── wrangler.jsonc              # Cloudflare Workers config
 ├── src/
 │   ├── index.ts                # Entry point
 │   ├── durable-objects/
-│   │   ├── mahoraga-harness.ts # THE HARNESS - customize this!
+│   │   ├── Okx-harness.ts # THE HARNESS - customize this!
 │   │   └── session.ts
 │   ├── mcp/                    # MCP server & tools
 │   ├── policy/                 # Trade validation

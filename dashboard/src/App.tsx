@@ -187,6 +187,8 @@ export default function App() {
         setStatus(data.data)
         setError(null)
       } else {
+        // Still hydrate dashboard with whatever data the backend returned (logs/errors/partial status)
+        setStatus(data.data || null)
         setError(data.error || 'Failed to fetch status')
       }
     } catch {

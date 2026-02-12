@@ -20,7 +20,7 @@ export function normalizeOkxSymbol(symbol: string, defaultQuote: string): OkxSym
 
   if (upper.includes("/")) {
     const [base, rawQuote] = upper.split("/", 2) as [string, string];
-    const quote = rawQuote === "USD" ? defaultQuote : rawQuote;
+    const quote = rawQuote; // Keep the specified quote currency instead of converting USD
     return {
       instId: `${base}-${quote}`,
       normalizedSymbol: `${base}/${quote}`,
@@ -32,7 +32,7 @@ export function normalizeOkxSymbol(symbol: string, defaultQuote: string): OkxSym
   const match = upper.match(/^([A-Z0-9]{2,10})(USD|USDT|USDC)$/);
   if (match) {
     const base = match[1]!;
-    const quote = match[2] === "USD" ? defaultQuote : match[2]!;
+    const quote = match[2]!; // Keep the matched quote currency instead of converting USD
     return {
       instId: `${base}-${quote}`,
       normalizedSymbol: `${base}/${quote}`,

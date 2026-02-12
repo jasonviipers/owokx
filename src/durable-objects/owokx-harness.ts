@@ -315,8 +315,8 @@ const DEFAULT_CONFIG: AgentConfig = {
   options_max_delta: 0.7,
   options_stop_loss_pct: 50,
   options_take_profit_pct: 100,
-  crypto_enabled: false,
-  crypto_symbols: ["BTC/USD", "ETH/USD", "SOL/USD"],
+  crypto_enabled: true,
+  crypto_symbols: ["BTC/USDT", "ETH/USDT", "SOL/USDT"],
   crypto_momentum_threshold: 2.0,
   crypto_max_position_value: 1000,
   crypto_take_profit_pct: 10,
@@ -2158,26 +2158,26 @@ export class OwokxHarness extends DurableObject<Env> {
 
       const prompt = `Should we BUY this cryptocurrency based on momentum and market conditions?
 
-SYMBOL: ${symbol}
-PRICE: $${price.toFixed(2)}
-24H CHANGE: ${dailyChange.toFixed(2)}%
-MOMENTUM SCORE: ${(momentum * 100).toFixed(0)}%
-SENTIMENT: ${(sentiment * 100).toFixed(0)}% bullish
+                      SYMBOL: ${symbol}
+                      PRICE: $${price.toFixed(2)}
+                      24H CHANGE: ${dailyChange.toFixed(2)}%
+                      MOMENTUM SCORE: ${(momentum * 100).toFixed(0)}%
+                      SENTIMENT: ${(sentiment * 100).toFixed(0)}% bullish
 
-Evaluate if this is a good entry. Consider:
-- Is the momentum sustainable or a trap?
-- Any major news/events affecting this crypto?
-- Risk/reward at current price level?
+                      Evaluate if this is a good entry. Consider:
+                      - Is the momentum sustainable or a trap?
+                      - Any major news/events affecting this crypto?
+                      - Risk/reward at current price level?
 
-JSON response:
-{
-  "verdict": "BUY|SKIP|WAIT",
-  "confidence": 0.0-1.0,
-  "entry_quality": "excellent|good|fair|poor",
-  "reasoning": "brief reason",
-  "red_flags": ["any concerns"],
-  "catalysts": ["positive factors"]
-}`;
+                      JSON response:
+                      {
+                        "verdict": "BUY|SKIP|WAIT",
+                        "confidence": 0.0-1.0,
+                        "entry_quality": "excellent|good|fair|poor",
+                        "reasoning": "brief reason",
+                        "red_flags": ["any concerns"],
+                        "catalysts": ["positive factors"]
+                      }`;
 
       const response = await this._llm.complete({
         model: this.state.config.llm_model, // Use config model (usually cheap one)
@@ -2630,23 +2630,23 @@ JSON response:
 
       const prompt = `Should we BUY this ${isCrypto ? "crypto" : "stock"} based on social sentiment and fundamentals?
 
-SYMBOL: ${symbol}
-SENTIMENT: ${(sentimentScore * 100).toFixed(0)}% bullish (sources: ${sources.join(", ")})
+                      SYMBOL: ${symbol}
+                      SENTIMENT: ${(sentimentScore * 100).toFixed(0)}% bullish (sources: ${sources.join(", ")})
 
-CURRENT DATA:
-- Price: $${price}
+                      CURRENT DATA:
+                      - Price: $${price}
 
-Evaluate if this is a good entry. Consider: Is the sentiment justified? Is it too late (already pumped)? Any red flags?
+                      Evaluate if this is a good entry. Consider: Is the sentiment justified? Is it too late (already pumped)? Any red flags?
 
-JSON response:
-{
-  "verdict": "BUY|SKIP|WAIT",
-  "confidence": 0.0-1.0,
-  "entry_quality": "excellent|good|fair|poor",
-  "reasoning": "brief reason",
-  "red_flags": ["any concerns"],
-  "catalysts": ["positive factors"]
-}`;
+                      JSON response:
+                      {
+                        "verdict": "BUY|SKIP|WAIT",
+                        "confidence": 0.0-1.0,
+                        "entry_quality": "excellent|good|fair|poor",
+                        "reasoning": "brief reason",
+                        "red_flags": ["any concerns"],
+                        "catalysts": ["positive factors"]
+                      }`;
 
       const response = await this._llm.complete({
         model: this.state.config.llm_model,
