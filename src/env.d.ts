@@ -10,6 +10,7 @@ export interface Env {
   TRADER: DurableObjectNamespace;
   SWARM_REGISTRY: DurableObjectNamespace;
   RISK_MANAGER: DurableObjectNamespace;
+  LEARNING_AGENT?: DurableObjectNamespace;
 
   BROKER_PROVIDER?: "alpaca" | "okx";
 

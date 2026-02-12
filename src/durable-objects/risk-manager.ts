@@ -67,7 +67,6 @@ export class RiskManager extends AgentBase<RiskManagerState> {
   }
 
   protected async onStart(): Promise<void> {
-    await this.registerWithSwarm();
     this.log("info", "Risk Manager started");
   }
 

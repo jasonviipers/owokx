@@ -4,11 +4,12 @@
  * Follows the same pattern as OwokxHarness for consistency.
  */
 
-import { DurableObject } from "cloudflare:workers";
+import { AgentBase, type AgentBaseState } from "../lib/agents/base";
 import type { Env } from "../env.d";
+import type { AgentMessage, AgentType } from "../lib/agents/protocol";
 import { createLLMProvider } from "../providers/llm/factory";
 
-interface AnalystState {
+interface AnalystState extends AgentBaseState {
   researchResults: Record<string, {
     symbol: string;
     verdict: "BUY" | "SKIP" | "WAIT";
@@ -19,25 +20,66 @@ interface AnalystState {
   lastAnalysisTime: number;
 }
 
-const DEFAULT_STATE: AnalystState = {
+const DEFAULT_STATE: Pick<AnalystState, "researchResults" | "lastAnalysisTime"> = {
   researchResults: {},
   lastAnalysisTime: 0,
 };
 
-export class AnalystSimple extends DurableObject<Env> {
-  private state: AnalystState = { ...DEFAULT_STATE };
+export class AnalystSimple extends AgentBase<AnalystState> {
+  protected agentType: AgentType = "analyst";
+  private readonly analysisIntervalMs = 120_000;
+  private readonly researchTtlMs = 180_000;
   private _llm: any = null;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
+    this.state = {
+      ...this.state,
+      researchResults: this.state.researchResults ?? DEFAULT_STATE.researchResults,
+      lastAnalysisTime: this.state.lastAnalysisTime ?? DEFAULT_STATE.lastAnalysisTime,
+    };
+  }
 
-    ctx.blockConcurrencyWhile(async () => {
-      const stored = await ctx.storage.get<AnalystState>("state");
-      if (stored) {
-        this.state = { ...DEFAULT_STATE, ...stored };
+  protected async onStart(): Promise<void> {
+    this.initializeLLM();
+    await this.subscribe("signals_updated");
+  }
+
+  protected getCapabilities(): string[] {
+    return ["analyze_signals", "research_signal", "publish_analysis"];
+  }
+
+  async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    if (url.pathname === "/health") {
+      return this.handleHealth();
+    }
+    return super.fetch(request);
+  }
+
+  protected async handleMessage(message: AgentMessage): Promise<unknown> {
+    switch (message.topic) {
+      case "analyze_signals": {
+        const payload = message.payload as { signals?: unknown[] };
+        const signals = Array.isArray(payload?.signals) ? payload.signals : [];
+        const recommendations = await this.analyzeSignals(signals);
+        return { recommendations };
       }
-      this.initializeLLM();
-    });
+      case "research_signal": {
+        const payload = message.payload as { symbol?: string; sentiment?: number };
+        if (!payload.symbol || typeof payload.sentiment !== "number") {
+          return { error: "symbol and sentiment are required" };
+        }
+        const research = await this.researchSignal(payload.symbol, payload.sentiment);
+        return { research };
+      }
+      case "signals_updated": {
+        await this.runAnalysisFromScout();
+        return { ok: true };
+      }
+      default:
+        return { error: `Unknown topic: ${message.topic}` };
+    }
   }
 
   private initializeLLM(): void {
@@ -51,19 +93,21 @@ export class AnalystSimple extends DurableObject<Env> {
     }
   }
 
-  async fetch(request: Request): Promise<Response> {
-    const url = new URL(request.url);
+  protected async handleCustomFetch(request: Request, url: URL): Promise<Response> {
     const path = url.pathname;
-
     if (path === "/analyze") {
       return this.handleAnalyze(request);
-    } else if (path === "/research") {
-      return this.handleResearch(request);
-    } else if (path === "/health") {
-      return this.handleHealth();
     }
-
-    return new Response("Not found", { status: 404 });
+    if (path === "/research") {
+      return this.handleResearch(request);
+    }
+    if (path === "/analysis-cycle" && request.method === "POST") {
+      await this.runAnalysisFromScout();
+      return new Response(JSON.stringify({ ok: true }), {
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    return super.handleCustomFetch(request, url);
   }
 
   private async handleAnalyze(request: Request): Promise<Response> {
@@ -112,11 +156,35 @@ export class AnalystSimple extends DurableObject<Env> {
     }
   }
 
-  private async handleHealth(): Promise<Response> {
+  private async runAnalysisFromScout(): Promise<void> {
+    const dataScoutId = this.env.DATA_SCOUT.idFromName("default");
+    const dataScout = this.env.DATA_SCOUT.get(dataScoutId);
+    const response = await dataScout.fetch("http://data-scout/signals");
+    if (!response.ok) {
+      return;
+    }
+
+    const payload = await response.json() as { signals?: unknown[] };
+    const signals = Array.isArray(payload.signals) ? payload.signals : [];
+    const recommendations = await this.analyzeSignals(signals);
+    this.state.lastAnalysisTime = Date.now();
+    await this.saveState();
+
+    try {
+      await this.publishEvent("analysis_ready", {
+        recommendations,
+        generatedAt: this.state.lastAnalysisTime,
+      });
+    } catch (error) {
+      this.log("warn", "Unable to publish analysis_ready event", { error: String(error) });
+    }
+  }
+
+  private handleHealth(): Response {
     const now = Date.now();
     const lastAnalysisAge = now - this.state.lastAnalysisTime;
     const isHealthy = lastAnalysisAge < 600000; // 10 minutes
-    
+
     return new Response(JSON.stringify({
       healthy: isHealthy,
       lastAnalysisTime: this.state.lastAnalysisTime,
@@ -128,13 +196,38 @@ export class AnalystSimple extends DurableObject<Env> {
     });
   }
 
-  private async analyzeSignals(signals: any[]): Promise<any[]> {
+  private async analyzeSignals(signals: unknown[]): Promise<any[]> {
     if (!this._llm || signals.length === 0) {
       return [];
     }
 
+    const normalizedSignals: Array<{
+      symbol: string;
+      sentiment: number;
+      volume: number;
+      sources: string[];
+    }> = [];
+
+    for (const signal of signals) {
+      const candidate = signal as {
+        symbol?: string;
+        sentiment?: number;
+        volume?: number;
+        sources?: string[];
+      };
+      if (typeof candidate.symbol !== "string") continue;
+      if (typeof candidate.sentiment !== "number") continue;
+      if (typeof candidate.volume !== "number") continue;
+      normalizedSignals.push({
+        symbol: candidate.symbol,
+        sentiment: candidate.sentiment,
+        volume: candidate.volume,
+        sources: Array.isArray(candidate.sources) ? candidate.sources : [],
+      });
+    }
+
     // Filter to top 5 signals by sentiment * volume
-    const topSignals = signals
+    const topSignals = normalizedSignals
       .filter(s => Math.abs(s.sentiment) >= 0.3)
       .sort((a, b) => Math.abs(b.sentiment) * b.volume - Math.abs(a.sentiment) * a.volume)
       .slice(0, 5);
@@ -190,15 +283,14 @@ Output JSON array of recommendations:
 
       return recommendations;
     } catch (error) {
-      console.error("LLM analysis error:", error);
+      this.log("warn", "LLM analysis error", { error: String(error) });
       return [];
     }
   }
 
   private async researchSignal(symbol: string, sentimentScore: number): Promise<any> {
     const cached = this.state.researchResults[symbol];
-    const CACHE_TTL_MS = 180000; // 3 minutes
-    if (cached && Date.now() - cached.timestamp < CACHE_TTL_MS) {
+    if (cached && Date.now() - cached.timestamp < this.researchTtlMs) {
       return cached;
     }
 
@@ -258,12 +350,20 @@ JSON response:
       
       return result;
     } catch (error) {
-      console.error("Signal research error:", error);
+      this.log("warn", "Signal research error", { error: String(error), symbol });
       return null;
     }
   }
 
   async alarm(): Promise<void> {
+    if (!this._llm) {
+      this.initializeLLM();
+    }
+
+    if (Date.now() - this.state.lastAnalysisTime >= this.analysisIntervalMs) {
+      await this.runAnalysisFromScout();
+    }
+
     // Clean up old research results (older than 1 hour)
     const now = Date.now();
     const oneHourAgo = now - 60 * 60 * 1000;
@@ -274,10 +374,8 @@ JSON response:
         delete this.state.researchResults[symbol];
       }
     }
-    
-    await this.ctx.storage.put("state", this.state);
-    
-    // Reschedule for 1 hour from now
-    await this.ctx.storage.setAlarm(Date.now() + 3600000);
+
+    await this.saveState();
+    await super.alarm();
   }
 }

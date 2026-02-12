@@ -12,12 +12,18 @@ export { AnalystSimple as Analyst } from "./durable-objects/analyst-simple";
 export { TraderSimple as Trader } from "./durable-objects/trader-simple";
 export { SwarmRegistry } from "./durable-objects/swarm-registry";
 export { RiskManager } from "./durable-objects/risk-manager";
+export { LearningAgent } from "./durable-objects/learning-agent";
 
 function unauthorizedResponse(): Response {
   return new Response(JSON.stringify({ error: "Unauthorized. Requires: Authorization: Bearer <token>" }), {
     status: 401,
     headers: { "Content-Type": "application/json" },
   });
+}
+
+function getRegistryStub(env: Env): DurableObjectStub {
+  const registryId = env.SWARM_REGISTRY.idFromName("default");
+  return env.SWARM_REGISTRY.get(registryId);
 }
 
 export default {
@@ -149,14 +155,67 @@ export default {
       if (!isRequestAuthorized(request, env, "read")) {
         return unauthorizedResponse();
       }
-      const registryId = env.SWARM_REGISTRY.idFromName("default");
-      const registry = env.SWARM_REGISTRY.get(registryId);
+      const registry = getRegistryStub(env);
       const registryPath = url.pathname.replace("/registry", "") || "/health";
       const registryUrl = new URL(registryPath, "http://registry");
       registryUrl.search = url.search;
       return registry.fetch(
         new Request(registryUrl.toString(), {
           method: request.method,
+          headers: request.headers,
+          body: request.body,
+        })
+      );
+    }
+
+    if (url.pathname === "/swarm/agents") {
+      if (!isRequestAuthorized(request, env, "read")) {
+        return unauthorizedResponse();
+      }
+      const registry = getRegistryStub(env);
+      return registry.fetch("http://registry/agents");
+    }
+
+    if (url.pathname === "/swarm/queue") {
+      if (!isRequestAuthorized(request, env, "read")) {
+        return unauthorizedResponse();
+      }
+      const registry = getRegistryStub(env);
+      return registry.fetch("http://registry/queue/state");
+    }
+
+    if (url.pathname === "/swarm/subscriptions") {
+      if (!isRequestAuthorized(request, env, "read")) {
+        return unauthorizedResponse();
+      }
+      const registry = getRegistryStub(env);
+      const proxyUrl = new URL("/subscriptions", "http://registry");
+      proxyUrl.search = url.search;
+      return registry.fetch(proxyUrl.toString());
+    }
+
+    if (url.pathname === "/swarm/dispatch" && request.method === "POST") {
+      if (!isRequestAuthorized(request, env, "trade")) {
+        return unauthorizedResponse();
+      }
+      const registry = getRegistryStub(env);
+      return registry.fetch(
+        new Request("http://registry/queue/dispatch", {
+          method: "POST",
+          headers: request.headers,
+          body: request.body,
+        })
+      );
+    }
+
+    if (url.pathname === "/swarm/publish" && request.method === "POST") {
+      if (!isRequestAuthorized(request, env, "trade")) {
+        return unauthorizedResponse();
+      }
+      const registry = getRegistryStub(env);
+      return registry.fetch(
+        new Request("http://registry/queue/publish", {
+          method: "POST",
           headers: request.headers,
           body: request.body,
         })
@@ -174,6 +233,30 @@ export default {
       riskUrl.search = url.search;
       return riskManager.fetch(
         new Request(riskUrl.toString(), {
+          method: request.method,
+          headers: request.headers,
+          body: request.body,
+        })
+      );
+    }
+
+    if (url.pathname.startsWith("/learning")) {
+      if (!isRequestAuthorized(request, env, "read")) {
+        return unauthorizedResponse();
+      }
+      if (!env.LEARNING_AGENT) {
+        return new Response(JSON.stringify({ error: "Learning agent not configured" }), {
+          status: 503,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      const learningId = env.LEARNING_AGENT.idFromName("default");
+      const learningAgent = env.LEARNING_AGENT.get(learningId);
+      const learningPath = url.pathname.replace("/learning", "") || "/health";
+      const learningUrl = new URL(learningPath, "http://learning");
+      learningUrl.search = url.search;
+      return learningAgent.fetch(
+        new Request(learningUrl.toString(), {
           method: request.method,
           headers: request.headers,
           body: request.body,

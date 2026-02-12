@@ -4,11 +4,12 @@
  * Follows the same pattern as OwokxHarness for consistency.
  */
 
-import { DurableObject } from "cloudflare:workers";
+import { AgentBase, type AgentBaseState } from "../lib/agents/base";
 import type { Env } from "../env.d";
+import type { AgentMessage, AgentType } from "../lib/agents/protocol";
 import { extractTickers, DEFAULT_TICKER_BLACKLIST } from "../lib/ticker";
 
-interface DataScoutState {
+interface DataScoutState extends AgentBaseState {
   signals: Record<string, {
     symbol: string;
     sentiment: number;
@@ -19,48 +20,62 @@ interface DataScoutState {
   lastGatherTime: number;
 }
 
-const DEFAULT_STATE: DataScoutState = {
+const DEFAULT_STATE: Pick<DataScoutState, "signals" | "lastGatherTime"> = {
   signals: {},
   lastGatherTime: 0,
 };
 
-export class DataScoutSimple extends DurableObject<Env> {
-  private state: DataScoutState = { ...DEFAULT_STATE };
+export class DataScoutSimple extends AgentBase<DataScoutState> {
+  protected agentType: AgentType = "scout";
+  private readonly gatherIntervalMs = 300_000;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
+    this.state = {
+      ...this.state,
+      signals: this.state.signals ?? DEFAULT_STATE.signals,
+      lastGatherTime: this.state.lastGatherTime ?? DEFAULT_STATE.lastGatherTime,
+    };
+  }
 
-    ctx.blockConcurrencyWhile(async () => {
-      const stored = await ctx.storage.get<DataScoutState>("state");
-      if (stored) {
-        this.state = { ...DEFAULT_STATE, ...stored };
-      }
-    });
+  protected getCapabilities(): string[] {
+    return ["gather_signals", "get_signals", "publish_signals"];
   }
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
-    const path = url.pathname;
-
-    if (path === "/gather") {
-      return this.handleGather();
-    } else if (path === "/signals") {
-      return this.handleGetSignals();
-    } else if (path === "/health") {
+    if (url.pathname === "/health") {
       return this.handleHealth();
     }
+    return super.fetch(request);
+  }
 
-    return new Response("Not found", { status: 404 });
+  protected async handleMessage(message: AgentMessage): Promise<unknown> {
+    switch (message.topic) {
+      case "gather_signals":
+        await this.runGatherCycle();
+        return { success: true, signalCount: Object.keys(this.state.signals).length };
+      case "get_signals":
+        return { signals: Object.values(this.state.signals) };
+      default:
+        return { error: `Unknown topic: ${message.topic}` };
+    }
+  }
+
+  protected async handleCustomFetch(_request: Request, url: URL): Promise<Response> {
+    const path = url.pathname;
+    if (path === "/gather") {
+      return this.handleGather();
+    }
+    if (path === "/signals") {
+      return this.handleGetSignals();
+    }
+    return super.handleCustomFetch(_request, url);
   }
 
   private async handleGather(): Promise<Response> {
     try {
-      await this.gatherStockTwits();
-      await this.gatherReddit();
-      
-      this.state.lastGatherTime = Date.now();
-      await this.ctx.storage.put("state", this.state);
-      
+      await this.runGatherCycle();
       return new Response(JSON.stringify({ 
         success: true, 
         signalCount: Object.keys(this.state.signals).length 
@@ -86,6 +101,8 @@ export class DataScoutSimple extends DurableObject<Env> {
         delete this.state.signals[symbol];
       }
     }
+
+    await this.saveState();
     
     return new Response(JSON.stringify({ 
       signals: Object.values(this.state.signals) 
@@ -94,11 +111,28 @@ export class DataScoutSimple extends DurableObject<Env> {
     });
   }
 
-  private async handleHealth(): Promise<Response> {
+  private async runGatherCycle(): Promise<void> {
+    await this.gatherStockTwits();
+    await this.gatherReddit();
+
+    this.state.lastGatherTime = Date.now();
+    await this.saveState();
+
+    try {
+      await this.publishEvent("signals_updated", {
+        count: Object.keys(this.state.signals).length,
+        timestamp: this.state.lastGatherTime,
+      });
+    } catch (error) {
+      this.log("warn", "Unable to publish signals_updated event", { error: String(error) });
+    }
+  }
+
+  private handleHealth(): Response {
     const now = Date.now();
     const lastGatherAge = now - this.state.lastGatherTime;
     const isHealthy = lastGatherAge < 300000; // 5 minutes
-    
+
     return new Response(JSON.stringify({
       healthy: isHealthy,
       lastGatherTime: this.state.lastGatherTime,
@@ -163,7 +197,7 @@ export class DataScoutSimple extends DurableObject<Env> {
         }
       }
     } catch (error) {
-      console.error("StockTwits gathering error:", error);
+      this.log("warn", "StockTwits gathering error", { error: String(error) });
     }
   }
 
@@ -242,7 +276,7 @@ export class DataScoutSimple extends DurableObject<Env> {
         }
       }
     } catch (error) {
-      console.error("Reddit gathering error:", error);
+      this.log("warn", "Reddit gathering error", { error: String(error) });
     }
   }
 
@@ -273,14 +307,9 @@ export class DataScoutSimple extends DurableObject<Env> {
   }
 
   async alarm(): Promise<void> {
-    // Auto-gather data every 5 minutes
-    await this.gatherStockTwits();
-    await this.gatherReddit();
-    
-    this.state.lastGatherTime = Date.now();
-    await this.ctx.storage.put("state", this.state);
-    
-    // Reschedule for 5 minutes from now
-    await this.ctx.storage.setAlarm(Date.now() + 300000);
+    if (Date.now() - this.state.lastGatherTime >= this.gatherIntervalMs) {
+      await this.runGatherCycle();
+    }
+    await super.alarm();
   }
 }
