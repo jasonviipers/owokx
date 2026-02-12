@@ -721,7 +721,7 @@ export default function App() {
               <div className="overflow-y-auto h-full space-y-1">
                 {signals.length === 0 ? (
                   <div className="text-hud-text-dim text-sm py-4 text-center">
-                    {!status?.enabled ? (
+                    {status?.enabled === false ? (
                       <span className="text-hud-warning">Agent paused. Enable to gather signals.</span>
                     ) : status?.swarm?.healthy === false ? (
                       <span className="text-hud-error">Swarm unhealthy - Waiting for peers...</span>
@@ -821,7 +821,7 @@ export default function App() {
               <div className="overflow-y-auto h-full space-y-2">
                 {Object.entries(status?.signalResearch || {}).length === 0 ? (
                   <div className="text-hud-text-dim text-sm py-4 text-center">
-                    {!status?.enabled ? (
+                    {status?.enabled === false ? (
                       <span className="text-hud-warning">Agent paused.</span>
                     ) : status?.swarm?.healthy === false ? (
                       <span className="text-hud-error">Swarm unhealthy.</span>
