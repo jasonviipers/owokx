@@ -154,6 +154,8 @@ interface PositionEntry {
   entry_reason: string;
   peak_price: number;
   peak_sentiment: number;
+  entry_prediction?: number;
+  entry_regime?: "trending" | "ranging" | "volatile";
 }
 
 interface SocialHistoryEntry {
@@ -210,6 +212,111 @@ interface PremarketPlan {
   researched_buys: ResearchResult[];
 }
 
+interface MemoryEpisode {
+  id: string;
+  timestamp: number;
+  importance: number; // 0-1
+  context: string;
+  outcome: "success" | "failure" | "neutral";
+  tags: string[];
+  metadata?: Record<string, unknown>;
+}
+
+interface DynamicRiskProfile {
+  timestamp: number;
+  marketRegime: "trending" | "ranging" | "volatile";
+  realizedVolatility: number;
+  maxDrawdownPct: number;
+  sharpeLike: number;
+  multiplier: number;
+  suggestedPositionPct: number;
+}
+
+interface MarketRegime {
+  type: "trending" | "ranging" | "volatile";
+  confidence: number;
+  duration: number;
+  characteristics: Record<string, number>;
+  detectedAt: number;
+  since: number;
+}
+
+interface PredictiveModelState {
+  bias: number;
+  learningRate: number;
+  weights: {
+    sentiment: number;
+    freshness: number;
+    sourceDiversity: number;
+    logVolume: number;
+    regimeAlignment: number;
+  };
+  samples: number;
+  hitRate: number;
+  mse: number;
+  lastUpdatedAt: number;
+  perSymbol: Record<
+    string,
+    {
+      samples: number;
+      wins: number;
+      losses: number;
+      avgReturnPct: number;
+      lastOutcomeAt: number;
+    }
+  >;
+}
+
+interface StressTestResult {
+  timestamp: number;
+  passed: boolean;
+  worstCaseLoss: number;
+  worstCaseDrawdownPct: number;
+  recommendedRiskMultiplier: number;
+  historicalShockPct: number;
+  scenarios: Array<{
+    name: string;
+    shockPct: number;
+    projectedLoss: number;
+    projectedDrawdownPct: number;
+  }>;
+}
+
+interface OptimizationState {
+  adaptiveDataPollIntervalMs: number;
+  adaptiveResearchIntervalMs: number;
+  adaptiveAnalystIntervalMs: number;
+  gatherLatencyEmaMs: number;
+  researchLatencyEmaMs: number;
+  analystLatencyEmaMs: number;
+  errorRateEma: number;
+  lastOptimizationAt: number;
+  optimizationRuns: number;
+}
+
+interface SymbolToolContext {
+  technical: {
+    rsi14: number | null;
+    macd: number | null;
+    macdSignal: number | null;
+    bollingerUpper: number | null;
+    bollingerMid: number | null;
+    bollingerLower: number | null;
+    trendStrength: number | null;
+  };
+  fundamental: {
+    dailyChangePct: number;
+    sourceDiversity: number;
+    secCatalysts: number;
+    mentionVolume: number;
+  };
+  risk: {
+    portfolioVolatility: number;
+    maxDrawdownPct: number;
+    regime: "trending" | "ranging" | "volatile";
+  };
+}
+
 interface AgentState {
   config: AgentConfig;
   signalCache: Signal[];
@@ -234,6 +341,14 @@ interface AgentState {
   twitterDailyReadReset: number;
   twitterReadTokens: number;
   twitterReadLastRefill: number;
+  memoryEpisodes: MemoryEpisode[];
+  lastRiskProfile: DynamicRiskProfile | null;
+  marketRegime: MarketRegime;
+  predictiveModel: PredictiveModelState;
+  lastStressTest: StressTestResult | null;
+  optimization: OptimizationState;
+  lastSwarmRoleSyncAt: number;
+  swarmRoleHealth: Partial<Record<"scout" | "analyst" | "trader" | "risk_manager" | "learning", number>>;
   premarketPlan: PremarketPlan | null;
   lastBrokerAuthError?: { at: number; message: string };
   lastLLMAuthError?: { at: number; message: string };
@@ -331,7 +446,7 @@ const DEFAULT_CONFIG: AgentConfig = {
   allowed_exchanges: ["NYSE", "NASDAQ", "ARCA", "AMEX", "BATS"],
 };
 
-type GathererSource = "stocktwits" | "reddit" | "crypto" | "sec";
+type GathererSource = "stocktwits" | "reddit" | "crypto" | "sec" | "scout";
 
 const SIGNAL_CACHE_MAX = 200;
 const SIGNAL_MAX_AGE_MS = 24 * 60 * 60 * 1000;
@@ -343,15 +458,68 @@ const DATA_GATHERER_TIMEOUT_MS: Record<GathererSource, number> = {
   reddit: 6_000,
   crypto: 4_000,
   sec: 5_000,
+  scout: 4_000,
 };
 
 const RESEARCH_MAX_CONCURRENT = 3;
 const RESEARCH_BATCH_DELAY_MS = 200;
 
+const MEMORY_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+const MEMORY_MAX_EPISODES = 500;
+const MEMORY_HALF_LIFE_MS = 7 * 24 * 60 * 60 * 1000;
+const MEMORY_MIN_IMPORTANCE_TO_KEEP = 0.15;
+
+const SWARM_ROLE_SYNC_INTERVAL_MS = 120_000;
+const STRESS_TEST_INTERVAL_MS = 300_000;
+const OPTIMIZATION_INTERVAL_MS = 180_000;
+
 const TWITTER_DAILY_READ_LIMIT = 200;
 const TWITTER_BUCKET_CAPACITY = 20;
 const TWITTER_BUCKET_REFILL_PER_SECOND = TWITTER_DAILY_READ_LIMIT / 86_400;
 const TWITTER_BUCKET_DAY_MS = 86_400_000;
+
+const DEFAULT_MARKET_REGIME: MarketRegime = {
+  type: "ranging",
+  confidence: 0.5,
+  duration: 0,
+  characteristics: {
+    volatility: 0.01,
+    trend: 0,
+    sharpe_like: 0,
+    sentiment_dispersion: 0,
+  },
+  detectedAt: 0,
+  since: 0,
+};
+
+const DEFAULT_PREDICTIVE_MODEL: PredictiveModelState = {
+  bias: 0,
+  learningRate: 0.05,
+  weights: {
+    sentiment: 1.2,
+    freshness: 0.8,
+    sourceDiversity: 0.5,
+    logVolume: 0.35,
+    regimeAlignment: 0.4,
+  },
+  samples: 0,
+  hitRate: 0,
+  mse: 0,
+  lastUpdatedAt: 0,
+  perSymbol: {},
+};
+
+const DEFAULT_OPTIMIZATION_STATE: OptimizationState = {
+  adaptiveDataPollIntervalMs: DEFAULT_CONFIG.data_poll_interval_ms,
+  adaptiveResearchIntervalMs: 120_000,
+  adaptiveAnalystIntervalMs: DEFAULT_CONFIG.analyst_interval_ms,
+  gatherLatencyEmaMs: 0,
+  researchLatencyEmaMs: 0,
+  analystLatencyEmaMs: 0,
+  errorRateEma: 0,
+  lastOptimizationAt: 0,
+  optimizationRuns: 0,
+};
 
 const DEFAULT_STATE: AgentState = {
   config: DEFAULT_CONFIG,
@@ -377,6 +545,14 @@ const DEFAULT_STATE: AgentState = {
   twitterDailyReadReset: 0,
   twitterReadTokens: TWITTER_BUCKET_CAPACITY,
   twitterReadLastRefill: 0,
+  memoryEpisodes: [],
+  lastRiskProfile: null,
+  marketRegime: { ...DEFAULT_MARKET_REGIME },
+  predictiveModel: { ...DEFAULT_PREDICTIVE_MODEL, weights: { ...DEFAULT_PREDICTIVE_MODEL.weights }, perSymbol: {} },
+  lastStressTest: null,
+  optimization: { ...DEFAULT_OPTIMIZATION_STATE },
+  lastSwarmRoleSyncAt: 0,
+  swarmRoleHealth: {},
   premarketPlan: null,
   enabled: false,
 };
@@ -896,6 +1072,31 @@ export class OwokxHarness extends DurableObject<Env> {
       const stored = await this.ctx.storage.get<AgentState>("state");
       if (stored) {
         this.state = { ...DEFAULT_STATE, ...stored };
+        if (!Array.isArray(this.state.memoryEpisodes)) {
+          this.state.memoryEpisodes = [];
+        }
+        this.state.marketRegime = {
+          ...DEFAULT_MARKET_REGIME,
+          ...(this.state.marketRegime ?? {}),
+          characteristics: {
+            ...DEFAULT_MARKET_REGIME.characteristics,
+            ...(this.state.marketRegime?.characteristics ?? {}),
+          },
+        };
+        this.state.predictiveModel = {
+          ...DEFAULT_PREDICTIVE_MODEL,
+          ...(this.state.predictiveModel ?? {}),
+          weights: {
+            ...DEFAULT_PREDICTIVE_MODEL.weights,
+            ...(this.state.predictiveModel?.weights ?? {}),
+          },
+          perSymbol: this.state.predictiveModel?.perSymbol ?? {},
+        };
+        this.state.optimization = {
+          ...DEFAULT_OPTIMIZATION_STATE,
+          ...(this.state.optimization ?? {}),
+        };
+        this.pruneMemoryEpisodes();
 
         // AUTO-CORRECTION: Fix corrupted crypto_symbols in persisted state
         if (this.state.config.crypto_symbols && Array.isArray(this.state.config.crypto_symbols)) {
@@ -1034,7 +1235,12 @@ export class OwokxHarness extends DurableObject<Env> {
     }
 
     const now = Date.now();
-    const RESEARCH_INTERVAL_MS = 120_000;
+    const researchIntervalMs =
+      this.state.optimization?.adaptiveResearchIntervalMs || DEFAULT_OPTIMIZATION_STATE.adaptiveResearchIntervalMs;
+    const dataPollIntervalMs =
+      this.state.optimization?.adaptiveDataPollIntervalMs || this.state.config.data_poll_interval_ms;
+    const analystIntervalMs =
+      this.state.optimization?.adaptiveAnalystIntervalMs || this.state.config.analyst_interval_ms;
     const POSITION_RESEARCH_INTERVAL_MS = 300_000;
 
     try {
@@ -1052,15 +1258,19 @@ export class OwokxHarness extends DurableObject<Env> {
         return;
       }
 
+      if (now - this.state.lastSwarmRoleSyncAt >= SWARM_ROLE_SYNC_INTERVAL_MS) {
+        await this.syncSwarmRoleHealth();
+      }
+
       const broker = createBrokerProviders(this.env, this.state.config.broker);
       const clock = await broker.trading.getClock();
 
-      if (now - this.state.lastDataGatherRun >= this.state.config.data_poll_interval_ms) {
+      if (now - this.state.lastDataGatherRun >= dataPollIntervalMs) {
         await this.runDataGatherers();
         this.state.lastDataGatherRun = now;
       }
 
-      if (now - this.state.lastResearchRun >= RESEARCH_INTERVAL_MS) {
+      if (now - this.state.lastResearchRun >= researchIntervalMs) {
         await this.researchTopSignals(5);
         this.state.lastResearchRun = now;
       }
@@ -1070,6 +1280,15 @@ export class OwokxHarness extends DurableObject<Env> {
       }
 
       const positions = await broker.trading.getPositions();
+      if (!this.state.lastStressTest || now - this.state.lastStressTest.timestamp >= STRESS_TEST_INTERVAL_MS) {
+        try {
+          const account = await broker.trading.getAccount();
+          this.runStressTest(account, positions);
+        } catch (error) {
+          this.log("Risk", "stress_test_skipped", { error: String(error) });
+          this.recordPerformanceSample("analyst", 0, true);
+        }
+      }
 
       if (this.state.config.crypto_enabled) {
         await this.runCryptoTrading(broker, positions);
@@ -1080,8 +1299,10 @@ export class OwokxHarness extends DurableObject<Env> {
           await this.executePremarketPlan();
         }
 
-        if (now - this.state.lastAnalystRun >= this.state.config.analyst_interval_ms) {
+        if (now - this.state.lastAnalystRun >= analystIntervalMs) {
+          const analystStart = Date.now();
           await this.runAnalyst();
+          this.recordPerformanceSample("analyst", Date.now() - analystStart, false);
           this.state.lastAnalystRun = now;
         }
 
@@ -1114,9 +1335,15 @@ export class OwokxHarness extends DurableObject<Env> {
         }
       }
 
+      if (!this.state.optimization.lastOptimizationAt || now - this.state.optimization.lastOptimizationAt >= OPTIMIZATION_INTERVAL_MS) {
+        this.optimizeRuntimeParameters(now);
+      }
+
+      this.pruneMemoryEpisodes();
       await this.persist();
     } catch (error) {
       this.log("System", "alarm_error", { error: String(error) });
+      this.recordPerformanceSample("analyst", this.state.optimization.analystLatencyEmaMs || 1_000, true);
     }
 
     await this.scheduleNextAlarm();
@@ -1170,7 +1397,18 @@ export class OwokxHarness extends DurableObject<Env> {
     const url = new URL(request.url);
     const action = url.pathname.slice(1);
 
-    const readActions = ["status", "logs", "costs", "signals", "history", "setup/status", "metrics"];
+    const readActions = [
+      "status",
+      "logs",
+      "costs",
+      "signals",
+      "history",
+      "setup/status",
+      "metrics",
+      "regime",
+      "prediction",
+      "stress-test",
+    ];
     const tradeActions = ["enable", "disable", "trigger", "reset"];
     let requiredScope: "read" | "trade" | null = null;
 
@@ -1226,6 +1464,24 @@ export class OwokxHarness extends DurableObject<Env> {
         case "metrics":
           return this.handleMetrics();
 
+        case "regime":
+          return this.jsonResponse({ regime: this.state.marketRegime, risk_profile: this.state.lastRiskProfile });
+
+        case "prediction":
+          return this.jsonResponse({
+            predictive_model: this.state.predictiveModel,
+            top_symbol_stats: Object.entries(this.state.predictiveModel.perSymbol)
+              .sort((a, b) => (b[1]?.samples || 0) - (a[1]?.samples || 0))
+              .slice(0, 20)
+              .reduce<Record<string, unknown>>((acc, [symbol, stats]) => {
+                acc[symbol] = stats;
+                return acc;
+              }, {}),
+          });
+
+        case "stress-test":
+          return this.handleStressTest();
+
         case "trigger":
           await this.alarm();
           return this.jsonResponse({ ok: true, message: "Alarm triggered" });
@@ -1256,6 +1512,11 @@ export class OwokxHarness extends DurableObject<Env> {
     const recentErrors = recentLogs.filter((l) => l.action.includes("error") || l.action.includes("failed")).length;
     const signals = Array.isArray(this.state.signalCache) ? this.state.signalCache.length : 0;
     const positionEntries = this.state.positionEntries ? Object.keys(this.state.positionEntries).length : 0;
+    const elapsedSeconds = Math.max(0, (now - (this.state.twitterReadLastRefill || now)) / 1000);
+    const projectedTwitterTokens = Math.min(
+      TWITTER_BUCKET_CAPACITY,
+      this.state.twitterReadTokens + elapsedSeconds * TWITTER_BUCKET_REFILL_PER_SECOND
+    );
 
     return this.jsonResponse({
       ok: true,
@@ -1269,9 +1530,42 @@ export class OwokxHarness extends DurableObject<Env> {
         logs_recent_errors: recentErrors,
         last_analyst_run_ms: this.state.lastAnalystRun ?? null,
         last_research_run_ms: this.state.lastResearchRun ?? null,
+        signal_cache_bytes_estimate: this.state.signalCacheBytesEstimate,
+        signal_cache_peak_bytes: this.state.signalCachePeakBytes,
+        signal_cache_cleanup_count: this.state.signalCacheCleanupCount,
+        signal_cache_last_cleanup_at: this.state.signalCacheLastCleanupAt || null,
+        twitter_daily_reads: this.state.twitterDailyReads,
+        twitter_daily_remaining: Math.max(0, TWITTER_DAILY_READ_LIMIT - this.state.twitterDailyReads),
+        twitter_bucket_tokens: Number(projectedTwitterTokens.toFixed(3)),
+        memory_episodes: this.state.memoryEpisodes.length,
+        last_risk_profile: this.state.lastRiskProfile,
+        market_regime: this.state.marketRegime,
+        last_stress_test: this.state.lastStressTest,
+        optimization: this.state.optimization,
+        predictive_model_samples: this.state.predictiveModel.samples,
+        predictive_model_hit_rate: this.state.predictiveModel.hitRate,
+        swarm_role_health: this.state.swarmRoleHealth,
+        swarm_role_sync_at: this.state.lastSwarmRoleSyncAt || null,
         now_ms: now,
       },
     });
+  }
+
+  private async handleStressTest(): Promise<Response> {
+    let broker: BrokerProviders;
+    try {
+      broker = createBrokerProviders(this.env, this.state.config.broker);
+    } catch (error) {
+      return this.jsonResponse({ ok: false, error: String(error) });
+    }
+
+    try {
+      const [account, positions] = await Promise.all([broker.trading.getAccount(), broker.trading.getPositions()]);
+      const report = this.runStressTest(account, positions);
+      return this.jsonResponse({ ok: true, report });
+    } catch (error) {
+      return this.jsonResponse({ ok: false, error: String(error) });
+    }
   }
 
   private maybeRecordPortfolioSnapshot(equity: number): void {
@@ -1316,6 +1610,13 @@ export class OwokxHarness extends DurableObject<Env> {
           twitterConfirmations: this.state.twitterConfirmations,
           premarketPlan: this.state.premarketPlan,
           stalenessAnalysis: this.state.stalenessAnalysis,
+          memoryEpisodes: this.state.memoryEpisodes.slice(-50),
+          lastRiskProfile: this.state.lastRiskProfile,
+          marketRegime: this.state.marketRegime,
+          predictiveModel: this.state.predictiveModel,
+          lastStressTest: this.state.lastStressTest,
+          optimization: this.state.optimization,
+          swarmRoleHealth: this.state.swarmRoleHealth,
         },
       });
     }
@@ -1345,6 +1646,13 @@ export class OwokxHarness extends DurableObject<Env> {
           twitterConfirmations: this.state.twitterConfirmations,
           premarketPlan: this.state.premarketPlan,
           stalenessAnalysis: this.state.stalenessAnalysis,
+          memoryEpisodes: this.state.memoryEpisodes.slice(-50),
+          lastRiskProfile: this.state.lastRiskProfile,
+          marketRegime: this.state.marketRegime,
+          predictiveModel: this.state.predictiveModel,
+          lastStressTest: this.state.lastStressTest,
+          optimization: this.state.optimization,
+          swarmRoleHealth: this.state.swarmRoleHealth,
           broker_error: cachedAuthError.message,
         },
       });
@@ -1414,6 +1722,13 @@ export class OwokxHarness extends DurableObject<Env> {
         premarketPlan: this.state.premarketPlan,
         stalenessAnalysis: this.state.stalenessAnalysis,
         overnightActivity: this.state.overnightActivity,
+        memoryEpisodes: this.state.memoryEpisodes.slice(-50),
+        lastRiskProfile: this.state.lastRiskProfile,
+        marketRegime: this.state.marketRegime,
+        predictiveModel: this.state.predictiveModel,
+        lastStressTest: this.state.lastStressTest,
+        optimization: this.state.optimization,
+        swarmRoleHealth: this.state.swarmRoleHealth,
         swarm,
       },
     });
@@ -1422,6 +1737,8 @@ export class OwokxHarness extends DurableObject<Env> {
   private async handleUpdateConfig(request: Request): Promise<Response> {
     const body = (await request.json()) as Partial<AgentConfig>;
     this.state.config = { ...this.state.config, ...body };
+    this.state.optimization.adaptiveDataPollIntervalMs = this.state.config.data_poll_interval_ms;
+    this.state.optimization.adaptiveAnalystIntervalMs = this.state.config.analyst_interval_ms;
     this.initializeLLM();
     await this.persist();
     return this.jsonResponse({ ok: true, config: this.state.config });
@@ -1596,7 +1913,7 @@ export class OwokxHarness extends DurableObject<Env> {
   //
   // To add a new source:
   // 1. Create a new gather method (e.g., gatherNewsAPI)
-  // 2. Add it to runDataGatherers() Promise.all
+  // 2. Add it to runDataGatherers() gatherers array (allSettled + timeout)
   // 3. Add source weight to SOURCE_CONFIG.weights
   // 4. Return Signal[] with your source name
   //
@@ -1619,12 +1936,16 @@ export class OwokxHarness extends DurableObject<Env> {
       { source: "crypto", run: () => this.gatherCrypto() },
       { source: "sec", run: () => this.gatherSECFilings() },
     ];
+    if (this.env.DATA_SCOUT) {
+      gatherers.push({ source: "scout", run: () => this.gatherScoutSignals() });
+    }
 
     const sourceCounts: Record<GathererSource, number> = {
       stocktwits: 0,
       reddit: 0,
       crypto: 0,
       sec: 0,
+      scout: 0,
     };
     const sourceDurations: Partial<Record<GathererSource, number>> = {};
 
@@ -1662,17 +1983,36 @@ export class OwokxHarness extends DurableObject<Env> {
 
     this.updateSignalCache(allSignals);
 
+    const gatherDurationMs = Date.now() - startedAt;
     this.log("System", "data_gathered", {
       stocktwits: sourceCounts.stocktwits,
       reddit: sourceCounts.reddit,
       crypto: sourceCounts.crypto,
       sec: sourceCounts.sec,
+      scout: sourceCounts.scout,
       total: this.state.signalCache.length,
-      gather_duration_ms: Date.now() - startedAt,
+      gather_duration_ms: gatherDurationMs,
       source_durations_ms: sourceDurations,
       failed_sources: failures,
       signal_cache_bytes: this.state.signalCacheBytesEstimate,
     });
+    this.recordPerformanceSample("gather", gatherDurationMs, failures.length > 0);
+
+    this.rememberEpisode(
+      `Data gathered with ${this.state.signalCache.length} active signals`,
+      failures.length === gatherers.length ? "failure" : "success",
+      ["data", "signals", ...Object.keys(sourceCounts)],
+      {
+        impact: Math.min(1, this.state.signalCache.length / Math.max(1, SIGNAL_CACHE_MAX)),
+        confidence: failures.length > 0 ? 0.6 : 0.85,
+        novelty: failures.length > 0 ? 0.75 : 0.4,
+        metadata: {
+          sourceCounts,
+          failures,
+          durationMs: gatherDurationMs,
+        },
+      }
+    );
   }
 
   private updateSignalCache(incomingSignals: Signal[]): void {
@@ -1727,6 +2067,21 @@ export class OwokxHarness extends DurableObject<Env> {
         budget_bytes: SIGNAL_CACHE_MEMORY_BUDGET_BYTES,
         cleanup_count: this.state.signalCacheCleanupCount,
       });
+      this.rememberEpisode(
+        `Signal cache cleanup executed (${nextSignals.length} kept)`,
+        "neutral",
+        ["memory", "cache", "cleanup"],
+        {
+          impact: 0.35,
+          confidence: 0.9,
+          novelty: 0.3,
+          metadata: {
+            beforeCount: deduped.size,
+            afterCount: nextSignals.length,
+            estimatedBytes,
+          },
+        }
+      );
     }
 
     this.state.signalCache = nextSignals;
@@ -1746,6 +2101,66 @@ export class OwokxHarness extends DurableObject<Env> {
       return new TextEncoder().encode(JSON.stringify(value)).length;
     } catch {
       return 0;
+    }
+  }
+
+  private async gatherScoutSignals(): Promise<Signal[]> {
+    if (!this.env.DATA_SCOUT) return [];
+
+    try {
+      const id = this.env.DATA_SCOUT.idFromName("default");
+      const stub = this.env.DATA_SCOUT.get(id);
+      const res = await this.withTimeout(stub.fetch("http://data-scout/signals"), DATA_GATHERER_TIMEOUT_MS.scout, "scout_signals_timeout");
+      if (!res.ok) {
+        this.log("Scout", "signals_fetch_failed", { status: res.status });
+        return [];
+      }
+
+      const payload = (await res.json()) as {
+        signals?: Array<{
+          symbol?: string;
+          sentiment?: number;
+          volume?: number;
+          sources?: string[];
+          timestamp?: number;
+        }>;
+      };
+
+      const now = Date.now();
+      const mapped: Signal[] = [];
+      const sourceWeight = 0.92;
+
+      for (const candidate of payload.signals ?? []) {
+        if (!candidate || typeof candidate.symbol !== "string" || typeof candidate.sentiment !== "number") {
+          continue;
+        }
+        const symbol = candidate.symbol.toUpperCase();
+        const sentiment = Number.isFinite(candidate.sentiment) ? candidate.sentiment : 0;
+        const volume = typeof candidate.volume === "number" && Number.isFinite(candidate.volume) ? candidate.volume : 1;
+        const signalTimestamp =
+          typeof candidate.timestamp === "number" && Number.isFinite(candidate.timestamp) ? candidate.timestamp : now;
+        const sources = Array.isArray(candidate.sources) ? candidate.sources.map((s) => String(s)) : ["scout"];
+
+        mapped.push({
+          symbol,
+          source: "scout",
+          source_detail: `swarm_scout_${sources.slice(0, 3).join("+")}`,
+          sentiment,
+          raw_sentiment: sentiment,
+          volume,
+          freshness: calculateTimeDecay(signalTimestamp / 1000),
+          source_weight: sourceWeight,
+          reason: `Scout: ${sources.join(",")} volume ${volume}`,
+          timestamp: signalTimestamp,
+          subreddits: sources,
+        });
+      }
+
+      this.log("Scout", "signals_gathered", { count: mapped.length });
+      return mapped;
+    } catch (error) {
+      this.log("Scout", "signals_error", { error: String(error) });
+      return [];
     }
   }
 
@@ -2464,25 +2879,70 @@ export class OwokxHarness extends DurableObject<Env> {
     return !!(this.env.X_BEARER_TOKEN || this.env.TWITTER_BEARER_TOKEN);
   }
 
-  private canSpendTwitterRead(): boolean {
-    const ONE_DAY_MS = 86400_000;
-    const MAX_DAILY_READS = 200;
+  private canSpendTwitterRead(count = 1): boolean {
+    const spendCount = Math.max(1, Math.floor(count));
+    this.refillTwitterReadBucket();
 
-    const now = Date.now();
-    if (now - this.state.twitterDailyReadReset > ONE_DAY_MS) {
-      this.state.twitterDailyReads = 0;
-      this.state.twitterDailyReadReset = now;
+    if (this.state.twitterDailyReads + spendCount > TWITTER_DAILY_READ_LIMIT) {
+      return false;
     }
-    return this.state.twitterDailyReads < MAX_DAILY_READS;
+
+    return this.state.twitterReadTokens >= spendCount;
   }
 
   private spendTwitterRead(count = 1): void {
-    this.state.twitterDailyReads += count;
+    const spendCount = Math.max(1, Math.floor(count));
+    this.refillTwitterReadBucket();
+
+    const hasDailyBudget = this.state.twitterDailyReads + spendCount <= TWITTER_DAILY_READ_LIMIT;
+    const hasBucketTokens = this.state.twitterReadTokens >= spendCount;
+    if (!hasDailyBudget || !hasBucketTokens) {
+      this.log("X", "read_spend_rejected", {
+        requested: spendCount,
+        daily_total: this.state.twitterDailyReads,
+        daily_remaining: Math.max(0, TWITTER_DAILY_READ_LIMIT - this.state.twitterDailyReads),
+        bucket_tokens: Number(this.state.twitterReadTokens.toFixed(3)),
+      });
+      return;
+    }
+
+    this.state.twitterReadTokens = Math.max(0, this.state.twitterReadTokens - spendCount);
+    this.state.twitterDailyReads += spendCount;
     this.log("X", "read_spent", {
-      count,
+      count: spendCount,
       daily_total: this.state.twitterDailyReads,
-      budget_remaining: 200 - this.state.twitterDailyReads,
+      budget_remaining: Math.max(0, TWITTER_DAILY_READ_LIMIT - this.state.twitterDailyReads),
+      bucket_tokens_remaining: Number(this.state.twitterReadTokens.toFixed(3)),
+      bucket_capacity: TWITTER_BUCKET_CAPACITY,
     });
+  }
+
+  private refillTwitterReadBucket(now = Date.now()): void {
+    if (this.state.twitterDailyReadReset <= 0) {
+      this.state.twitterDailyReadReset = now;
+    }
+    if (now - this.state.twitterDailyReadReset > TWITTER_BUCKET_DAY_MS) {
+      this.state.twitterDailyReads = 0;
+      this.state.twitterDailyReadReset = now;
+    }
+
+    if (this.state.twitterReadLastRefill <= 0) {
+      this.state.twitterReadLastRefill = now;
+    }
+    if (!Number.isFinite(this.state.twitterReadTokens)) {
+      this.state.twitterReadTokens = TWITTER_BUCKET_CAPACITY;
+    }
+
+    const elapsedSeconds = Math.max(0, (now - this.state.twitterReadLastRefill) / 1000);
+    if (elapsedSeconds <= 0) {
+      return;
+    }
+
+    const replenished = elapsedSeconds * TWITTER_BUCKET_REFILL_PER_SECOND;
+    if (replenished > 0) {
+      this.state.twitterReadTokens = Math.min(TWITTER_BUCKET_CAPACITY, this.state.twitterReadTokens + replenished);
+      this.state.twitterReadLastRefill = now;
+    }
   }
 
   private async twitterSearchRecent(
@@ -2739,6 +3199,722 @@ export class OwokxHarness extends DurableObject<Env> {
   // [TUNE] Change llm_model and llm_analyst_model in config for cost/quality
   // ============================================================================
 
+  private clamp01(value: number): number {
+    if (!Number.isFinite(value)) return 0;
+    return Math.max(0, Math.min(1, value));
+  }
+
+  private sigmoid(value: number): number {
+    if (!Number.isFinite(value)) return 0.5;
+    if (value > 20) return 1;
+    if (value < -20) return 0;
+    return 1 / (1 + Math.exp(-value));
+  }
+
+  private computeSignalDispersion(): number {
+    const values = this.state.signalCache
+      .map((signal) => signal.sentiment)
+      .filter((value) => Number.isFinite(value))
+      .slice(0, 120);
+    if (values.length < 2) return 0;
+    const mean = values.reduce((sum, value) => sum + value, 0) / values.length;
+    const variance = values.reduce((sum, value) => sum + (value - mean) ** 2, 0) / values.length;
+    return Math.sqrt(Math.max(variance, 0));
+  }
+
+  private computeRegimeAlignment(signalSentiment: number, regime: "trending" | "ranging" | "volatile"): number {
+    const direction = signalSentiment >= 0 ? 1 : -1;
+    if (regime === "trending") return 0.7 * direction;
+    if (regime === "volatile") return direction > 0 ? 0.1 : -0.2;
+    return 0;
+  }
+
+  private applyRegimeConfidenceAdjustment(confidence: number, sentiment: number): number {
+    const regime = this.state.marketRegime;
+    let adjusted = confidence;
+    if (regime.type === "volatile") {
+      adjusted -= 0.08 * regime.confidence;
+    } else if (regime.type === "trending") {
+      adjusted += sentiment >= 0 ? 0.05 * regime.confidence : -0.03 * regime.confidence;
+    } else {
+      adjusted -= 0.02 * regime.confidence;
+    }
+    return this.clamp01(adjusted);
+  }
+
+  private predictSignalProbability(
+    signal: Pick<Signal, "symbol" | "sentiment" | "freshness" | "volume"> & { sourceDiversity?: number }
+  ): number {
+    const model = this.state.predictiveModel;
+    const sourceDiversity =
+      typeof signal.sourceDiversity === "number"
+        ? signal.sourceDiversity
+        : new Set(this.state.signalCache.filter((s) => s.symbol === signal.symbol).map((s) => s.source)).size;
+    const features = {
+      sentiment: this.clamp01((signal.sentiment + 1) / 2),
+      freshness: this.clamp01(signal.freshness),
+      sourceDiversity: this.clamp01(sourceDiversity / 4),
+      logVolume: this.clamp01(Math.log10(Math.max(1, signal.volume || 1)) / 3),
+      regimeAlignment: this.clamp01((this.computeRegimeAlignment(signal.sentiment, this.state.marketRegime.type) + 1) / 2),
+    };
+    const linear =
+      model.bias +
+      model.weights.sentiment * (features.sentiment - 0.5) * 2 +
+      model.weights.freshness * (features.freshness - 0.5) * 2 +
+      model.weights.sourceDiversity * (features.sourceDiversity - 0.5) * 2 +
+      model.weights.logVolume * (features.logVolume - 0.5) * 2 +
+      model.weights.regimeAlignment * (features.regimeAlignment - 0.5) * 2;
+    return this.clamp01(this.sigmoid(linear));
+  }
+
+  private updatePredictiveModelFromTrade(symbol: string, outcomeReturnPct: number, entry?: PositionEntry): void {
+    const model = this.state.predictiveModel;
+    const target = outcomeReturnPct > 0 ? 1 : 0;
+    const prediction = this.clamp01(entry?.entry_prediction ?? 0.5);
+    const error = target - prediction;
+    const lr = model.learningRate;
+
+    // Lightweight online update keeps model adaptive without expensive retraining.
+    model.bias += lr * error * 0.25;
+    model.weights.sentiment += lr * error * (entry?.entry_sentiment ?? 0);
+    model.weights.freshness += lr * error * 0.15;
+    model.weights.sourceDiversity += lr * error * Math.min(1, (entry?.entry_sources?.length || 1) / 4);
+    model.weights.logVolume += lr * error * Math.min(1, Math.log10(Math.max(1, entry?.entry_social_volume || 1)) / 3);
+    model.weights.regimeAlignment += lr * error * (entry?.entry_regime === "trending" ? 0.5 : entry?.entry_regime === "volatile" ? -0.2 : 0.1);
+    model.weights.sentiment = Math.max(-3, Math.min(3, model.weights.sentiment));
+    model.weights.freshness = Math.max(-3, Math.min(3, model.weights.freshness));
+    model.weights.sourceDiversity = Math.max(-3, Math.min(3, model.weights.sourceDiversity));
+    model.weights.logVolume = Math.max(-3, Math.min(3, model.weights.logVolume));
+    model.weights.regimeAlignment = Math.max(-3, Math.min(3, model.weights.regimeAlignment));
+
+    model.samples += 1;
+    model.hitRate =
+      ((model.hitRate * Math.max(0, model.samples - 1) + (error === 0 ? 1 : target === (prediction >= 0.5 ? 1 : 0) ? 1 : 0)) /
+        model.samples) || 0;
+    model.mse = ((model.mse * Math.max(0, model.samples - 1) + error ** 2) / model.samples) || 0;
+    model.lastUpdatedAt = Date.now();
+
+    const upper = symbol.toUpperCase();
+    const stats = model.perSymbol[upper] ?? {
+      samples: 0,
+      wins: 0,
+      losses: 0,
+      avgReturnPct: 0,
+      lastOutcomeAt: 0,
+    };
+    stats.samples += 1;
+    if (outcomeReturnPct > 0) stats.wins += 1;
+    else stats.losses += 1;
+    stats.avgReturnPct = (stats.avgReturnPct * (stats.samples - 1) + outcomeReturnPct) / stats.samples;
+    stats.lastOutcomeAt = Date.now();
+    model.perSymbol[upper] = stats;
+  }
+
+  private deriveHistoricalShockPct(): number {
+    const points = this.state.portfolioEquityHistory.slice(-240);
+    if (points.length < 10) return -0.08;
+
+    const returns: number[] = [];
+    for (let i = 1; i < points.length; i += 1) {
+      const prev = points[i - 1]?.equity ?? 0;
+      const next = points[i]?.equity ?? prev;
+      if (prev > 0 && Number.isFinite(prev) && Number.isFinite(next)) {
+        returns.push((next - prev) / prev);
+      }
+    }
+    const negatives = returns.filter((value) => value < 0).sort((a, b) => a - b);
+    if (negatives.length === 0) return -0.05;
+    const idx = Math.max(0, Math.floor(negatives.length * 0.1) - 1);
+    return negatives[idx] ?? -0.08;
+  }
+
+  private runStressTest(account: Account, positions: Position[]): StressTestResult {
+    const totalExposure = positions.reduce((sum, pos) => sum + Math.max(0, pos.market_value || 0), 0);
+    const cryptoExposure = positions
+      .filter((pos) => isCryptoSymbol(pos.symbol, this.state.config.crypto_symbols || []) || pos.asset_class === "crypto")
+      .reduce((sum, pos) => sum + Math.max(0, pos.market_value || 0), 0);
+    const equityExposure = Math.max(0, totalExposure - cryptoExposure);
+    const historicalShockPct = this.deriveHistoricalShockPct();
+
+    const scenarios: Array<{ name: string; shockPct: number; projectedLoss: number; projectedDrawdownPct: number }> = [
+      { name: "flash_crash", shockPct: -0.1, projectedLoss: totalExposure * 0.1, projectedDrawdownPct: 0 },
+      { name: "macro_bear", shockPct: -0.16, projectedLoss: equityExposure * 0.16 + cryptoExposure * 0.2, projectedDrawdownPct: 0 },
+      { name: "volatility_spike", shockPct: -0.12, projectedLoss: totalExposure * 0.12, projectedDrawdownPct: 0 },
+      {
+        name: "historical_10pct_tail",
+        shockPct: historicalShockPct,
+        projectedLoss: totalExposure * Math.abs(historicalShockPct),
+        projectedDrawdownPct: 0,
+      },
+    ];
+
+    for (const scenario of scenarios) {
+      scenario.projectedDrawdownPct = account.equity > 0 ? scenario.projectedLoss / account.equity : 1;
+    }
+
+    const worstCaseLoss = scenarios.reduce((max, scenario) => Math.max(max, scenario.projectedLoss), 0);
+    const worstCaseDrawdownPct = account.equity > 0 ? worstCaseLoss / account.equity : 1;
+    const passed = worstCaseDrawdownPct <= 0.12;
+    const recommendedRiskMultiplier = passed ? Math.max(0.7, 1 - worstCaseDrawdownPct) : Math.max(0.3, 0.95 - worstCaseDrawdownPct * 2.5);
+
+    const report: StressTestResult = {
+      timestamp: Date.now(),
+      passed,
+      worstCaseLoss,
+      worstCaseDrawdownPct,
+      recommendedRiskMultiplier,
+      historicalShockPct,
+      scenarios,
+    };
+    this.state.lastStressTest = report;
+    this.rememberEpisode(
+      `Stress test ${passed ? "passed" : "failed"} (worst drawdown ${(worstCaseDrawdownPct * 100).toFixed(1)}%)`,
+      passed ? "success" : "failure",
+      ["risk", "stress_test", this.state.marketRegime.type],
+      {
+        impact: Math.min(1, worstCaseDrawdownPct),
+        confidence: this.clamp01(1 - Math.abs(report.recommendedRiskMultiplier - 0.7)),
+        novelty: 0.3,
+        metadata: {
+          recommendedRiskMultiplier: report.recommendedRiskMultiplier,
+          historicalShockPct,
+        },
+      }
+    );
+
+    this.log("Risk", "stress_test_complete", {
+      passed,
+      worst_case_drawdown_pct: Number((worstCaseDrawdownPct * 100).toFixed(2)),
+      recommended_multiplier: Number(recommendedRiskMultiplier.toFixed(3)),
+    });
+    return report;
+  }
+
+  private recordPerformanceSample(
+    stage: "gather" | "research" | "analyst",
+    durationMs: number,
+    hadError: boolean
+  ): void {
+    const opt = this.state.optimization;
+    const alpha = 0.2;
+    const updateEma = (current: number, next: number) => (current <= 0 ? next : current * (1 - alpha) + next * alpha);
+
+    if (stage === "gather") {
+      opt.gatherLatencyEmaMs = updateEma(opt.gatherLatencyEmaMs, durationMs);
+    } else if (stage === "research") {
+      opt.researchLatencyEmaMs = updateEma(opt.researchLatencyEmaMs, durationMs);
+    } else {
+      opt.analystLatencyEmaMs = updateEma(opt.analystLatencyEmaMs, durationMs);
+    }
+
+    const errorPoint = hadError ? 1 : 0;
+    opt.errorRateEma = updateEma(opt.errorRateEma, errorPoint);
+  }
+
+  private optimizeRuntimeParameters(now = Date.now()): void {
+    const opt = this.state.optimization;
+    const maxDataPoll = 60_000;
+    const minDataPoll = 10_000;
+    const maxResearch = 240_000;
+    const minResearch = 60_000;
+    const maxAnalyst = 240_000;
+    const minAnalyst = 60_000;
+
+    let dataPoll = opt.adaptiveDataPollIntervalMs || this.state.config.data_poll_interval_ms;
+    let research = opt.adaptiveResearchIntervalMs || 120_000;
+    let analyst = opt.adaptiveAnalystIntervalMs || this.state.config.analyst_interval_ms;
+
+    const overloaded =
+      opt.errorRateEma > 0.2 || opt.gatherLatencyEmaMs > 4_000 || opt.researchLatencyEmaMs > 7_000 || opt.analystLatencyEmaMs > 8_000;
+    const healthy =
+      opt.errorRateEma < 0.05 && opt.gatherLatencyEmaMs > 0 && opt.gatherLatencyEmaMs < 2_000 && opt.researchLatencyEmaMs < 4_000;
+
+    if (overloaded) {
+      dataPoll = Math.min(maxDataPoll, Math.round(dataPoll * 1.15));
+      research = Math.min(maxResearch, Math.round(research * 1.15));
+      analyst = Math.min(maxAnalyst, Math.round(analyst * 1.12));
+    } else if (healthy) {
+      dataPoll = Math.max(minDataPoll, Math.round(dataPoll * 0.92));
+      research = Math.max(minResearch, Math.round(research * 0.93));
+      analyst = Math.max(minAnalyst, Math.round(analyst * 0.94));
+    }
+
+    opt.adaptiveDataPollIntervalMs = dataPoll;
+    opt.adaptiveResearchIntervalMs = research;
+    opt.adaptiveAnalystIntervalMs = analyst;
+    opt.optimizationRuns += 1;
+    opt.lastOptimizationAt = now;
+
+    this.log("System", "runtime_optimized", {
+      data_poll_ms: dataPoll,
+      research_ms: research,
+      analyst_ms: analyst,
+      gather_ema_ms: Number(opt.gatherLatencyEmaMs.toFixed(1)),
+      research_ema_ms: Number(opt.researchLatencyEmaMs.toFixed(1)),
+      analyst_ema_ms: Number(opt.analystLatencyEmaMs.toFixed(1)),
+      error_rate_ema: Number(opt.errorRateEma.toFixed(3)),
+      overloaded,
+      healthy,
+    });
+  }
+
+  private mapEntryQualityFromConfidence(confidence: number): "excellent" | "good" | "fair" | "poor" {
+    if (confidence >= 0.85) return "excellent";
+    if (confidence >= 0.7) return "good";
+    if (confidence >= 0.55) return "fair";
+    return "poor";
+  }
+
+  private calculateEMA(values: number[], period: number): number[] {
+    if (values.length === 0 || period <= 0) return [];
+    const smoothing = 2 / (period + 1);
+    const output: number[] = [];
+    let ema = values[0] ?? 0;
+    output.push(ema);
+    for (let i = 1; i < values.length; i += 1) {
+      const current = values[i] ?? ema;
+      ema = current * smoothing + ema * (1 - smoothing);
+      output.push(ema);
+    }
+    return output;
+  }
+
+  private computePortfolioRiskMetrics(): {
+    realizedVolatility: number;
+    maxDrawdownPct: number;
+    sharpeLike: number;
+    regime: "trending" | "ranging" | "volatile";
+    trendStrength: number;
+    sentimentDispersion: number;
+  } {
+    const points = this.state.portfolioEquityHistory.slice(-180);
+    if (points.length < 3) {
+      return {
+        realizedVolatility: 0.01,
+        maxDrawdownPct: 0,
+        sharpeLike: 0,
+        regime: "ranging",
+        trendStrength: 0,
+        sentimentDispersion: this.computeSignalDispersion(),
+      };
+    }
+
+    const returns: number[] = [];
+    for (let i = 1; i < points.length; i += 1) {
+      const prev = points[i - 1]?.equity ?? 0;
+      const next = points[i]?.equity ?? prev;
+      if (prev > 0 && Number.isFinite(prev) && Number.isFinite(next)) {
+        returns.push((next - prev) / prev);
+      }
+    }
+
+    if (returns.length === 0) {
+      return {
+        realizedVolatility: 0.01,
+        maxDrawdownPct: 0,
+        sharpeLike: 0,
+        regime: "ranging",
+        trendStrength: 0,
+        sentimentDispersion: this.computeSignalDispersion(),
+      };
+    }
+
+    const mean = returns.reduce((sum, value) => sum + value, 0) / returns.length;
+    const variance = returns.reduce((sum, value) => sum + (value - mean) ** 2, 0) / returns.length;
+    const stdev = Math.sqrt(Math.max(variance, 0));
+
+    let peak = points[0]?.equity ?? 0;
+    let maxDrawdownPct = 0;
+    for (const point of points) {
+      if (!point || !Number.isFinite(point.equity)) continue;
+      peak = Math.max(peak, point.equity);
+      if (peak > 0) {
+        const drawdown = (peak - point.equity) / peak;
+        maxDrawdownPct = Math.max(maxDrawdownPct, drawdown);
+      }
+    }
+
+    const sharpeLike = stdev > 0 ? (mean / stdev) * Math.sqrt(Math.min(returns.length, 252)) : 0;
+    const trendStrength = mean * Math.sqrt(Math.min(returns.length, 252));
+    const sentimentDispersion = this.computeSignalDispersion();
+
+    let regime: "trending" | "ranging" | "volatile" = "ranging";
+    if (stdev > 0.03 || sentimentDispersion > 0.45) {
+      regime = "volatile";
+    } else if (Math.abs(trendStrength) > 0.35 && Math.abs(sharpeLike) > 0.5) {
+      regime = "trending";
+    }
+
+    const previous = this.state.marketRegime;
+    const nextSince = previous.type === regime ? previous.since || Date.now() : Date.now();
+    const confidenceComponents = [
+      this.clamp01(stdev / 0.04),
+      this.clamp01(Math.abs(trendStrength) / 0.8),
+      this.clamp01(Math.abs(sharpeLike) / 1.5),
+      this.clamp01(sentimentDispersion / 0.6),
+    ];
+    const confidence = confidenceComponents.reduce((sum, value) => sum + value, 0) / confidenceComponents.length;
+    this.state.marketRegime = {
+      type: regime,
+      confidence,
+      duration: Math.max(0, Date.now() - nextSince),
+      characteristics: {
+        volatility: stdev,
+        trend: trendStrength,
+        sharpe_like: sharpeLike,
+        sentiment_dispersion: sentimentDispersion,
+      },
+      detectedAt: Date.now(),
+      since: nextSince,
+    };
+
+    return {
+      realizedVolatility: stdev,
+      maxDrawdownPct,
+      sharpeLike,
+      regime,
+      trendStrength,
+      sentimentDispersion,
+    };
+  }
+
+  private getDynamicRiskProfile(account: Account): DynamicRiskProfile {
+    const metrics = this.computePortfolioRiskMetrics();
+    const dailyPnlPct =
+      Number.isFinite(account.last_equity) && account.last_equity > 0
+        ? (account.equity - account.last_equity) / account.last_equity
+        : 0;
+
+    const volatilityPenalty = Math.max(0, (metrics.realizedVolatility - 0.01) * 12);
+    const drawdownPenalty = Math.max(0, metrics.maxDrawdownPct * 3);
+    const dailyLossPenalty = Math.max(0, -dailyPnlPct * 5);
+    const regimePenalty =
+      metrics.regime === "volatile" ? 0.25 : metrics.regime === "trending" ? -0.05 : 0.05;
+    const stressPenalty = this.state.lastStressTest
+      ? 1 - this.clamp01(this.state.lastStressTest.recommendedRiskMultiplier)
+      : 0;
+    const rawMultiplier = 1 - volatilityPenalty - drawdownPenalty - dailyLossPenalty - regimePenalty - stressPenalty;
+    const multiplier = Math.max(0.25, Math.min(1.2, rawMultiplier));
+
+    const basePct = this.state.config.position_size_pct_of_cash;
+    const suggestedPositionPct = Math.max(3, Math.min(20, basePct * multiplier));
+
+    const profile: DynamicRiskProfile = {
+      timestamp: Date.now(),
+      marketRegime: metrics.regime,
+      realizedVolatility: metrics.realizedVolatility,
+      maxDrawdownPct: metrics.maxDrawdownPct,
+      sharpeLike: metrics.sharpeLike,
+      multiplier,
+      suggestedPositionPct,
+    };
+    this.state.lastRiskProfile = profile;
+    return profile;
+  }
+
+  private async buildSymbolToolContext(
+    symbol: string,
+    isCrypto: boolean,
+    broker: BrokerProviders
+  ): Promise<SymbolToolContext | null> {
+    const instrument = isCrypto ? normalizeCryptoSymbol(symbol) : symbol;
+
+    try {
+      const [bars, snapshot] = await Promise.all([
+        broker.marketData.getBars(instrument, "1Day", { limit: 60 }).catch(() => []),
+        isCrypto
+          ? broker.marketData.getCryptoSnapshot(instrument).catch(() => null)
+          : broker.marketData.getSnapshot(instrument).catch(() => null),
+      ]);
+
+      const closes = (bars || []).map((bar) => bar.c).filter((value) => Number.isFinite(value));
+      const technical: SymbolToolContext["technical"] = {
+        rsi14: null,
+        macd: null,
+        macdSignal: null,
+        bollingerUpper: null,
+        bollingerMid: null,
+        bollingerLower: null,
+        trendStrength: null,
+      };
+
+      if (closes.length >= 30) {
+        const recent = closes.slice(-15);
+        let gains = 0;
+        let losses = 0;
+        for (let i = 1; i < recent.length; i += 1) {
+          const delta = (recent[i] ?? 0) - (recent[i - 1] ?? 0);
+          if (delta >= 0) gains += delta;
+          else losses += Math.abs(delta);
+        }
+        const avgGain = gains / 14;
+        const avgLoss = losses / 14;
+        const rs = avgLoss > 0 ? avgGain / avgLoss : 100;
+        technical.rsi14 = 100 - 100 / (1 + rs);
+
+        const ema12 = this.calculateEMA(closes, 12);
+        const ema26 = this.calculateEMA(closes, 26);
+        const macdSeries = ema12.map((value, index) => value - (ema26[index] ?? value));
+        const signalSeries = this.calculateEMA(macdSeries, 9);
+        technical.macd = macdSeries[macdSeries.length - 1] ?? null;
+        technical.macdSignal = signalSeries[signalSeries.length - 1] ?? null;
+
+        const bollingerWindow = closes.slice(-20);
+        const mid = bollingerWindow.reduce((sum, value) => sum + value, 0) / bollingerWindow.length;
+        const variance =
+          bollingerWindow.reduce((sum, value) => sum + (value - mid) ** 2, 0) / Math.max(1, bollingerWindow.length);
+        const stdev = Math.sqrt(Math.max(variance, 0));
+        technical.bollingerMid = mid;
+        technical.bollingerUpper = mid + 2 * stdev;
+        technical.bollingerLower = mid - 2 * stdev;
+
+        const first = closes[0] ?? 0;
+        const last = closes[closes.length - 1] ?? first;
+        technical.trendStrength = first > 0 ? (last - first) / first : 0;
+      }
+
+      const matchingSignals = this.state.signalCache.filter((signal) => signal.symbol === symbol);
+      const sourceDiversity = new Set(matchingSignals.map((signal) => signal.source)).size;
+      const secCatalysts = matchingSignals.filter(
+        (signal) => signal.source === "sec" || signal.source_detail.toLowerCase().includes("sec")
+      ).length;
+      const mentionVolume = matchingSignals.reduce((sum, signal) => sum + (signal.volume || 0), 0);
+
+      const prevClose = snapshot?.prev_daily_bar?.c ?? 0;
+      const dayPrice = snapshot?.daily_bar?.c ?? snapshot?.latest_trade?.price ?? 0;
+      const dailyChangePct = prevClose > 0 ? ((dayPrice - prevClose) / prevClose) * 100 : 0;
+      const riskMetrics = this.computePortfolioRiskMetrics();
+
+      return {
+        technical,
+        fundamental: {
+          dailyChangePct,
+          sourceDiversity,
+          secCatalysts,
+          mentionVolume,
+        },
+        risk: {
+          portfolioVolatility: riskMetrics.realizedVolatility,
+          maxDrawdownPct: riskMetrics.maxDrawdownPct,
+          regime: riskMetrics.regime,
+        },
+      };
+    } catch (error) {
+      this.log("Tools", "symbol_context_error", { symbol, error: String(error) });
+      return null;
+    }
+  }
+
+  private formatToolContext(context: SymbolToolContext | null): string {
+    if (!context) return "- tool context unavailable";
+    return [
+      `- technical: RSI14 ${context.technical.rsi14?.toFixed(1) ?? "n/a"}, MACD ${context.technical.macd?.toFixed(4) ?? "n/a"} vs signal ${
+        context.technical.macdSignal?.toFixed(4) ?? "n/a"
+      }, Bollinger [${context.technical.bollingerLower?.toFixed(2) ?? "n/a"}, ${
+        context.technical.bollingerUpper?.toFixed(2) ?? "n/a"
+      }]`,
+      `- fundamental: daily change ${context.fundamental.dailyChangePct.toFixed(2)}%, source diversity ${
+        context.fundamental.sourceDiversity
+      }, SEC catalysts ${context.fundamental.secCatalysts}, mentions ${context.fundamental.mentionVolume}`,
+      `- risk: portfolio vol ${(context.risk.portfolioVolatility * 100).toFixed(2)}%, drawdown ${(
+        context.risk.maxDrawdownPct * 100
+      ).toFixed(2)}%, regime ${context.risk.regime}`,
+    ].join("\n");
+  }
+
+  private async fetchLearningAdvice(
+    symbol: string,
+    confidence: number
+  ): Promise<{ approved: boolean; adjustedConfidence: number; reasons: string[] } | null> {
+    if (!this.env.LEARNING_AGENT) return null;
+
+    try {
+      const id = this.env.LEARNING_AGENT.idFromName("default");
+      const stub = this.env.LEARNING_AGENT.get(id);
+      const res = await stub.fetch("http://learning/advice", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ symbol, confidence }),
+      });
+      if (!res.ok) return null;
+
+      const payload = (await res.json()) as {
+        approved?: boolean;
+        adjustedConfidence?: number;
+        reasons?: string[];
+      };
+      return {
+        approved: Boolean(payload.approved),
+        adjustedConfidence:
+          typeof payload.adjustedConfidence === "number" ? this.clamp01(payload.adjustedConfidence) : this.clamp01(confidence),
+        reasons: Array.isArray(payload.reasons) ? payload.reasons.map((reason) => String(reason)) : [],
+      };
+    } catch (error) {
+      this.log("Learning", "advice_fetch_failed", { symbol, error: String(error) });
+      return null;
+    }
+  }
+
+  private async fetchAnalystBatchResearch(
+    signals: Array<{ symbol: string; sentiment: number }>
+  ): Promise<Record<string, ResearchResult>> {
+    if (!this.env.ANALYST || signals.length === 0) return {};
+
+    try {
+      const id = this.env.ANALYST.idFromName("default");
+      const stub = this.env.ANALYST.get(id);
+      const res = await stub.fetch("http://analyst/research-batch", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ signals: signals.slice(0, 8) }),
+      });
+      if (!res.ok) {
+        this.log("Swarm", "analyst_batch_failed", { status: res.status });
+        return {};
+      }
+
+      const payload = (await res.json()) as {
+        results?: Record<
+          string,
+          {
+            symbol?: string;
+            verdict?: "BUY" | "SKIP" | "WAIT";
+            confidence?: number;
+            reasoning?: string;
+            timestamp?: number;
+          }
+        >;
+      };
+      const mapped: Record<string, ResearchResult> = {};
+      for (const [symbolKey, value] of Object.entries(payload.results ?? {})) {
+        const symbol = (value.symbol || symbolKey).toUpperCase();
+        const verdict = value.verdict === "BUY" || value.verdict === "SKIP" || value.verdict === "WAIT" ? value.verdict : "WAIT";
+        const confidence = this.clamp01(typeof value.confidence === "number" ? value.confidence : 0);
+        mapped[symbol] = {
+          symbol,
+          verdict,
+          confidence,
+          entry_quality: this.mapEntryQualityFromConfidence(confidence),
+          reasoning: value.reasoning || "Swarm analyst recommendation",
+          red_flags: verdict === "BUY" ? [] : ["Swarm analyst not fully confident"],
+          catalysts: verdict === "BUY" ? ["Swarm analyst validation"] : [],
+          timestamp: typeof value.timestamp === "number" ? value.timestamp : Date.now(),
+        };
+      }
+      if (Object.keys(mapped).length > 0) {
+        this.rememberEpisode(
+          `Swarm analyst returned ${Object.keys(mapped).length} research items`,
+          "success",
+          ["swarm", "analyst", "research"],
+          {
+            impact: Math.min(1, Object.keys(mapped).length / 8),
+            confidence: 0.75,
+            novelty: 0.4,
+          }
+        );
+      }
+      return mapped;
+    } catch (error) {
+      this.log("Swarm", "analyst_batch_error", { error: String(error) });
+      return {};
+    }
+  }
+
+  private async syncSwarmRoleHealth(): Promise<void> {
+    if (!this.env.SWARM_REGISTRY) return;
+
+    try {
+      const id = this.env.SWARM_REGISTRY.idFromName("default");
+      const stub = this.env.SWARM_REGISTRY.get(id);
+      const res = await stub.fetch("http://registry/agents");
+      if (!res.ok) return;
+
+      const data = (await res.json()) as Record<string, { type?: string; lastHeartbeat?: number }>;
+      const now = Date.now();
+      const roleHealth: AgentState["swarmRoleHealth"] = {};
+      for (const status of Object.values(data)) {
+        if (!status?.type) continue;
+        if (
+          status.type !== "scout" &&
+          status.type !== "analyst" &&
+          status.type !== "trader" &&
+          status.type !== "risk_manager" &&
+          status.type !== "learning"
+        ) {
+          continue;
+        }
+        const role = status.type as keyof AgentState["swarmRoleHealth"];
+        if (typeof status.lastHeartbeat === "number" && now - status.lastHeartbeat <= 300_000) {
+          roleHealth[role] = (roleHealth[role] || 0) + 1;
+        }
+      }
+      this.state.swarmRoleHealth = roleHealth;
+      this.state.lastSwarmRoleSyncAt = now;
+    } catch (error) {
+      this.log("Swarm", "role_health_sync_error", { error: String(error) });
+    }
+  }
+
+  private getRelevantMemoryEpisodes(tags: string[], limit = 5): MemoryEpisode[] {
+    this.pruneMemoryEpisodes();
+    const now = Date.now();
+    const normalizedTags = new Set(tags.map((tag) => tag.toLowerCase()));
+    return this.state.memoryEpisodes
+      .filter((episode) => episode.tags.some((tag) => normalizedTags.has(tag.toLowerCase())))
+      .map((episode) => {
+        const age = Math.max(0, now - episode.timestamp);
+        const decay = Math.exp(-age / MEMORY_HALF_LIFE_MS);
+        return { episode, score: episode.importance * decay };
+      })
+      .sort((a, b) => b.score - a.score)
+      .slice(0, limit)
+      .map((entry) => entry.episode);
+  }
+
+  private rememberEpisode(
+    context: string,
+    outcome: "success" | "failure" | "neutral",
+    tags: string[],
+    options: {
+      impact: number;
+      confidence: number;
+      novelty: number;
+      metadata?: Record<string, unknown>;
+    }
+  ): void {
+    const importance = this.clamp01(
+      this.clamp01(options.impact) * 0.4 +
+        this.clamp01(options.confidence) * 0.35 +
+        this.clamp01(options.novelty) * 0.25
+    );
+
+    this.state.memoryEpisodes.push({
+      id: `mem:${Date.now()}:${Math.random().toString(16).slice(2, 10)}`,
+      timestamp: Date.now(),
+      importance,
+      context,
+      outcome,
+      tags: Array.from(new Set(tags.map((tag) => tag.toLowerCase()))).slice(0, 12),
+      metadata: options.metadata,
+    });
+    this.pruneMemoryEpisodes();
+  }
+
+  private pruneMemoryEpisodes(now = Date.now()): void {
+    const threshold = now - MEMORY_RETENTION_MS;
+    this.state.memoryEpisodes = (this.state.memoryEpisodes || [])
+      .filter((episode) => {
+        if (!episode || !Number.isFinite(episode.timestamp)) return false;
+        if (episode.timestamp < threshold) return false;
+        const age = now - episode.timestamp;
+        const decayedImportance = episode.importance * Math.exp(-age / MEMORY_HALF_LIFE_MS);
+        const isRecent = age < 3 * 24 * 60 * 60 * 1000;
+        return isRecent || decayedImportance >= MEMORY_MIN_IMPORTANCE_TO_KEEP;
+      })
+      .sort((a, b) => b.timestamp - a.timestamp)
+      .slice(0, MEMORY_MAX_EPISODES);
+  }
+
   private async researchSignal(
     symbol: string,
     sentimentScore: number,
@@ -2778,6 +3954,24 @@ export class OwokxHarness extends DurableObject<Env> {
           snapshot?.latest_trade?.price || snapshot?.latest_quote?.ask_price || snapshot?.latest_quote?.bid_price || 0;
       }
 
+      const toolContext = await this.buildSymbolToolContext(symbol, isCrypto, broker);
+      const toolSummary = this.formatToolContext(toolContext);
+      const matchingSignal = this.state.signalCache.find((signal) => signal.symbol === symbol);
+      const predictiveScore = this.predictSignalProbability({
+        symbol,
+        sentiment: matchingSignal?.sentiment ?? sentimentScore,
+        freshness: matchingSignal?.freshness ?? 0.5,
+        volume: matchingSignal?.volume ?? 1,
+        sourceDiversity: new Set(this.state.signalCache.filter((signal) => signal.symbol === symbol).map((signal) => signal.source)).size,
+      });
+      const memorySummary = this.getRelevantMemoryEpisodes([symbol, "research", "risk"], 3)
+        .map(
+          (episode) =>
+            `- [${episode.outcome}] ${episode.context} (importance ${(episode.importance * 100).toFixed(0)}%)`
+        )
+        .join("\n");
+      const learningAdvice = await this.fetchLearningAdvice(symbol, Math.max(0, Math.min(1, sentimentScore)));
+
       const prompt = `Should we BUY this ${isCrypto ? "crypto" : "stock"} based on social sentiment and fundamentals?
 
                       SYMBOL: ${symbol}
@@ -2785,6 +3979,25 @@ export class OwokxHarness extends DurableObject<Env> {
 
                       CURRENT DATA:
                       - Price: $${price}
+
+                      TOOL OUTPUT:
+                      ${toolSummary}
+
+                      PREDICTIVE EDGE:
+                      - model_probability: ${(predictiveScore * 100).toFixed(1)}%
+                      - model_samples: ${this.state.predictiveModel.samples}
+
+                      MEMORY LESSONS:
+                      ${memorySummary || "- No relevant memory episodes yet"}
+
+                      LEARNING ADVICE:
+                      ${
+                        learningAdvice
+                          ? `- approved: ${learningAdvice.approved}
+                      - adjusted_confidence: ${learningAdvice.adjustedConfidence.toFixed(2)}
+                      - reasons: ${learningAdvice.reasons.join("; ") || "none"}`
+                          : "- unavailable"
+                      }
 
                       Evaluate if this is a good entry. Consider: Is the sentiment justified? Is it too late (already pumped)? Any red flags?
 
@@ -2827,14 +4040,30 @@ export class OwokxHarness extends DurableObject<Env> {
         catalysts: string[];
       };
 
+      const confidenceWithPrediction = this.clamp01(analysis.confidence * 0.75 + predictiveScore * 0.25);
+      const adjustedConfidence = this.clamp01(
+        learningAdvice ? (confidenceWithPrediction + learningAdvice.adjustedConfidence) / 2 : confidenceWithPrediction
+      );
+
+      const adjustedVerdict =
+        learningAdvice && !learningAdvice.approved && analysis.verdict === "BUY" ? ("WAIT" as const) : analysis.verdict;
+      const mergedRedFlags = [...(analysis.red_flags || [])];
+      if (learningAdvice && !learningAdvice.approved) {
+        mergedRedFlags.push(`LearningAgent rejected entry: ${learningAdvice.reasons.join("; ") || "risk caution"}`);
+      }
+      const mergedCatalysts = [...(analysis.catalysts || [])];
+      if (learningAdvice && learningAdvice.approved && learningAdvice.reasons.length > 0) {
+        mergedCatalysts.push(`LearningAgent: ${learningAdvice.reasons.join("; ")}`);
+      }
+
       const result: ResearchResult = {
         symbol,
-        verdict: analysis.verdict,
-        confidence: analysis.confidence,
+        verdict: adjustedVerdict,
+        confidence: adjustedConfidence,
         entry_quality: analysis.entry_quality,
         reasoning: analysis.reasoning,
-        red_flags: analysis.red_flags || [],
-        catalysts: analysis.catalysts || [],
+        red_flags: mergedRedFlags,
+        catalysts: mergedCatalysts,
         timestamp: Date.now(),
       };
 
@@ -2860,6 +4089,23 @@ export class OwokxHarness extends DurableObject<Env> {
         });
       }
 
+      this.rememberEpisode(
+        `Research verdict for ${symbol}: ${result.verdict} (${(result.confidence * 100).toFixed(0)}%)`,
+        result.verdict === "BUY" ? "success" : "neutral",
+        ["research", symbol, ...(result.verdict === "BUY" ? ["entry_candidate"] : [])],
+        {
+          impact: Math.min(1, Math.abs(sentimentScore)),
+          confidence: result.confidence,
+          novelty: 0.4,
+          metadata: {
+            verdict: result.verdict,
+            entryQuality: result.entry_quality,
+            sources,
+            predictiveScore,
+          },
+        }
+      );
+
       return result;
     } catch (error) {
       const errorMsg = String(error);
@@ -2882,11 +4128,13 @@ export class OwokxHarness extends DurableObject<Env> {
   }
 
   private async researchTopSignals(limit = 5): Promise<ResearchResult[]> {
+    const startedAt = Date.now();
     if (this.state.lastLLMAuthError && Date.now() - this.state.lastLLMAuthError.at < 300_000) {
       this.log("SignalResearch", "research_skipped_circuit_breaker", {
         reason: "Recent auth error",
         time_remaining_ms: 300_000 - (Date.now() - this.state.lastLLMAuthError.at),
       });
+      this.recordPerformanceSample("research", Date.now() - startedAt, true);
       return [];
     }
 
@@ -2901,38 +4149,158 @@ export class OwokxHarness extends DurableObject<Env> {
     const notHeld = allSignals.filter((s) => !heldSymbols.has(s.symbol));
     // Use raw_sentiment for threshold (before weighting), weighted sentiment for sorting
     const aboveThreshold = notHeld.filter((s) => s.raw_sentiment >= this.state.config.min_sentiment_score);
-    const candidates = aboveThreshold.sort((a, b) => b.sentiment - a.sentiment).slice(0, limit);
-
-    if (candidates.length === 0) {
+    if (aboveThreshold.length === 0) {
       this.log("SignalResearch", "no_candidates", {
         total_signals: allSignals.length,
         not_held: notHeld.length,
         above_threshold: aboveThreshold.length,
         min_sentiment: this.state.config.min_sentiment_score,
       });
+      this.recordPerformanceSample("research", Date.now() - startedAt, false);
       return [];
     }
 
-    this.log("SignalResearch", "researching_signals", { count: candidates.length });
-
-    const aggregated = new Map<string, { symbol: string; sentiment: number; sources: string[] }>();
-    for (const sig of candidates) {
-      if (!aggregated.has(sig.symbol)) {
-        aggregated.set(sig.symbol, { symbol: sig.symbol, sentiment: sig.sentiment, sources: [sig.source] });
-      } else {
-        aggregated.get(sig.symbol)!.sources.push(sig.source);
+    const aggregated = new Map<
+      string,
+      {
+        symbol: string;
+        totalSentiment: number;
+        totalRawSentiment: number;
+        mentions: number;
+        freshness: number;
+        sources: Set<string>;
       }
+    >();
+
+    for (const signal of aboveThreshold) {
+      if (!aggregated.has(signal.symbol)) {
+        aggregated.set(signal.symbol, {
+          symbol: signal.symbol,
+          totalSentiment: 0,
+          totalRawSentiment: 0,
+          mentions: 0,
+          freshness: 0,
+          sources: new Set<string>(),
+        });
+      }
+      const entry = aggregated.get(signal.symbol)!;
+      entry.totalSentiment += signal.sentiment;
+      entry.totalRawSentiment += signal.raw_sentiment;
+      entry.mentions += 1;
+      entry.freshness = Math.max(entry.freshness, signal.freshness || 0);
+      entry.sources.add(signal.source);
     }
+
+    const now = Date.now();
+    const queued = Array.from(aggregated.values())
+      .map((entry) => {
+        const avgSentiment = entry.totalSentiment / entry.mentions;
+        const avgRawSentiment = entry.totalRawSentiment / entry.mentions;
+        const sourceDiversity = Math.min(1, entry.sources.size / 3);
+        const mentionScore = Math.min(1, Math.log2(entry.mentions + 1) / 4);
+        const freshnessScore = Math.max(0, Math.min(entry.freshness, 1));
+        const predictiveScore = this.predictSignalProbability({
+          symbol: entry.symbol,
+          sentiment: avgSentiment,
+          freshness: freshnessScore,
+          volume: entry.mentions,
+          sourceDiversity: entry.sources.size,
+        });
+        const recentResearch = this.state.signalResearch[entry.symbol];
+        const recentlyResearched =
+          !!recentResearch && Number.isFinite(recentResearch.timestamp) && now - recentResearch.timestamp < 15 * 60 * 1000;
+        const recentPenalty = recentlyResearched ? 0.2 : 0;
+
+        const priority =
+          avgSentiment * 0.55 +
+          avgRawSentiment * 0.2 +
+          sourceDiversity * 0.15 +
+          mentionScore * 0.05 +
+          freshnessScore * 0.05 +
+          predictiveScore * 0.15 -
+          recentPenalty;
+
+        return {
+          symbol: entry.symbol,
+          avgSentiment,
+          sources: Array.from(entry.sources),
+          mentions: entry.mentions,
+          predictiveScore,
+          priority,
+        };
+      })
+      .sort((a, b) => b.priority - a.priority)
+      .slice(0, limit);
+
+    if (queued.length === 0) {
+      this.log("SignalResearch", "no_candidates", {
+        total_signals: allSignals.length,
+        not_held: notHeld.length,
+        above_threshold: aboveThreshold.length,
+        min_sentiment: this.state.config.min_sentiment_score,
+      });
+      this.recordPerformanceSample("research", Date.now() - startedAt, false);
+      return [];
+    }
+
+    const maxConcurrent = Math.min(RESEARCH_MAX_CONCURRENT, queued.length);
+    this.log("SignalResearch", "researching_signals", {
+      count: queued.length,
+      max_concurrent: maxConcurrent,
+      queue: queued.map((c) => ({
+        symbol: c.symbol,
+        priority: Number(c.priority.toFixed(3)),
+        predictive: Number(c.predictiveScore.toFixed(3)),
+        mentions: c.mentions,
+      })),
+    });
 
     const results: ResearchResult[] = [];
-    for (const [symbol, data] of aggregated) {
-      const analysis = await this.researchSignal(symbol, data.sentiment, data.sources);
-      if (analysis) {
-        results.push(analysis);
-      }
-      await this.sleep(500);
+    const swarmResults = await this.fetchAnalystBatchResearch(
+      queued.map((candidate) => ({ symbol: candidate.symbol, sentiment: candidate.avgSentiment }))
+    );
+    const coveredBySwarm = new Set<string>();
+    for (const result of Object.values(swarmResults)) {
+      coveredBySwarm.add(result.symbol);
+      this.state.signalResearch[result.symbol] = result;
+      results.push(result);
     }
 
+    const localQueue = queued.filter((candidate) => !coveredBySwarm.has(candidate.symbol));
+    if (localQueue.length > 0) {
+      this.log("SignalResearch", "swarm_research_partial_fallback", {
+        swarm_count: coveredBySwarm.size,
+        local_count: localQueue.length,
+      });
+    }
+
+    for (let i = 0; i < localQueue.length; i += maxConcurrent) {
+      const batch = localQueue.slice(i, i + maxConcurrent);
+      const settled = await Promise.allSettled(
+        batch.map((candidate) => this.researchSignal(candidate.symbol, candidate.avgSentiment, candidate.sources))
+      );
+
+      settled.forEach((result, index) => {
+        const symbol = batch[index]!.symbol;
+        if (result.status === "fulfilled") {
+          if (result.value) {
+            results.push(result.value);
+          }
+          return;
+        }
+
+        this.log("SignalResearch", "research_failed", {
+          symbol,
+          error: String(result.reason),
+        });
+      });
+
+      if (i + maxConcurrent < localQueue.length) {
+        await this.sleep(RESEARCH_BATCH_DELAY_MS);
+      }
+    }
+
+    this.recordPerformanceSample("research", Date.now() - startedAt, false);
     return results;
   }
 
@@ -3037,9 +4405,19 @@ Provide a brief risk assessment and recommendation (HOLD, SELL, or ADD). JSON fo
     }
 
     const candidates = Array.from(aggregated.values())
-      .map((a) => ({ ...a, avgSentiment: a.totalSentiment / a.count }))
+      .map((a) => {
+        const avgSentiment = a.totalSentiment / a.count;
+        const predictiveScore = this.predictSignalProbability({
+          symbol: a.symbol,
+          sentiment: avgSentiment,
+          freshness: 0.6,
+          volume: a.count,
+          sourceDiversity: new Set(a.sources).size,
+        });
+        return { ...a, avgSentiment, predictiveScore };
+      })
       .filter((a) => a.avgSentiment >= this.state.config.min_sentiment_score * 0.5)
-      .sort((a, b) => b.avgSentiment - a.avgSentiment)
+      .sort((a, b) => b.avgSentiment + b.predictiveScore * 0.2 - (a.avgSentiment + a.predictiveScore * 0.2))
       .slice(0, 10);
 
     if (candidates.length === 0) {
@@ -3052,6 +4430,20 @@ Provide a brief risk assessment and recommendation (HOLD, SELL, or ADD). JSON fo
     }
 
     const positionSymbols = new Set(positions.map((p) => p.symbol));
+    const broker = createBrokerProviders(this.env, this.state.config.broker);
+    const portfolioRisk = this.computePortfolioRiskMetrics();
+    const dynamicRisk = this.getDynamicRiskProfile(account);
+    const candidateToolSummaries = await Promise.all(
+      candidates.slice(0, 3).map(async (candidate) => {
+        const isCrypto = isCryptoSymbol(candidate.symbol, this.state.config.crypto_symbols || []);
+        const toolContext = await this.buildSymbolToolContext(candidate.symbol, isCrypto, broker);
+        return `- ${candidate.symbol}: ${this.formatToolContext(toolContext)}`;
+      })
+    );
+    const memoryLessons = this.getRelevantMemoryEpisodes(["analyst", "risk", "trade"], 4)
+      .map((episode) => `- ${episode.context} (${episode.outcome}, importance ${(episode.importance * 100).toFixed(0)}%)`)
+      .join("\n");
+
     const prompt = `Current Time: ${new Date().toISOString()}
 
 ACCOUNT STATUS:
@@ -3077,7 +4469,7 @@ TOP SENTIMENT CANDIDATES:
 ${candidates
   .map(
     (c) =>
-      `- ${c.symbol}: avg sentiment ${(c.avgSentiment * 100).toFixed(0)}%, sources: ${c.sources.join(", ")}, ${positionSymbols.has(c.symbol) ? "[CURRENTLY HELD]" : "[NOT HELD]"}`
+      `- ${c.symbol}: avg sentiment ${(c.avgSentiment * 100).toFixed(0)}%, predictive ${(c.predictiveScore * 100).toFixed(0)}%, sources: ${c.sources.join(", ")}, ${positionSymbols.has(c.symbol) ? "[CURRENTLY HELD]" : "[NOT HELD]"}`
   )
   .join("\n")}
 
@@ -3086,6 +4478,24 @@ ${signals
   .slice(0, 20)
   .map((s) => `- ${s.symbol} (${s.source}): ${s.reason}`)
   .join("\n")}
+
+TOOL CONTEXT (TOP CANDIDATES):
+${candidateToolSummaries.join("\n")}
+
+PORTFOLIO RISK CONTEXT:
+- Regime: ${dynamicRisk.marketRegime}
+- Regime confidence: ${(this.state.marketRegime.confidence * 100).toFixed(0)}%
+- Regime duration (min): ${(this.state.marketRegime.duration / 60000).toFixed(1)}
+- Realized volatility: ${(dynamicRisk.realizedVolatility * 100).toFixed(2)}%
+- Max drawdown: ${(dynamicRisk.maxDrawdownPct * 100).toFixed(2)}%
+- Sharpe-like: ${portfolioRisk.sharpeLike.toFixed(3)}
+- Dynamic multiplier: ${dynamicRisk.multiplier.toFixed(2)}
+- Suggested position pct: ${dynamicRisk.suggestedPositionPct.toFixed(2)}%
+- Stress test passed: ${this.state.lastStressTest ? this.state.lastStressTest.passed : "n/a"}
+- Stress worst-case drawdown: ${this.state.lastStressTest ? (this.state.lastStressTest.worstCaseDrawdownPct * 100).toFixed(2) : "n/a"}%
+
+EPISODIC MEMORY LESSONS:
+${memoryLessons || "- No major memory episodes yet"}
 
 TRADING RULES:
 - Max position size: $${this.state.config.max_position_value}
@@ -3151,6 +4561,24 @@ Response format:
         candidates: candidates.length,
         recommendations: analysis.recommendations?.length || 0,
       });
+
+      this.rememberEpisode(
+        `LLM batch analysis produced ${analysis.recommendations?.length || 0} recommendations`,
+        "neutral",
+        ["analyst", "batch_decision", dynamicRisk.marketRegime],
+        {
+          impact: Math.min(1, candidates.length / 10),
+          confidence: this.clamp01(
+            (analysis.recommendations || []).reduce((acc, rec) => acc + (Number(rec.confidence) || 0), 0) /
+              Math.max(1, (analysis.recommendations || []).length)
+          ),
+          novelty: 0.35,
+          metadata: {
+            highConviction: analysis.high_conviction_plays || [],
+            marketSummary: analysis.market_summary || "",
+          },
+        }
+      );
 
       let decisionId: string | null = null;
       try {
@@ -3240,6 +4668,20 @@ Response format:
       return;
     }
 
+    const riskProfile = this.getDynamicRiskProfile(account);
+    if (!this.state.lastStressTest || Date.now() - this.state.lastStressTest.timestamp >= STRESS_TEST_INTERVAL_MS) {
+      this.runStressTest(account, positions);
+    }
+    const stressFailed = !!this.state.lastStressTest && !this.state.lastStressTest.passed;
+    this.log("Risk", "dynamic_profile", {
+      regime: riskProfile.marketRegime,
+      volatility: Number((riskProfile.realizedVolatility * 100).toFixed(2)),
+      drawdown_pct: Number((riskProfile.maxDrawdownPct * 100).toFixed(2)),
+      multiplier: Number(riskProfile.multiplier.toFixed(3)),
+      suggested_pct: Number(riskProfile.suggestedPositionPct.toFixed(2)),
+      stress_passed: this.state.lastStressTest?.passed ?? null,
+    });
+
     const heldSymbols = new Set(positions.map((p) => p.symbol));
 
     // Check position exits
@@ -3294,8 +4736,19 @@ Response format:
             finalConfidence = finalConfidence * 0.85;
           }
         }
+        finalConfidence = this.applyRegimeConfidenceAdjustment(finalConfidence, originalSignal?.sentiment || finalConfidence);
 
         if (finalConfidence < this.state.config.min_analyst_confidence) continue;
+        if (stressFailed && finalConfidence < 0.85) {
+          this.log("Risk", "buy_deferred_stress_regime", {
+            symbol: research.symbol,
+            confidence: finalConfidence,
+            worst_case_drawdown_pct: this.state.lastStressTest
+              ? Number((this.state.lastStressTest.worstCaseDrawdownPct * 100).toFixed(2))
+              : null,
+          });
+          continue;
+        }
 
         const shouldUseOptions =
           this.isOptionsEnabled() &&
@@ -3315,6 +4768,14 @@ Response format:
         const result = await this.executeBuy(broker, research.symbol, finalConfidence, account);
         if (result) {
           heldSymbols.add(research.symbol);
+          const predicted = this.predictSignalProbability({
+            symbol: research.symbol,
+            sentiment: originalSignal?.sentiment ?? finalConfidence,
+            freshness: originalSignal?.freshness ?? 0.5,
+            volume: originalSignal?.volume ?? 1,
+            sourceDiversity: new Set(this.state.signalCache.filter((s) => s.symbol === research.symbol).map((s) => s.source))
+              .size,
+          });
           this.state.positionEntries[research.symbol] = {
             symbol: research.symbol,
             entry_time: Date.now(),
@@ -3325,6 +4786,8 @@ Response format:
             entry_reason: research.reasoning,
             peak_price: 0,
             peak_sentiment: originalSignal?.sentiment || finalConfidence,
+            entry_prediction: predicted,
+            entry_regime: this.state.marketRegime.type,
           };
         }
       }
@@ -3367,10 +4830,21 @@ Response format:
           if (positions.length >= this.state.config.max_positions) continue;
           if (heldSymbols.has(rec.symbol)) continue;
           if (researchedSymbols.has(rec.symbol)) continue;
+          const adjustedRecConfidence = this.applyRegimeConfidenceAdjustment(rec.confidence, rec.confidence);
+          if (stressFailed && adjustedRecConfidence < 0.9) continue;
+          if (adjustedRecConfidence < this.state.config.min_analyst_confidence) continue;
 
-          const result = await this.executeBuy(broker, rec.symbol, rec.confidence, account, decisionId);
+          const result = await this.executeBuy(broker, rec.symbol, adjustedRecConfidence, account, decisionId);
           if (result) {
             const originalSignal = this.state.signalCache.find((s) => s.symbol === rec.symbol);
+            const predicted = this.predictSignalProbability({
+              symbol: rec.symbol,
+              sentiment: originalSignal?.sentiment ?? rec.confidence,
+              freshness: originalSignal?.freshness ?? 0.5,
+              volume: originalSignal?.volume ?? 1,
+              sourceDiversity: new Set(this.state.signalCache.filter((s) => s.symbol === rec.symbol).map((s) => s.source))
+                .size,
+            });
             heldSymbols.add(rec.symbol);
             this.state.positionEntries[rec.symbol] = {
               symbol: rec.symbol,
@@ -3382,6 +4856,8 @@ Response format:
               entry_reason: rec.reasoning,
               peak_price: 0,
               peak_sentiment: originalSignal?.sentiment || rec.confidence,
+              entry_prediction: predicted,
+              entry_regime: this.state.marketRegime.type,
             };
           }
         }
@@ -3389,19 +4865,9 @@ Response format:
     }
   }
 
-  // Task 7: Adaptive capital preservation
   private getAdaptivePositionSizePct(account: Account): number {
-    const basePct = this.state.config.position_size_pct_of_cash;
-    // If we have recent losses, reduce size.
-    // Simplistic implementation: check daily PnL if available in account
-    // Account doesn't always have daily PnL easily accessible without history.
-    // We can use equity vs last_equity.
-    const dailyPnL = account.equity - account.last_equity;
-    if (dailyPnL < 0) {
-      // Reduce size by half if down for the day
-      return basePct * 0.5;
-    }
-    return basePct;
+    const risk = this.getDynamicRiskProfile(account);
+    return risk.suggestedPositionPct;
   }
 
   private async executeBuy(
@@ -3426,7 +4892,7 @@ Response format:
       return false;
     }
 
-    // Task 7: Adaptive Sizing
+    const riskProfile = this.getDynamicRiskProfile(account);
     const sizePct = Math.min(20, this.getAdaptivePositionSizePct(account));
     const positionSize = Math.min(account.cash * (sizePct / 100) * confidence, this.state.config.max_position_value);
 
@@ -3457,6 +4923,10 @@ Response format:
             symbol,
             notional: Math.round(positionSize * 100) / 100,
             side: "buy",
+            volatility: riskProfile.realizedVolatility,
+            drawdownPct: riskProfile.maxDrawdownPct,
+            riskMultiplier: riskProfile.multiplier,
+            marketRegime: riskProfile.marketRegime,
           }),
         });
 
@@ -3533,12 +5003,35 @@ Response format:
         symbol: orderSymbol,
         isCrypto,
         size: positionSize,
+        dynamic_risk_multiplier: riskProfile.multiplier,
+        regime: riskProfile.marketRegime,
         submission_state: execution.submission.state,
         broker_order_id: execution.broker_order_id ?? null,
       });
+      this.rememberEpisode(
+        `Buy executed for ${orderSymbol} ($${positionSize.toFixed(2)})`,
+        "success",
+        ["trade", "buy", orderSymbol, riskProfile.marketRegime],
+        {
+          impact: Math.min(1, positionSize / Math.max(1, this.state.config.max_position_value)),
+          confidence,
+          novelty: 0.45,
+          metadata: {
+            sizePct,
+            riskMultiplier: riskProfile.multiplier,
+            regime: riskProfile.marketRegime,
+          },
+        }
+      );
       return execution.submission.state === "SUBMITTED" || execution.submission.state === "SUBMITTING";
     } catch (error) {
       this.log("Executor", "buy_failed", { symbol, error: String(error) });
+      this.rememberEpisode(`Buy failed for ${symbol}`, "failure", ["trade", "buy", symbol, "error"], {
+        impact: 0.4,
+        confidence,
+        novelty: 0.5,
+        metadata: { error: String(error) },
+      });
       return false;
     }
   }
@@ -3598,9 +5091,28 @@ Response format:
       });
 
       if (execution.submission.state === "SUBMITTED") {
+        const returnPct = pos.market_value > 0 ? (pos.unrealized_pl / pos.market_value) * 100 : 0;
+        const entry = this.state.positionEntries[pos.symbol];
+        this.updatePredictiveModelFromTrade(pos.symbol, returnPct, entry);
+
         delete this.state.positionEntries[pos.symbol];
         delete this.state.socialHistory[pos.symbol];
         delete this.state.stalenessAnalysis[pos.symbol];
+
+        this.rememberEpisode(
+          `Sell executed for ${pos.symbol}: ${reason}`,
+          pos.unrealized_pl >= 0 ? "success" : "failure",
+          ["trade", "sell", pos.symbol],
+          {
+            impact: Math.min(1, Math.abs(pos.unrealized_pl) / Math.max(1, pos.market_value || 1)),
+            confidence: 0.75,
+            novelty: 0.35,
+            metadata: {
+              unrealized_pl: pos.unrealized_pl,
+              reason,
+            },
+          }
+        );
 
         if (this.env.RISK_MANAGER) {
           const realizedPnl = pos.unrealized_pl ?? 0;
@@ -3621,6 +5133,12 @@ Response format:
       return execution.submission.state === "SUBMITTED" || execution.submission.state === "SUBMITTING";
     } catch (error) {
       this.log("Executor", "sell_failed", { symbol, error: String(error) });
+      this.rememberEpisode(`Sell failed for ${symbol}`, "failure", ["trade", "sell", symbol, "error"], {
+        impact: 0.3,
+        confidence: 0.65,
+        novelty: 0.4,
+        metadata: { error: String(error), reason },
+      });
       return false;
     }
   }
@@ -4045,12 +5563,22 @@ Response format:
       if (rec.action === "BUY" && rec.confidence >= this.state.config.min_analyst_confidence) {
         if (heldSymbols.has(rec.symbol)) continue;
         if (positions.length >= this.state.config.max_positions) break;
+        const adjustedConfidence = this.applyRegimeConfidenceAdjustment(rec.confidence, rec.confidence);
+        if (!this.state.lastStressTest?.passed && adjustedConfidence < 0.9) continue;
 
-        const result = await this.executeBuy(broker, rec.symbol, rec.confidence, account, idempotencySuffix);
+        const result = await this.executeBuy(broker, rec.symbol, adjustedConfidence, account, idempotencySuffix);
         if (result) {
           heldSymbols.add(rec.symbol);
 
           const originalSignal = this.state.signalCache.find((s) => s.symbol === rec.symbol);
+          const predicted = this.predictSignalProbability({
+            symbol: rec.symbol,
+            sentiment: originalSignal?.sentiment ?? rec.confidence,
+            freshness: originalSignal?.freshness ?? 0.5,
+            volume: originalSignal?.volume ?? 1,
+            sourceDiversity: new Set(this.state.signalCache.filter((s) => s.symbol === rec.symbol).map((s) => s.source))
+              .size,
+          });
           this.state.positionEntries[rec.symbol] = {
             symbol: rec.symbol,
             entry_time: Date.now(),
@@ -4061,6 +5589,8 @@ Response format:
             entry_reason: rec.reasoning,
             peak_price: 0,
             peak_sentiment: originalSignal?.sentiment || 0,
+            entry_prediction: predicted,
+            entry_regime: this.state.marketRegime.type,
           };
         }
       }
@@ -4109,6 +5639,24 @@ Response format:
     this.state.costTracker.tokens_out += tokensOut;
 
     return cost;
+  }
+
+  private withTimeout<T>(operation: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      const timeoutHandle: ReturnType<typeof setTimeout> = setTimeout(() => {
+        reject(new Error(`${label} exceeded ${timeoutMs}ms`));
+      }, timeoutMs);
+
+      operation
+        .then((value) => {
+          clearTimeout(timeoutHandle);
+          resolve(value);
+        })
+        .catch((error) => {
+          clearTimeout(timeoutHandle);
+          reject(error);
+        });
+    });
   }
 
   private async persist(): Promise<void> {
