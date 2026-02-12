@@ -1231,6 +1231,7 @@ export class OwokxHarness extends DurableObject<Env> {
   async alarm(): Promise<void> {
     if (!this.state.enabled) {
       this.log("System", "alarm_skipped", { reason: "Agent not enabled" });
+      await this.persist();
       return;
     }
 
@@ -1339,14 +1340,14 @@ export class OwokxHarness extends DurableObject<Env> {
         this.optimizeRuntimeParameters(now);
       }
 
-      this.pruneMemoryEpisodes();
-      await this.persist();
     } catch (error) {
       this.log("System", "alarm_error", { error: String(error) });
       this.recordPerformanceSample("analyst", this.state.optimization.analystLatencyEmaMs || 1_000, true);
+    } finally {
+      this.pruneMemoryEpisodes();
+      await this.persist();
+      await this.scheduleNextAlarm();
     }
-
-    await this.scheduleNextAlarm();
   }
 
   private async scheduleNextAlarm(): Promise<void> {
@@ -1686,7 +1687,7 @@ export class OwokxHarness extends DurableObject<Env> {
     let swarm: any;
     if (this.env.SWARM_REGISTRY) {
       try {
-        const id = this.env.SWARM_REGISTRY.idFromName("main");
+        const id = this.env.SWARM_REGISTRY.idFromName("default");
         const stub = this.env.SWARM_REGISTRY.get(id);
         const [healthRes, agentsRes] = await Promise.all([
           stub.fetch("http://registry/health"),

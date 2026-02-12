@@ -1,6 +1,6 @@
 ⚠️ **Warning:** This software is provided for educational and informational purposes only. Nothing in this repository constitutes financial, investment, legal, or tax advice.
 
-# Okx
+# Okx Trading Agent
 
 An autonomous, LLM-powered trading agent that runs 24/7 on Cloudflare Workers.
 
@@ -40,7 +40,7 @@ cd Okx
 npm install
 ```
 
-### 2. Create Cloudflare resources
+### 2. Create Cloudflare resourcesy
 
 ```bash
 # Create D1 database
