@@ -176,6 +176,133 @@ export default {
       return registry.fetch("http://registry/agents");
     }
 
+    if (url.pathname === "/swarm/health") {
+      if (!isRequestAuthorized(request, env, "read")) {
+        return unauthorizedResponse();
+      }
+      const registry = getRegistryStub(env);
+      const [healthRes, queueRes] = await Promise.all([
+        registry.fetch("http://registry/health"),
+        registry.fetch("http://registry/queue/state"),
+      ]);
+
+      if (!healthRes.ok || !queueRes.ok) {
+        return new Response(
+          JSON.stringify({
+            healthy: false,
+            error: "Unable to load swarm health",
+            registryStatus: healthRes.status,
+            queueStatus: queueRes.status,
+          }),
+          {
+            status: 503,
+            headers: { "Content-Type": "application/json" },
+          }
+        );
+      }
+
+      const health = await healthRes.json() as {
+        healthy?: boolean;
+      };
+      const queue = await queueRes.json() as {
+        deadLettered?: number;
+        staleAgents?: number;
+      };
+      const deadLettered = Number.isFinite(queue.deadLettered) ? Number(queue.deadLettered) : 0;
+      const staleAgents = Number.isFinite(queue.staleAgents) ? Number(queue.staleAgents) : 0;
+
+      return new Response(
+        JSON.stringify({
+          healthy: Boolean(health.healthy),
+          degraded: deadLettered > 0 || staleAgents > 0,
+          deadLettered,
+          staleAgents,
+          registry: health,
+          queue,
+          timestamp: new Date().toISOString(),
+        }),
+        {
+          headers: { "Content-Type": "application/json" },
+        }
+      );
+    }
+
+    if (url.pathname === "/swarm/metrics") {
+      if (!isRequestAuthorized(request, env, "read")) {
+        return unauthorizedResponse();
+      }
+      const registry = getRegistryStub(env);
+      const [agentsRes, queueRes] = await Promise.all([
+        registry.fetch("http://registry/agents"),
+        registry.fetch("http://registry/queue/state"),
+      ]);
+
+      if (!agentsRes.ok || !queueRes.ok) {
+        return new Response(
+          JSON.stringify({
+            error: "Unable to load swarm metrics",
+            registryAgentsStatus: agentsRes.status,
+            queueStatus: queueRes.status,
+          }),
+          {
+            status: 503,
+            headers: { "Content-Type": "application/json" },
+          }
+        );
+      }
+
+      const now = Date.now();
+      const staleThresholdMs = 300_000;
+      const agents = await agentsRes.json() as Record<string, {
+        id?: string;
+        type?: string;
+        status?: string;
+        lastHeartbeat?: number;
+      }>;
+      const queue = await queueRes.json() as {
+        queued?: number;
+        deadLettered?: number;
+        stats?: Record<string, number>;
+        routingState?: Record<string, number>;
+        staleAgents?: number;
+      };
+
+      const byType: Record<string, number> = {};
+      const byStatus: Record<string, number> = {};
+      let staleComputed = 0;
+
+      for (const agent of Object.values(agents)) {
+        const type = agent.type ?? "unknown";
+        const status = agent.status ?? "unknown";
+        byType[type] = (byType[type] ?? 0) + 1;
+        byStatus[status] = (byStatus[status] ?? 0) + 1;
+        if (typeof agent.lastHeartbeat === "number" && now - agent.lastHeartbeat > staleThresholdMs) {
+          staleComputed += 1;
+        }
+      }
+
+      return new Response(
+        JSON.stringify({
+          timestamp: new Date().toISOString(),
+          agents: {
+            total: Object.keys(agents).length,
+            byType,
+            byStatus,
+            stale: Number.isFinite(queue.staleAgents) ? Number(queue.staleAgents) : staleComputed,
+          },
+          queue: {
+            queued: Number.isFinite(queue.queued) ? Number(queue.queued) : 0,
+            deadLettered: Number.isFinite(queue.deadLettered) ? Number(queue.deadLettered) : 0,
+            stats: queue.stats ?? {},
+            routingState: queue.routingState ?? {},
+          },
+        }),
+        {
+          headers: { "Content-Type": "application/json" },
+        }
+      );
+    }
+
     if (url.pathname === "/swarm/queue") {
       if (!isRequestAuthorized(request, env, "read")) {
         return unauthorizedResponse();
@@ -194,6 +321,16 @@ export default {
       return registry.fetch(proxyUrl.toString());
     }
 
+    if (url.pathname === "/swarm/routing") {
+      if (!isRequestAuthorized(request, env, "read")) {
+        return unauthorizedResponse();
+      }
+      const registry = getRegistryStub(env);
+      const proxyUrl = new URL("/routing/preview", "http://registry");
+      proxyUrl.search = url.search;
+      return registry.fetch(proxyUrl.toString());
+    }
+
     if (url.pathname === "/swarm/dispatch" && request.method === "POST") {
       if (!isRequestAuthorized(request, env, "trade")) {
         return unauthorizedResponse();
@@ -201,6 +338,34 @@ export default {
       const registry = getRegistryStub(env);
       return registry.fetch(
         new Request("http://registry/queue/dispatch", {
+          method: "POST",
+          headers: request.headers,
+          body: request.body,
+        })
+      );
+    }
+
+    if (url.pathname === "/swarm/recovery/requeue-dlq" && request.method === "POST") {
+      if (!isRequestAuthorized(request, env, "trade")) {
+        return unauthorizedResponse();
+      }
+      const registry = getRegistryStub(env);
+      return registry.fetch(
+        new Request("http://registry/recovery/requeue-dead-letter", {
+          method: "POST",
+          headers: request.headers,
+          body: request.body,
+        })
+      );
+    }
+
+    if (url.pathname === "/swarm/recovery/prune-stale" && request.method === "POST") {
+      if (!isRequestAuthorized(request, env, "trade")) {
+        return unauthorizedResponse();
+      }
+      const registry = getRegistryStub(env);
+      return registry.fetch(
+        new Request("http://registry/recovery/prune-stale-agents", {
           method: "POST",
           headers: request.headers,
           body: request.body,

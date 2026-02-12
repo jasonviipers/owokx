@@ -9,6 +9,27 @@ import type { Env } from "../env.d";
 import type { AgentMessage, AgentType } from "../lib/agents/protocol";
 import { createLLMProvider } from "../providers/llm/factory";
 
+interface AnalysisCacheEntry {
+  recommendations: unknown[];
+  timestamp: number;
+}
+
+interface LlmHealth {
+  failures: number;
+  circuitOpenUntil: number;
+  lastSuccessAt: number;
+  lastFailureAt: number;
+  lastError?: string;
+}
+
+interface AnalystMetrics {
+  analysisCalls: number;
+  analysisCacheHits: number;
+  researchCalls: number;
+  researchBatchCalls: number;
+  researchCacheHits: number;
+}
+
 interface AnalystState extends AgentBaseState {
   researchResults: Record<string, {
     symbol: string;
@@ -17,11 +38,36 @@ interface AnalystState extends AgentBaseState {
     reasoning: string;
     timestamp: number;
   }>;
+  analysisCache: Record<string, AnalysisCacheEntry>;
+  llmHealth: LlmHealth;
+  metrics: AnalystMetrics;
   lastAnalysisTime: number;
 }
 
-const DEFAULT_STATE: Pick<AnalystState, "researchResults" | "lastAnalysisTime"> = {
+function createDefaultLlmHealth(): LlmHealth {
+  return {
+    failures: 0,
+    circuitOpenUntil: 0,
+    lastSuccessAt: 0,
+    lastFailureAt: 0,
+  };
+}
+
+function createDefaultMetrics(): AnalystMetrics {
+  return {
+    analysisCalls: 0,
+    analysisCacheHits: 0,
+    researchCalls: 0,
+    researchBatchCalls: 0,
+    researchCacheHits: 0,
+  };
+}
+
+const DEFAULT_STATE: Pick<AnalystState, "researchResults" | "analysisCache" | "llmHealth" | "metrics" | "lastAnalysisTime"> = {
   researchResults: {},
+  analysisCache: {},
+  llmHealth: createDefaultLlmHealth(),
+  metrics: createDefaultMetrics(),
   lastAnalysisTime: 0,
 };
 
@@ -29,13 +75,27 @@ export class AnalystSimple extends AgentBase<AnalystState> {
   protected agentType: AgentType = "analyst";
   private readonly analysisIntervalMs = 120_000;
   private readonly researchTtlMs = 180_000;
+  private readonly analysisCacheTtlMs = 90_000;
+  private readonly llmTimeoutMs = 18_000;
+  private readonly llmFailureThreshold = 3;
+  private readonly llmMaxBackoffMs = 5 * 60 * 1000;
+  private readonly maxBatchResearchSymbols = 8;
   private _llm: any = null;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.state = {
       ...this.state,
-      researchResults: this.state.researchResults ?? DEFAULT_STATE.researchResults,
+      researchResults: this.state.researchResults ?? {},
+      analysisCache: this.state.analysisCache ?? {},
+      llmHealth: {
+        ...createDefaultLlmHealth(),
+        ...(this.state.llmHealth ?? {}),
+      },
+      metrics: {
+        ...createDefaultMetrics(),
+        ...(this.state.metrics ?? {}),
+      },
       lastAnalysisTime: this.state.lastAnalysisTime ?? DEFAULT_STATE.lastAnalysisTime,
     };
   }
@@ -46,7 +106,15 @@ export class AnalystSimple extends AgentBase<AnalystState> {
   }
 
   protected getCapabilities(): string[] {
-    return ["analyze_signals", "research_signal", "publish_analysis"];
+    return [
+      "analyze_signals",
+      "research_signal",
+      "research_signals_batch",
+      "publish_analysis",
+      "llm_cached_analysis",
+      "llm_batched_research",
+      "llm_circuit_breaker",
+    ];
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -72,6 +140,14 @@ export class AnalystSimple extends AgentBase<AnalystState> {
         }
         const research = await this.researchSignal(payload.symbol, payload.sentiment);
         return { research };
+      }
+      case "research_signals_batch": {
+        const payload = message.payload as {
+          signals?: Array<{ symbol?: string; sentiment?: number }>;
+        };
+        const signals = Array.isArray(payload.signals) ? payload.signals : [];
+        const results = await this.researchSignalsBatch(signals);
+        return { results };
       }
       case "signals_updated": {
         await this.runAnalysisFromScout();
@@ -100,6 +176,9 @@ export class AnalystSimple extends AgentBase<AnalystState> {
     }
     if (path === "/research") {
       return this.handleResearch(request);
+    }
+    if (path === "/research-batch" && request.method === "POST") {
+      return this.handleResearchBatch(request);
     }
     if (path === "/analysis-cycle" && request.method === "POST") {
       await this.runAnalysisFromScout();
@@ -156,6 +235,24 @@ export class AnalystSimple extends AgentBase<AnalystState> {
     }
   }
 
+  private async handleResearchBatch(request: Request): Promise<Response> {
+    try {
+      const payload = await request.json() as {
+        signals?: Array<{ symbol?: string; sentiment?: number }>;
+      };
+      const signals = Array.isArray(payload.signals) ? payload.signals : [];
+      const results = await this.researchSignalsBatch(signals);
+      return new Response(JSON.stringify({ results }), {
+        headers: { "Content-Type": "application/json" },
+      });
+    } catch (error) {
+      return new Response(JSON.stringify({ error: String(error) }), {
+        status: 500,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+  }
+
   private async runAnalysisFromScout(): Promise<void> {
     const dataScoutId = this.env.DATA_SCOUT.idFromName("default");
     const dataScout = this.env.DATA_SCOUT.get(dataScoutId);
@@ -166,6 +263,15 @@ export class AnalystSimple extends AgentBase<AnalystState> {
 
     const payload = await response.json() as { signals?: unknown[] };
     const signals = Array.isArray(payload.signals) ? payload.signals : [];
+    const batchedResearch = await this.researchSignalsBatch(
+      signals.map((signal) => {
+        const candidate = signal as { symbol?: string; sentiment?: number };
+        return {
+          symbol: candidate.symbol,
+          sentiment: candidate.sentiment,
+        };
+      })
+    );
     const recommendations = await this.analyzeSignals(signals);
     this.state.lastAnalysisTime = Date.now();
     await this.saveState();
@@ -173,6 +279,7 @@ export class AnalystSimple extends AgentBase<AnalystState> {
     try {
       await this.publishEvent("analysis_ready", {
         recommendations,
+        batchedResearch,
         generatedAt: this.state.lastAnalysisTime,
       });
     } catch (error) {
@@ -191,16 +298,211 @@ export class AnalystSimple extends AgentBase<AnalystState> {
       lastAnalysisAgeMs: lastAnalysisAge,
       researchCount: Object.keys(this.state.researchResults).length,
       llmAvailable: !!this._llm,
+      llmHealth: this.state.llmHealth,
+      metrics: this.state.metrics,
+      analysisCacheEntries: Object.keys(this.state.analysisCache).length,
     }), {
       headers: { "Content-Type": "application/json" },
     });
   }
 
   private async analyzeSignals(signals: unknown[]): Promise<any[]> {
-    if (!this._llm || signals.length === 0) {
+    if (signals.length === 0) {
       return [];
     }
 
+    const normalizedSignals = this.normalizeSignals(signals);
+    const topSignals = normalizedSignals
+      .filter((s) => Math.abs(s.sentiment) >= 0.3)
+      .sort((a, b) => Math.abs(b.sentiment) * b.volume - Math.abs(a.sentiment) * a.volume)
+      .slice(0, 5);
+
+    if (topSignals.length === 0) {
+      return [];
+    }
+
+    const cacheKey = this.buildAnalysisCacheKey(topSignals);
+    const cached = this.state.analysisCache[cacheKey];
+    if (cached && Date.now() - cached.timestamp < this.analysisCacheTtlMs) {
+      this.state.metrics.analysisCacheHits += 1;
+      return Array.isArray(cached.recommendations) ? cached.recommendations : [];
+    }
+
+    this.state.metrics.analysisCalls += 1;
+    const signalSummary = topSignals.map((s) => ({
+      symbol: s.symbol,
+      sentiment: (s.sentiment * 100).toFixed(0),
+      sources: s.sources.join(", "),
+    }));
+
+    const prompt = `You are a trading analyst. Analyze these signals and provide recommendations.
+
+TOP SIGNALS:
+${signalSummary.map((s) => `- ${s.symbol}: ${s.sentiment}% sentiment (${s.sources})`).join("\n")}
+
+RULES:
+1. Only recommend BUY if confidence >= 0.7
+2. Consider position sizing: 10% of cash per trade
+3. Max 5 positions total
+
+Output JSON array of recommendations:
+[
+  {
+    "symbol": "AAPL",
+    "action": "BUY|SKIP|WAIT",
+    "confidence": 0.0-1.0,
+    "reasoning": "brief reason",
+    "urgency": "high|medium|low"
+  }
+]`;
+
+    const recommendations = await this.runLlmWithResilience<any[]>(
+      async () => {
+        const response = await this._llm.complete({
+          model: "gpt-4o-mini",
+          messages: [
+            {
+              role: "system",
+              content: "You are a quantitative trading analyst. Be data-driven and risk-aware. Output valid JSON only.",
+            },
+            { role: "user", content: prompt },
+          ],
+          max_tokens: 500,
+          temperature: 0.2,
+        });
+
+        const parsed = this.parseJsonResponse(response.content || "{}");
+        const output = Array.isArray(parsed.recommendations) ? parsed.recommendations : parsed;
+        return Array.isArray(output) ? output : [];
+      },
+      [],
+      "analyze_signals"
+    );
+
+    this.state.analysisCache[cacheKey] = {
+      recommendations,
+      timestamp: Date.now(),
+    };
+    await this.saveState();
+    return recommendations;
+  }
+
+  private async researchSignal(symbol: string, sentimentScore: number): Promise<any> {
+    const result = await this.researchSignalsBatch([
+      { symbol, sentiment: sentimentScore },
+    ]);
+    return result[symbol.toUpperCase()] ?? null;
+  }
+
+  private async researchSignalsBatch(
+    signals: Array<{ symbol?: string; sentiment?: number }>
+  ): Promise<Record<string, { symbol: string; verdict: "BUY" | "SKIP" | "WAIT"; confidence: number; reasoning: string; timestamp: number }>> {
+    const now = Date.now();
+    const normalizedInputs = signals
+      .map((signal) => ({
+        symbol: typeof signal.symbol === "string" ? signal.symbol.toUpperCase() : "",
+        sentiment: typeof signal.sentiment === "number" ? signal.sentiment : 0,
+      }))
+      .filter((signal) => signal.symbol.length > 0);
+
+    const deduped = Array.from(
+      new Map(normalizedInputs.map((signal) => [signal.symbol, signal])).values()
+    ).slice(0, this.maxBatchResearchSymbols * 2);
+
+    const results: Record<string, { symbol: string; verdict: "BUY" | "SKIP" | "WAIT"; confidence: number; reasoning: string; timestamp: number }> = {};
+    const uncached: Array<{ symbol: string; sentiment: number }> = [];
+
+    for (const signal of deduped) {
+      const cached = this.state.researchResults[signal.symbol];
+      if (cached && now - cached.timestamp < this.researchTtlMs) {
+        this.state.metrics.researchCacheHits += 1;
+        results[signal.symbol] = cached;
+        continue;
+      }
+      if (Math.abs(signal.sentiment) < 0.3) {
+        continue;
+      }
+      uncached.push(signal);
+    }
+
+    if (uncached.length === 0) {
+      return results;
+    }
+
+    const chunks: Array<Array<{ symbol: string; sentiment: number }>> = [];
+    for (let i = 0; i < uncached.length; i += this.maxBatchResearchSymbols) {
+      chunks.push(uncached.slice(i, i + this.maxBatchResearchSymbols));
+    }
+
+    for (const chunk of chunks) {
+      this.state.metrics.researchBatchCalls += 1;
+      const prompt = `Evaluate these symbols based on social sentiment.
+
+INPUT:
+${chunk.map((s) => `- ${s.symbol}: ${(s.sentiment * 100).toFixed(0)}%`).join("\n")}
+
+Return JSON array:
+[
+  {
+    "symbol": "AAPL",
+    "verdict": "BUY|SKIP|WAIT",
+    "confidence": 0.0-1.0,
+    "reasoning": "brief reason"
+  }
+]`;
+
+      const batchResult = await this.runLlmWithResilience<
+        Array<{ symbol?: string; verdict?: "BUY" | "SKIP" | "WAIT"; confidence?: number; reasoning?: string }>
+      >(
+        async () => {
+          const response = await this._llm.complete({
+            model: "gpt-4o-mini",
+            messages: [
+              {
+                role: "system",
+                content: "You are a stock research analyst. Output strict JSON array only.",
+              },
+              { role: "user", content: prompt },
+            ],
+            max_tokens: 600,
+            temperature: 0.25,
+          });
+          const parsed = this.parseJsonResponse(response.content || "[]");
+          return Array.isArray(parsed) ? parsed : [];
+        },
+        [],
+        "research_signals_batch"
+      );
+
+      for (const item of batchResult) {
+        if (!item || typeof item.symbol !== "string") continue;
+        const symbol = item.symbol.toUpperCase();
+        const verdict = item.verdict ?? "WAIT";
+        const confidence = typeof item.confidence === "number" ? item.confidence : 0;
+        const reasoning = typeof item.reasoning === "string" ? item.reasoning : "No reasoning provided";
+        const next = {
+          symbol,
+          verdict,
+          confidence,
+          reasoning,
+          timestamp: Date.now(),
+        };
+        this.state.researchResults[symbol] = next;
+        results[symbol] = next;
+      }
+    }
+
+    this.state.metrics.researchCalls += uncached.length;
+    await this.saveState();
+    return results;
+  }
+
+  private normalizeSignals(signals: unknown[]): Array<{
+    symbol: string;
+    sentiment: number;
+    volume: number;
+    sources: string[];
+  }> {
     const normalizedSignals: Array<{
       symbol: string;
       sentiment: number;
@@ -219,139 +521,108 @@ export class AnalystSimple extends AgentBase<AnalystState> {
       if (typeof candidate.sentiment !== "number") continue;
       if (typeof candidate.volume !== "number") continue;
       normalizedSignals.push({
-        symbol: candidate.symbol,
+        symbol: candidate.symbol.toUpperCase(),
         sentiment: candidate.sentiment,
         volume: candidate.volume,
         sources: Array.isArray(candidate.sources) ? candidate.sources : [],
       });
     }
 
-    // Filter to top 5 signals by sentiment * volume
-    const topSignals = normalizedSignals
-      .filter(s => Math.abs(s.sentiment) >= 0.3)
-      .sort((a, b) => Math.abs(b.sentiment) * b.volume - Math.abs(a.sentiment) * a.volume)
-      .slice(0, 5);
-
-    if (topSignals.length === 0) {
-      return [];
-    }
-
-    const signalSummary = topSignals.map(s => ({
-      symbol: s.symbol,
-      sentiment: (s.sentiment * 100).toFixed(0),
-      sources: s.sources.join(", "),
-    }));
-
-    const prompt = `You are a trading analyst. Analyze these signals and provide recommendations.
-
-TOP SIGNALS:
-${signalSummary.map(s => `- ${s.symbol}: ${s.sentiment}% sentiment (${s.sources})`).join("\n")}
-
-RULES:
-1. Only recommend BUY if confidence >= 0.7
-2. Consider position sizing: 10% of cash per trade
-3. Max 5 positions total
-
-Output JSON array of recommendations:
-[
-  {
-    "symbol": "AAPL",
-    "action": "BUY|SKIP|WAIT",
-    "confidence": 0.0-1.0,
-    "reasoning": "brief reason",
-    "urgency": "high|medium|low"
-  }
-]`;
-
-    try {
-      const response = await this._llm.complete({
-        model: "gpt-4o-mini",
-        messages: [
-          {
-            role: "system",
-            content: "You are a quantitative trading analyst. Be data-driven and risk-aware. Output valid JSON only.",
-          },
-          { role: "user", content: prompt },
-        ],
-        max_tokens: 500,
-        temperature: 0.2,
-      });
-
-      const content = response.content || "{}";
-      const data = JSON.parse(content.replace(/```json\n?|```/g, "").trim());
-      const recommendations = Array.isArray(data.recommendations) ? data.recommendations : data;
-
-      return recommendations;
-    } catch (error) {
-      this.log("warn", "LLM analysis error", { error: String(error) });
-      return [];
-    }
+    return normalizedSignals;
   }
 
-  private async researchSignal(symbol: string, sentimentScore: number): Promise<any> {
-    const cached = this.state.researchResults[symbol];
-    if (cached && Date.now() - cached.timestamp < this.researchTtlMs) {
-      return cached;
+  private buildAnalysisCacheKey(
+    signals: Array<{ symbol: string; sentiment: number; volume: number; sources: string[] }>
+  ): string {
+    return signals
+      .map((signal) =>
+        `${signal.symbol}:${signal.sentiment.toFixed(3)}:${signal.volume}:${signal.sources.sort().join("|")}`
+      )
+      .join(";");
+  }
+
+  private parseJsonResponse(content: string): any {
+    const cleaned = content.replace(/```json\n?|```/g, "").trim();
+    return JSON.parse(cleaned);
+  }
+
+  private isLlmCircuitOpen(): boolean {
+    return this.state.llmHealth.circuitOpenUntil > Date.now();
+  }
+
+  private markLlmSuccess(): void {
+    this.state.llmHealth = {
+      failures: 0,
+      circuitOpenUntil: 0,
+      lastSuccessAt: Date.now(),
+      lastFailureAt: this.state.llmHealth.lastFailureAt,
+      lastError: undefined,
+    };
+  }
+
+  private markLlmFailure(error: string): void {
+    const failures = this.state.llmHealth.failures + 1;
+    const shouldOpen = failures >= this.llmFailureThreshold;
+    const cooldown = shouldOpen
+      ? Math.min(this.llmMaxBackoffMs, 10_000 * 2 ** Math.max(0, failures - this.llmFailureThreshold))
+      : 0;
+
+    this.state.llmHealth = {
+      failures,
+      circuitOpenUntil: shouldOpen ? Date.now() + cooldown : 0,
+      lastSuccessAt: this.state.llmHealth.lastSuccessAt,
+      lastFailureAt: Date.now(),
+      lastError: error,
+    };
+  }
+
+  private async runLlmWithResilience<T>(
+    operation: () => Promise<T>,
+    fallback: T,
+    context: string
+  ): Promise<T> {
+    if (!this._llm) {
+      return fallback;
     }
-
-    if (!this._llm || Math.abs(sentimentScore) < 0.3) {
-      return null;
+    if (this.isLlmCircuitOpen()) {
+      this.log("warn", "LLM circuit open; using fallback", {
+        context,
+        openUntil: this.state.llmHealth.circuitOpenUntil,
+      });
+      return fallback;
     }
-
-    const prompt = `Should we BUY this stock based on social sentiment?
-
-SYMBOL: ${symbol}
-SENTIMENT: ${(sentimentScore * 100).toFixed(0)}% bullish
-
-Evaluate if this is a good entry. Consider: Is the sentiment justified? Is it too late (already pumped)? Any red flags?
-
-JSON response:
-{
-  "verdict": "BUY|SKIP|WAIT",
-  "confidence": 0.0-1.0,
-  "reasoning": "brief reason",
-  "red_flags": ["any concerns"],
-  "catalysts": ["positive factors"]
-}`;
 
     try {
-      const response = await this._llm.complete({
-        model: "gpt-4o-mini",
-        messages: [
-          {
-            role: "system",
-            content: "You are a stock research analyst. Be skeptical of hype. Output valid JSON only.",
-          },
-          { role: "user", content: prompt },
-        ],
-        max_tokens: 250,
-        temperature: 0.3,
-      });
-
-      const content = response.content || "{}";
-      const analysis = JSON.parse(content.replace(/```json\n?|```/g, "").trim()) as {
-        verdict: "BUY" | "SKIP" | "WAIT";
-        confidence: number;
-        reasoning: string;
-        red_flags: string[];
-        catalysts: string[];
-      };
-
-      const result = {
-        symbol,
-        verdict: analysis.verdict,
-        confidence: analysis.confidence,
-        reasoning: analysis.reasoning,
-        timestamp: Date.now(),
-      };
-
-      this.state.researchResults[symbol] = result;
-      await this.ctx.storage.put("state", this.state);
-      
+      const result = await this.withTimeout(operation(), this.llmTimeoutMs);
+      this.markLlmSuccess();
       return result;
     } catch (error) {
-      this.log("warn", "Signal research error", { error: String(error), symbol });
-      return null;
+      this.markLlmFailure(String(error));
+      this.log("warn", "LLM call failed; fallback used", { context, error: String(error) });
+      return fallback;
+    }
+  }
+
+  private async withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<T>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`Operation timeout after ${timeoutMs}ms`)), timeoutMs);
+    });
+
+    try {
+      return await Promise.race([promise, timeout]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  private pruneCaches(): void {
+    const now = Date.now();
+    for (const cacheKey in this.state.analysisCache) {
+      const entry = this.state.analysisCache[cacheKey];
+      if (entry && now - entry.timestamp > this.analysisCacheTtlMs) {
+        delete this.state.analysisCache[cacheKey];
+      }
     }
   }
 
@@ -375,6 +646,7 @@ JSON response:
       }
     }
 
+    this.pruneCaches();
     await this.saveState();
     await super.alarm();
   }

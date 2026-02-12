@@ -9,6 +9,7 @@
     "deploy": "wrangler deploy",
     "deploy:production": "wrangler deploy --env production",
     "deploy:oneclick": "npx tsx scripts/deploy.ts",
+    "benchmark:swarm": "node scripts/benchmark-swarm.mjs",
     "db:migrate": "wrangler d1 migrations apply owokx-db --local",
     "db:migrate:remote": "wrangler d1 migrations apply owokx-db --remote",
     "db:studio": "wrangler d1 execute owokx-db --local --command 'SELECT 1'",

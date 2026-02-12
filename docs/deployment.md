@@ -1,36 +1,23 @@
-# One-Click Deployment (Production-Ready)
+# Deployment and Operations Runbook
 
-This repository ships a full “commit → CI → deploy” pipeline:
+This project ships a production deployment workflow for the Worker and dashboard, with swarm-specific monitoring and recovery operations.
 
-- Cloudflare Worker deploys via Wrangler (staging on push, production via manual one-click).
-- Dashboard deploys as a Docker image published to GHCR and rolled out to Kubernetes via blue/green.
-- Real-time status monitoring is available via a CLI that triggers and watches the deployment workflow.
+## Deployment Paths
 
-## Workflows
-
-- CI (staging worker deploy): [.github/workflows/ci.yml](file:///c:/Users/4hkee/OneDrive/Bureau/Jason%20Platform/okx-trading/.github/workflows/ci.yml)
-- Dashboard container publish (GHCR): [.github/workflows/container-dashboard.yml](file:///c:/Users/4hkee/OneDrive/Bureau/Jason%20Platform/okx-trading/.github/workflows/container-dashboard.yml)
-- One-click deploy (worker + k8s blue/green + rollback + notifications): [.github/workflows/deploy-oneclick.yml](file:///c:/Users/4hkee/OneDrive/Bureau/Jason%20Platform/okx-trading/.github/workflows/deploy-oneclick.yml)
-
-## Environments
+- Staging Worker deploy: `.github/workflows/ci.yml`
+- Dashboard container publish (GHCR): `.github/workflows/container-dashboard.yml`
+- One-click production deploy (Worker + dashboard blue/green): `.github/workflows/deploy-oneclick.yml`
 
 Wrangler environments:
 
 - Staging: default (no `--env`)
 - Production: `--env production`
 
-Config lives in [wrangler.jsonc](file:///c:/Users/4hkee/OneDrive/Bureau/Jason%20Platform/okx-trading/wrangler.jsonc).
+Primary config file: `wrangler.jsonc`.
 
-Kubernetes environments:
+## One-Click Deploy
 
-- Staging overlay: [deploy/k8s/dashboard/overlays/staging](file:///c:/Users/4hkee/OneDrive/Bureau/Jason%20Platform/okx-trading/deploy/k8s/dashboard/overlays/staging)
-- Production overlay: [deploy/k8s/dashboard/overlays/production](file:///c:/Users/4hkee/OneDrive/Bureau/Jason%20Platform/okx-trading/deploy/k8s/dashboard/overlays/production)
-
-Each overlay pins the namespace and dashboard API origin via a ConfigMap patch.
-
-## One-Click Deploy (CLI)
-
-Trigger and monitor a deploy with a single command:
+Trigger and monitor deploy from CLI:
 
 ```bash
 npm run deploy:oneclick -- --env production --components all
@@ -40,63 +27,121 @@ Options:
 
 - `--env staging|production`
 - `--components all|worker|dashboard`
-- `--repo owner/repo` (optional override)
-- `--ref <branch>` (optional override)
+- `--repo owner/repo`
+- `--ref <branch>`
 
-The CLI is implemented at [scripts/deploy.ts](file:///c:/Users/4hkee/OneDrive/Bureau/Jason%20Platform/okx-trading/scripts/deploy.ts).
+Implementation: `scripts/deploy.ts`.
 
-## Kubernetes Blue/Green Dashboard
+## Pre-Deploy Checklist
 
-Dashboard manifests are:
+1. Validate type safety and tests.
+2. Confirm production secrets and environment variables are set.
+3. Confirm D1 migrations are ready.
+4. Confirm rollback owners are on-call.
 
-- Base: [deploy/k8s/dashboard/base](file:///c:/Users/4hkee/OneDrive/Bureau/Jason%20Platform/okx-trading/deploy/k8s/dashboard/base)
-- Two deployments (`owokx-dashboard-blue`, `owokx-dashboard-green`) and a single Service that selects the active track.
+Suggested commands:
 
-The one-click deploy workflow:
+```bash
+npm run typecheck
+npm run test:run
+npm run benchmark:swarm -- --messages 1000 --agents 5 --runs 3
+```
 
-1. Detects the currently active track from the Service selector
-2. Updates the inactive deployment image to the new GHCR tag
-3. Waits for rollout readiness
-4. Switches the Service selector to cut over traffic
-5. Runs post-deploy health checks and rolls back automatically on failure
+## Required Environment Configuration
 
-## Required GitHub Environment Configuration
+GitHub environments:
 
-Create two GitHub Environments: `staging` and `production`. Use environment protection rules for production (required reviewers).
+- `staging`
+- `production` (recommended: required reviewers)
 
 Environment secrets:
 
-- `CLOUDFLARE_API_TOKEN` (Worker deploy + D1 migrations)
-- `KUBE_CONFIG` (base64-encoded kubeconfig for the target cluster)
+- `CLOUDFLARE_API_TOKEN`
+- `KUBE_CONFIG`
 - `SLACK_WEBHOOK_URL` (optional)
-- SMTP email (optional):
-  - `SMTP_SERVER`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`
-  - `NOTIFY_EMAIL_TO`, `NOTIFY_EMAIL_FROM`
+- Optional SMTP credentials for notifications
 
-Environment variables (non-secret):
+Environment variables:
 
-- `OWOKX_WORKER_URL` (used for `/health` checks)
-- `OWOKX_DASHBOARD_URL` (used for `/health` checks)
+- `OWOKX_WORKER_URL`
+- `OWOKX_DASHBOARD_URL`
 
-## Secrets Management
+## D1 Migration Strategy
 
-- Cloudflare secrets: use `wrangler secret put <NAME>` and `wrangler secret put <NAME> --env production` for production.
-- Kubernetes secrets: keep secrets out of git. Prefer an external secrets controller (ESO/SealedSecrets/SOPS) or inject via your cluster’s secret manager.
-- GitHub: keep all credentials in Environment secrets and use environment protection rules for production promotions.
-
-## Database Migrations (D1)
-
-The one-click deploy workflow runs:
+One-click deploy runs migrations remotely:
 
 - Staging: `wrangler d1 migrations apply owokx-db --remote`
 - Production: `wrangler d1 migrations apply owokx-db --remote --env production`
 
-## Metrics
+## Monitoring Endpoints
 
-An authenticated metrics endpoint is exposed:
+All endpoints below require read authorization.
 
-- Worker: `GET /metrics` (requires a `read` token)
-- Backed by the harness state (costs, run timestamps, cache sizes)
+Global:
 
-See routing in [src/index.ts](file:///c:/Users/4hkee/OneDrive/Bureau/Jason%20Platform/okx-trading/src/index.ts) and the handler in [owokx-harness.ts](file:///c:/Users/4hkee/OneDrive/Bureau/Jason%20Platform/okx-trading/src/durable-objects/owokx-harness.ts).
+- `GET /health`
+- `GET /metrics`
 
+Swarm-specific:
+
+- `GET /swarm/health`
+- `GET /swarm/metrics`
+- `GET /swarm/agents`
+- `GET /swarm/queue`
+- `GET /swarm/subscriptions`
+- `GET /swarm/routing?type=<agentType>&count=<n>`
+
+Operational actions (trade authorization required):
+
+- `POST /swarm/dispatch`
+- `POST /swarm/publish`
+- `POST /swarm/recovery/requeue-dlq`
+- `POST /swarm/recovery/prune-stale`
+
+## Quick Operations
+
+Replace `$TOKEN` with a valid read or trade token.
+
+Check aggregate swarm health:
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" \
+  https://<worker-domain>/swarm/health
+```
+
+Check aggregated metrics:
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" \
+  https://<worker-domain>/swarm/metrics
+```
+
+Requeue dead-letter messages:
+
+```bash
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"limit":50}' \
+  https://<worker-domain>/swarm/recovery/requeue-dlq
+```
+
+Prune stale agents:
+
+```bash
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"staleMs":600000}' \
+  https://<worker-domain>/swarm/recovery/prune-stale
+```
+
+## Incident Runbook
+
+1. Verify `GET /swarm/health` and `GET /swarm/metrics`.
+2. If queue grows and dead letters increase, run dead-letter requeue.
+3. If stale agents increase, prune stale agents and verify new heartbeats.
+4. Trigger controlled dispatch (`POST /swarm/dispatch`) and observe queue drain.
+5. If system remains degraded, execute workflow rollback and investigate logs.
+
+## Training
+
+Use `docs/swarm-training.md` for onboarding, drill steps, and readiness checks.

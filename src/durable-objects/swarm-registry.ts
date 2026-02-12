@@ -24,6 +24,7 @@ function createDefaultRegistryState(): RegistryState {
     queueOrder: [],
     deadLetterQueue: {},
     subscriptions: {},
+    routingState: {},
     deliveryStats: {
       enqueued: 0,
       delivered: 0,
@@ -35,6 +36,7 @@ function createDefaultRegistryState(): RegistryState {
 }
 
 const HEARTBEAT_STALE_MS = 300_000;
+const REGISTRY_MAINTENANCE_INTERVAL_MS = 15_000;
 
 export class SwarmRegistry extends AgentBase<RegistryState> {
   protected agentType: AgentType = "registry";
@@ -50,6 +52,7 @@ export class SwarmRegistry extends AgentBase<RegistryState> {
       queueOrder: this.state.queueOrder ?? [],
       deadLetterQueue: this.state.deadLetterQueue ?? {},
       subscriptions: this.state.subscriptions ?? {},
+      routingState: this.state.routingState ?? {},
       deliveryStats: {
         ...defaults.deliveryStats,
         ...(this.state.deliveryStats ?? {}),
@@ -62,6 +65,7 @@ export class SwarmRegistry extends AgentBase<RegistryState> {
       agents: Object.keys(this.state.agents).length,
       queued: this.state.queueOrder.length,
     });
+    await this.scheduleMaintenanceAlarm();
   }
 
   protected getCapabilities(): string[] {
@@ -71,6 +75,8 @@ export class SwarmRegistry extends AgentBase<RegistryState> {
       "pubsub",
       "dispatch",
       "heartbeat_tracking",
+      "load_balancing",
+      "dead_letter_recovery",
     ];
   }
 
@@ -96,6 +102,10 @@ export class SwarmRegistry extends AgentBase<RegistryState> {
         );
       case "dispatch":
         return this.dispatchQueue(50);
+      case "requeue_dead_letter":
+        return this.requeueDeadLetter(50);
+      case "prune_stale_agents":
+        return this.pruneStaleAgents(HEARTBEAT_STALE_MS * 2);
       default:
         this.log("warn", `Unknown topic: ${message.topic}`);
         return { error: "Unknown topic" };
@@ -227,7 +237,42 @@ export class SwarmRegistry extends AgentBase<RegistryState> {
         queued: this.state.queueOrder.length,
         deadLettered: Object.keys(this.state.deadLetterQueue).length,
         stats: this.state.deliveryStats,
+        routingState: this.state.routingState,
+        staleAgents: this.countStaleAgents(),
       }), {
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+
+    if (path === "/routing/preview" && request.method === "GET") {
+      const type = url.searchParams.get("type");
+      if (!type) {
+        return new Response(JSON.stringify({ error: "type is required" }), {
+          status: 400,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      const count = Number.parseInt(url.searchParams.get("count") ?? "3", 10);
+      const preview = this.previewRouting(type as AgentType, Number.isFinite(count) ? count : 3);
+      return new Response(JSON.stringify(preview), {
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+
+    if (path === "/recovery/requeue-dead-letter" && request.method === "POST") {
+      const body = await request.json().catch(() => ({})) as { limit?: number };
+      const limit = Number.isFinite(body.limit) ? Math.max(1, Math.min(Number(body.limit), 500)) : 50;
+      const result = await this.requeueDeadLetter(limit);
+      return new Response(JSON.stringify(result), {
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+
+    if (path === "/recovery/prune-stale-agents" && request.method === "POST") {
+      const body = await request.json().catch(() => ({})) as { staleMs?: number };
+      const staleMs = Number.isFinite(body.staleMs) ? Math.max(60_000, Number(body.staleMs)) : HEARTBEAT_STALE_MS * 2;
+      const result = await this.pruneStaleAgents(staleMs);
+      return new Response(JSON.stringify(result), {
         headers: { "Content-Type": "application/json" },
       });
     }
@@ -255,6 +300,9 @@ export class SwarmRegistry extends AgentBase<RegistryState> {
       ...status,
       lastHeartbeat: Date.now(),
     };
+    if (this.state.routingState[status.type] === undefined) {
+      this.state.routingState[status.type] = 0;
+    }
     await this.saveState();
     this.log("info", `Registered agent: ${status.type} (${status.id})`);
   }
@@ -302,10 +350,12 @@ export class SwarmRegistry extends AgentBase<RegistryState> {
       throw new Error("Invalid message payload");
     }
 
+    const routedMessage = this.resolveMessageTarget(message);
+
     const queueId = createMessageId("queue");
     const queued: QueuedMessage = {
       queueId,
-      message,
+      message: routedMessage,
       enqueuedAt: Date.now(),
       availableAt: Date.now() + Math.max(0, delayMs),
       attempts: 0,
@@ -392,6 +442,8 @@ export class SwarmRegistry extends AgentBase<RegistryState> {
         continue;
       }
 
+      const resolvedMessage = this.resolveMessageTarget(queued.message, true);
+      queued.message = resolvedMessage;
       const targetStatus = this.state.agents[queued.message.target];
       if (!targetStatus) {
         this.bumpRetry(queued, "Target agent is not registered");
@@ -526,7 +578,150 @@ export class SwarmRegistry extends AgentBase<RegistryState> {
     }
   }
 
+  private resolveMessageTarget(message: AgentMessage, allowUnresolved = false): AgentMessage {
+    const agentType = this.parseTargetAgentType(message.target);
+    if (!agentType) {
+      return message;
+    }
+
+    const selectedAgentId = this.selectAgentForType(agentType);
+    if (!selectedAgentId) {
+      if (allowUnresolved) {
+        return message;
+      }
+      throw new Error(`No active agents available for type ${agentType}`);
+    }
+
+    return {
+      ...message,
+      target: selectedAgentId,
+      headers: {
+        ...(message.headers ?? {}),
+        "x-routed-type": agentType,
+      },
+    };
+  }
+
+  private parseTargetAgentType(target: string): AgentType | null {
+    if (target.startsWith("type:")) {
+      const candidate = target.slice("type:".length);
+      return this.isAgentType(candidate) ? candidate : null;
+    }
+    if (target.startsWith("role:")) {
+      const candidate = target.slice("role:".length);
+      return this.isAgentType(candidate) ? candidate : null;
+    }
+    return null;
+  }
+
+  private isAgentType(candidate: string): candidate is AgentType {
+    return (
+      candidate === "scout" ||
+      candidate === "analyst" ||
+      candidate === "trader" ||
+      candidate === "risk_manager" ||
+      candidate === "learning" ||
+      candidate === "registry"
+    );
+  }
+
+  private selectAgentForType(agentType: AgentType): string | null {
+    const candidates = Object.values(this.state.agents).filter((agent) => agent.type === agentType);
+    if (candidates.length === 0) {
+      return null;
+    }
+
+    const activeCandidates = candidates.filter((agent) => Date.now() - agent.lastHeartbeat <= HEARTBEAT_STALE_MS);
+    const pool = activeCandidates.length > 0 ? activeCandidates : candidates;
+    const cursor = this.state.routingState[agentType] ?? 0;
+    const index = cursor % pool.length;
+    const selected = pool[index];
+    if (!selected) return null;
+    this.state.routingState[agentType] = (cursor + 1) % pool.length;
+    return selected.id;
+  }
+
+  private previewRouting(agentType: AgentType, count: number): {
+    agentType: AgentType;
+    targets: string[];
+  } {
+    const safeCount = Math.max(1, Math.min(count, 20));
+    const targets: string[] = [];
+    const originalCursor = this.state.routingState[agentType] ?? 0;
+    for (let i = 0; i < safeCount; i += 1) {
+      const selected = this.selectAgentForType(agentType);
+      if (!selected) break;
+      targets.push(selected);
+    }
+    this.state.routingState[agentType] = originalCursor;
+    return { agentType, targets };
+  }
+
+  private countStaleAgents(): number {
+    const now = Date.now();
+    return Object.values(this.state.agents).filter((agent) => now - agent.lastHeartbeat > HEARTBEAT_STALE_MS).length;
+  }
+
+  private async requeueDeadLetter(limit: number): Promise<{ requeued: number; remaining: number }> {
+    const entries = Object.values(this.state.deadLetterQueue)
+      .sort((a, b) => a.enqueuedAt - b.enqueuedAt)
+      .slice(0, Math.max(1, Math.min(limit, 500)));
+
+    let requeued = 0;
+    for (const entry of entries) {
+      try {
+        await this.enqueueMessage(entry.message, 0, entry.maxAttempts);
+        delete this.state.deadLetterQueue[entry.queueId];
+        requeued += 1;
+      } catch {
+        // Keep in DLQ if still not routable
+      }
+    }
+    await this.saveState();
+    return {
+      requeued,
+      remaining: Object.keys(this.state.deadLetterQueue).length,
+    };
+  }
+
+  private async pruneStaleAgents(staleMs: number): Promise<{ removed: number; remaining: number }> {
+    const threshold = Date.now() - staleMs;
+    const staleAgentIds = Object.values(this.state.agents)
+      .filter((agent) => agent.lastHeartbeat < threshold)
+      .map((agent) => agent.id);
+
+    if (staleAgentIds.length === 0) {
+      return { removed: 0, remaining: Object.keys(this.state.agents).length };
+    }
+
+    const staleSet = new Set(staleAgentIds);
+    for (const agentId of staleAgentIds) {
+      delete this.state.agents[agentId];
+    }
+
+    for (const topic in this.state.subscriptions) {
+      const subscribers = this.state.subscriptions[topic];
+      if (!subscribers) continue;
+      this.state.subscriptions[topic] = subscribers.filter((id) => !staleSet.has(id));
+      if (this.state.subscriptions[topic].length === 0) {
+        delete this.state.subscriptions[topic];
+      }
+    }
+
+    await this.saveState();
+    return {
+      removed: staleAgentIds.length,
+      remaining: Object.keys(this.state.agents).length,
+    };
+  }
+
+  private async scheduleMaintenanceAlarm(): Promise<void> {
+    await this.ctx.storage.setAlarm(Date.now() + REGISTRY_MAINTENANCE_INTERVAL_MS);
+  }
+
   async alarm(): Promise<void> {
     await this.dispatchQueue(200);
+    await this.pruneStaleAgents(HEARTBEAT_STALE_MS * 3);
+    await this.scheduleMaintenanceAlarm();
   }
 }

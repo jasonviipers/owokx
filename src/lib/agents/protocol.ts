@@ -59,6 +59,7 @@ export interface SwarmState {
   deadLetterQueue: Record<string, QueuedMessage>;
   subscriptions: Record<string, string[]>;
   deliveryStats: DeliveryStats;
+  routingState: Partial<Record<AgentType, number>>;
 }
 
 export function createMessageId(prefix = "msg"): string {

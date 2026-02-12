@@ -9,6 +9,25 @@ import type { Env } from "../env.d";
 import type { AgentMessage, AgentType } from "../lib/agents/protocol";
 import { extractTickers, DEFAULT_TICKER_BLACKLIST } from "../lib/ticker";
 
+type SourceName = "stocktwits" | "reddit";
+
+interface SourceHealth {
+  failures: number;
+  circuitOpenUntil: number;
+  lastSuccessAt: number;
+  lastFailureAt: number;
+  lastError?: string;
+}
+
+interface PipelineMetrics {
+  cycles: number;
+  avgCycleMs: number;
+  lastCycleMs: number;
+  lastSuccessAt: number;
+  lastFailureAt: number;
+  consecutiveFailures: number;
+}
+
 interface DataScoutState extends AgentBaseState {
   signals: Record<string, {
     symbol: string;
@@ -18,28 +37,76 @@ interface DataScoutState extends AgentBaseState {
     volume: number;
   }>;
   lastGatherTime: number;
+  sourceHealth: Record<SourceName, SourceHealth>;
+  pipelineMetrics: PipelineMetrics;
 }
 
-const DEFAULT_STATE: Pick<DataScoutState, "signals" | "lastGatherTime"> = {
+function createDefaultSourceHealth(): Record<SourceName, SourceHealth> {
+  return {
+    stocktwits: {
+      failures: 0,
+      circuitOpenUntil: 0,
+      lastSuccessAt: 0,
+      lastFailureAt: 0,
+    },
+    reddit: {
+      failures: 0,
+      circuitOpenUntil: 0,
+      lastSuccessAt: 0,
+      lastFailureAt: 0,
+    },
+  };
+}
+
+function createDefaultPipelineMetrics(): PipelineMetrics {
+  return {
+    cycles: 0,
+    avgCycleMs: 0,
+    lastCycleMs: 0,
+    lastSuccessAt: 0,
+    lastFailureAt: 0,
+    consecutiveFailures: 0,
+  };
+}
+
+const DEFAULT_STATE: Pick<DataScoutState, "signals" | "lastGatherTime" | "sourceHealth" | "pipelineMetrics"> = {
   signals: {},
   lastGatherTime: 0,
+  sourceHealth: createDefaultSourceHealth(),
+  pipelineMetrics: createDefaultPipelineMetrics(),
 };
 
 export class DataScoutSimple extends AgentBase<DataScoutState> {
   protected agentType: AgentType = "scout";
   private readonly gatherIntervalMs = 300_000;
+  private readonly sourceTimeoutMs = 12_000;
+  private readonly staleSignalTtlMs = 3 * 60 * 60 * 1000;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.state = {
       ...this.state,
-      signals: this.state.signals ?? DEFAULT_STATE.signals,
+      signals: this.state.signals ?? {},
       lastGatherTime: this.state.lastGatherTime ?? DEFAULT_STATE.lastGatherTime,
+      sourceHealth: {
+        ...createDefaultSourceHealth(),
+        ...(this.state.sourceHealth ?? {}),
+      },
+      pipelineMetrics: {
+        ...createDefaultPipelineMetrics(),
+        ...(this.state.pipelineMetrics ?? {}),
+      },
     };
   }
 
   protected getCapabilities(): string[] {
-    return ["gather_signals", "get_signals", "publish_signals"];
+    return [
+      "gather_signals",
+      "get_signals",
+      "publish_signals",
+      "pipeline_optimized",
+      "source_circuit_breaker",
+    ];
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -57,6 +124,11 @@ export class DataScoutSimple extends AgentBase<DataScoutState> {
         return { success: true, signalCount: Object.keys(this.state.signals).length };
       case "get_signals":
         return { signals: Object.values(this.state.signals) };
+      case "get_pipeline_metrics":
+        return {
+          pipelineMetrics: this.state.pipelineMetrics,
+          sourceHealth: this.state.sourceHealth,
+        };
       default:
         return { error: `Unknown topic: ${message.topic}` };
     }
@@ -91,17 +163,7 @@ export class DataScoutSimple extends AgentBase<DataScoutState> {
   }
 
   private async handleGetSignals(): Promise<Response> {
-    // Clean up stale signals (older than 3 hours)
-    const now = Date.now();
-    const threeHoursAgo = now - 3 * 60 * 60 * 1000;
-    
-    for (const symbol in this.state.signals) {
-      const signal = this.state.signals[symbol];
-      if (signal && signal.timestamp < threeHoursAgo) {
-        delete this.state.signals[symbol];
-      }
-    }
-
+    this.cleanupStaleSignals();
     await this.saveState();
     
     return new Response(JSON.stringify({ 
@@ -112,16 +174,32 @@ export class DataScoutSimple extends AgentBase<DataScoutState> {
   }
 
   private async runGatherCycle(): Promise<void> {
-    await this.gatherStockTwits();
-    await this.gatherReddit();
+    const startedAt = Date.now();
 
-    this.state.lastGatherTime = Date.now();
+    const [stocktwitsResult, redditResult] = await Promise.all([
+      this.runSourceWithCircuitBreaker("stocktwits", () => this.gatherStockTwits()),
+      this.runSourceWithCircuitBreaker("reddit", () => this.gatherReddit()),
+    ]);
+
+    this.cleanupStaleSignals();
+
+    const cycleMs = Date.now() - startedAt;
+    const hadAnySuccess = stocktwitsResult.success || redditResult.success;
+    this.updatePipelineMetrics(cycleMs, hadAnySuccess);
+    if (hadAnySuccess) {
+      this.state.lastGatherTime = Date.now();
+    }
     await this.saveState();
 
     try {
       await this.publishEvent("signals_updated", {
         count: Object.keys(this.state.signals).length,
         timestamp: this.state.lastGatherTime,
+        processingMs: cycleMs,
+        sourceStats: {
+          stocktwits: stocktwitsResult,
+          reddit: redditResult,
+        },
       });
     } catch (error) {
       this.log("warn", "Unable to publish signals_updated event", { error: String(error) });
@@ -138,145 +216,252 @@ export class DataScoutSimple extends AgentBase<DataScoutState> {
       lastGatherTime: this.state.lastGatherTime,
       lastGatherAgeMs: lastGatherAge,
       signalCount: Object.keys(this.state.signals).length,
+      pipelineMetrics: this.state.pipelineMetrics,
+      sourceHealth: this.state.sourceHealth,
     }), {
       headers: { "Content-Type": "application/json" },
     });
   }
 
-  private async gatherStockTwits(): Promise<void> {
-    if (!this.env.STOCKTWITS_API_TOKEN) return;
+  private async gatherStockTwits(): Promise<number> {
+    if (!this.env.STOCKTWITS_API_TOKEN) return 0;
 
-    try {
-      const response = await fetch("https://api.stocktwits.com/api/2/streams/trending.json", {
+    const response = await this.fetchWithTimeout(
+      "https://api.stocktwits.com/api/2/streams/trending.json",
+      {
         headers: {
           Authorization: `Bearer ${this.env.STOCKTWITS_API_TOKEN}`,
         },
-      });
+      },
+      this.sourceTimeoutMs
+    );
 
-      if (!response.ok) return;
-
-      const data = await response.json() as any;
-      const messages = data.messages || [];
-
-      for (const msg of messages.slice(0, 20)) {
-        const text = msg.body || "";
-        const tickers = extractTickers(text);
-        
-        for (const ticker of tickers) {
-          if (DEFAULT_TICKER_BLACKLIST.has(ticker.toUpperCase())) continue;
-          
-          const sentiment = this.calculateSentiment(text);
-          if (Math.abs(sentiment) < 0.3) continue;
-          
-          const volume = msg.user?.followers || 1;
-          const now = Date.now();
-          
-          const existing = this.state.signals[ticker];
-          if (existing) {
-            // Update existing signal
-            const combinedSentiment = (existing.sentiment * existing.volume + sentiment * volume) / (existing.volume + volume);
-            const combinedSources = Array.from(new Set([...existing.sources, "stocktwits"]));
-            
-            this.state.signals[ticker] = {
-              symbol: ticker,
-              sentiment: combinedSentiment,
-              sources: combinedSources,
-              timestamp: now,
-              volume: existing.volume + volume,
-            };
-          } else {
-            // Create new signal
-            this.state.signals[ticker] = {
-              symbol: ticker,
-              sentiment,
-              sources: ["stocktwits"],
-              timestamp: now,
-              volume,
-            };
-          }
-        }
-      }
-    } catch (error) {
-      this.log("warn", "StockTwits gathering error", { error: String(error) });
+    if (!response.ok) {
+      throw new Error(`StockTwits request failed (${response.status})`);
     }
+
+    const data = await response.json() as { messages?: Array<{ body?: string; user?: { followers?: number } }> };
+    const messages = data.messages ?? [];
+    let processed = 0;
+
+    for (const msg of messages.slice(0, 20)) {
+      const text = msg.body || "";
+      const tickers = extractTickers(text);
+      const sentiment = this.calculateSentiment(text);
+      if (Math.abs(sentiment) < 0.3) continue;
+
+      for (const ticker of tickers) {
+        if (DEFAULT_TICKER_BLACKLIST.has(ticker.toUpperCase())) continue;
+        const volume = msg.user?.followers || 1;
+        this.upsertSignal(ticker, sentiment, "stocktwits", volume);
+        processed += 1;
+      }
+    }
+
+    return processed;
   }
 
-  private async gatherReddit(): Promise<void> {
-    if (!this.env.REDDIT_CLIENT_ID || !this.env.REDDIT_CLIENT_SECRET) return;
+  private async gatherReddit(): Promise<number> {
+    if (!this.env.REDDIT_CLIENT_ID || !this.env.REDDIT_CLIENT_SECRET) return 0;
 
-    try {
-      // Get Reddit access token
-      const authResponse = await fetch("https://www.reddit.com/api/v1/access_token", {
+    const authResponse = await this.fetchWithTimeout(
+      "https://www.reddit.com/api/v1/access_token",
+      {
         method: "POST",
         headers: {
           "Content-Type": "application/x-www-form-urlencoded",
           Authorization: `Basic ${btoa(`${this.env.REDDIT_CLIENT_ID}:${this.env.REDDIT_CLIENT_SECRET}`)}`,
         },
         body: "grant_type=client_credentials",
-      });
+      },
+      this.sourceTimeoutMs
+    );
 
-      if (!authResponse.ok) return;
+    if (!authResponse.ok) {
+      throw new Error(`Reddit auth failed (${authResponse.status})`);
+    }
 
-      const authData = await authResponse.json() as any;
-      const token = authData.access_token;
+    const authData = await authResponse.json() as { access_token?: string };
+    const token = authData.access_token;
+    if (!token) {
+      throw new Error("Reddit auth token missing");
+    }
 
-      // Fetch from WallStreetBets
-      const subredditResponse = await fetch("https://oauth.reddit.com/r/wallstreetbets/hot.json?limit=20", {
+    const subredditResponse = await this.fetchWithTimeout(
+      "https://oauth.reddit.com/r/wallstreetbets/hot.json?limit=20",
+      {
         headers: {
           Authorization: `Bearer ${token}`,
           "User-Agent": "okx-trading/1.0",
         },
-      });
+      },
+      this.sourceTimeoutMs
+    );
 
-      if (!subredditResponse.ok) return;
+    if (!subredditResponse.ok) {
+      throw new Error(`Reddit subreddit fetch failed (${subredditResponse.status})`);
+    }
 
-      const subredditData = await subredditResponse.json() as any;
-      const posts = subredditData.data?.children || [];
+    const subredditData = await subredditResponse.json() as {
+      data?: {
+        children?: Array<{
+          data?: {
+            title?: string;
+            selftext?: string;
+            score?: number;
+          };
+        }>;
+      };
+    };
+    const posts = subredditData.data?.children ?? [];
+    let processed = 0;
 
-      for (const post of posts) {
-        const data = post.data;
-        const title = data.title || "";
-        const selftext = data.selftext || "";
-        const text = `${title} ${selftext}`;
-        
-        const tickers = extractTickers(text);
-        
-        for (const ticker of tickers) {
-          if (DEFAULT_TICKER_BLACKLIST.has(ticker.toUpperCase())) continue;
-          
-          const sentiment = this.calculateSentiment(text);
-          if (Math.abs(sentiment) < 0.3) continue;
-          
-          const volume = data.score || 1;
-          const now = Date.now();
-          
-          const existing = this.state.signals[ticker];
-          if (existing) {
-            // Update existing signal
-            const combinedSentiment = (existing.sentiment * existing.volume + sentiment * volume) / (existing.volume + volume);
-            const combinedSources = Array.from(new Set([...existing.sources, "reddit"]));
-            
-            this.state.signals[ticker] = {
-              symbol: ticker,
-              sentiment: combinedSentiment,
-              sources: combinedSources,
-              timestamp: now,
-              volume: existing.volume + volume,
-            };
-          } else {
-            // Create new signal
-            this.state.signals[ticker] = {
-              symbol: ticker,
-              sentiment,
-              sources: ["reddit"],
-              timestamp: now,
-              volume,
-            };
-          }
-        }
+    for (const post of posts) {
+      const data = post.data;
+      const title = data?.title || "";
+      const selftext = data?.selftext || "";
+      const text = `${title} ${selftext}`;
+      const tickers = extractTickers(text);
+      const sentiment = this.calculateSentiment(text);
+      if (Math.abs(sentiment) < 0.3) continue;
+
+      for (const ticker of tickers) {
+        if (DEFAULT_TICKER_BLACKLIST.has(ticker.toUpperCase())) continue;
+        const volume = data?.score || 1;
+        this.upsertSignal(ticker, sentiment, "reddit", volume);
+        processed += 1;
       }
+    }
+
+    return processed;
+  }
+
+  private async runSourceWithCircuitBreaker(
+    source: SourceName,
+    runner: () => Promise<number>
+  ): Promise<{ source: SourceName; success: boolean; processed: number; skipped: boolean; error?: string }> {
+    const health = this.state.sourceHealth[source];
+    const now = Date.now();
+    if (health.circuitOpenUntil > now) {
+      return {
+        source,
+        success: false,
+        processed: 0,
+        skipped: true,
+        error: `circuit_open_until_${health.circuitOpenUntil}`,
+      };
+    }
+
+    try {
+      const processed = await runner();
+      this.state.sourceHealth[source] = {
+        ...health,
+        failures: 0,
+        circuitOpenUntil: 0,
+        lastSuccessAt: Date.now(),
+        lastError: undefined,
+      };
+      return {
+        source,
+        success: true,
+        processed: Number.isFinite(processed) ? processed : 0,
+        skipped: false,
+      };
     } catch (error) {
-      this.log("warn", "Reddit gathering error", { error: String(error) });
+      const failures = health.failures + 1;
+      const cooloffMs = Math.min(5 * 60 * 1000, 15_000 * 2 ** Math.max(0, failures - 1));
+      this.state.sourceHealth[source] = {
+        ...health,
+        failures,
+        circuitOpenUntil: Date.now() + cooloffMs,
+        lastFailureAt: Date.now(),
+        lastError: String(error),
+      };
+      this.log("warn", `${source} source failed`, {
+        error: String(error),
+        failures,
+        circuitOpenUntil: this.state.sourceHealth[source].circuitOpenUntil,
+      });
+      return {
+        source,
+        success: false,
+        processed: 0,
+        skipped: false,
+        error: String(error),
+      };
+    }
+  }
+
+  private upsertSignal(ticker: string, sentiment: number, source: SourceName, volume: number): void {
+    const normalized = ticker.toUpperCase();
+    const now = Date.now();
+    const existing = this.state.signals[normalized];
+    if (existing) {
+      const combinedSentiment = (existing.sentiment * existing.volume + sentiment * volume) / (existing.volume + volume);
+      const combinedSources = Array.from(new Set([...existing.sources, source]));
+      this.state.signals[normalized] = {
+        symbol: normalized,
+        sentiment: combinedSentiment,
+        sources: combinedSources,
+        timestamp: now,
+        volume: existing.volume + volume,
+      };
+      return;
+    }
+
+    this.state.signals[normalized] = {
+      symbol: normalized,
+      sentiment,
+      sources: [source],
+      timestamp: now,
+      volume,
+    };
+  }
+
+  private cleanupStaleSignals(): void {
+    const now = Date.now();
+    const threshold = now - this.staleSignalTtlMs;
+    for (const symbol in this.state.signals) {
+      const signal = this.state.signals[symbol];
+      if (signal && signal.timestamp < threshold) {
+        delete this.state.signals[symbol];
+      }
+    }
+  }
+
+  private updatePipelineMetrics(cycleMs: number, success: boolean): void {
+    const previous = this.state.pipelineMetrics;
+    const cycles = previous.cycles + 1;
+    const avgCycleMs = previous.avgCycleMs <= 0
+      ? cycleMs
+      : Math.round((previous.avgCycleMs * previous.cycles + cycleMs) / cycles);
+
+    this.state.pipelineMetrics = {
+      cycles,
+      avgCycleMs,
+      lastCycleMs: cycleMs,
+      lastSuccessAt: success ? Date.now() : previous.lastSuccessAt,
+      lastFailureAt: success ? previous.lastFailureAt : Date.now(),
+      consecutiveFailures: success ? 0 : previous.consecutiveFailures + 1,
+    };
+  }
+
+  private async fetchWithTimeout(
+    input: RequestInfo | URL,
+    init: RequestInit,
+    timeoutMs: number
+  ): Promise<Response> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<Response>((_, reject) => {
+      timer = setTimeout(() => {
+        reject(new Error(`Request timeout after ${timeoutMs}ms`));
+      }, timeoutMs);
+    });
+
+    try {
+      return await Promise.race([fetch(input, init), timeout]);
+    } finally {
+      if (timer) clearTimeout(timer);
     }
   }
 

@@ -240,4 +240,126 @@ describe("SwarmRegistry", () => {
     expect(queueState.deadLettered).toBe(1);
     expect(queueState.queued).toBe(0);
   });
+
+  it("load balances type-routed targets across active agents", async () => {
+    const { ctx, waitForInit } = createContext("registry-test-4");
+    const registry = new SwarmRegistry(ctx, createRegistryEnv());
+    await waitForInit();
+
+    await doFetch(registry, "http://registry/register", {
+      method: "POST",
+      body: JSON.stringify({
+        id: "analyst-1",
+        type: "analyst",
+        status: "active",
+        lastHeartbeat: Date.now(),
+        capabilities: [],
+      }),
+    });
+    await doFetch(registry, "http://registry/register", {
+      method: "POST",
+      body: JSON.stringify({
+        id: "analyst-2",
+        type: "analyst",
+        status: "active",
+        lastHeartbeat: Date.now(),
+        capabilities: [],
+      }),
+    });
+
+    await doFetch(registry, "http://registry/queue/enqueue", {
+      method: "POST",
+      body: JSON.stringify({
+        message: {
+          id: "lb-msg-1",
+          source: "system",
+          target: "type:analyst",
+          type: "COMMAND",
+          topic: "analyze_signals",
+          payload: { signals: [] },
+          timestamp: Date.now(),
+        },
+      }),
+    });
+
+    await doFetch(registry, "http://registry/queue/enqueue", {
+      method: "POST",
+      body: JSON.stringify({
+        message: {
+          id: "lb-msg-2",
+          source: "system",
+          target: "type:analyst",
+          type: "COMMAND",
+          topic: "analyze_signals",
+          payload: { signals: [] },
+          timestamp: Date.now(),
+        },
+      }),
+    });
+
+    const poll1 = await doFetch(registry, "http://registry/queue/poll?agentId=analyst-1&limit=10", { method: "GET" });
+    const poll2 = await doFetch(registry, "http://registry/queue/poll?agentId=analyst-2&limit=10", { method: "GET" });
+    const data1 = await poll1.json() as { messages: Array<{ id: string }> };
+    const data2 = await poll2.json() as { messages: Array<{ id: string }> };
+
+    expect(data1.messages).toHaveLength(1);
+    expect(data2.messages).toHaveLength(1);
+    expect(data1.messages[0]?.id).toBe("lb-msg-1");
+    expect(data2.messages[0]?.id).toBe("lb-msg-2");
+  });
+
+  it("can recover dead-letter messages by requeueing after agent registration", async () => {
+    const { ctx, waitForInit } = createContext("registry-test-5");
+    const registry = new SwarmRegistry(ctx, createRegistryEnv());
+    await waitForInit();
+
+    await doFetch(registry, "http://registry/queue/enqueue", {
+      method: "POST",
+      body: JSON.stringify({
+        message: {
+          id: "dlq-msg-1",
+          source: "system",
+          target: "analyst-recovery",
+          type: "COMMAND",
+          topic: "analyze_signals",
+          payload: { signals: [] },
+          timestamp: Date.now(),
+        },
+        maxAttempts: 1,
+      }),
+    });
+
+    await doFetch(registry, "http://registry/queue/dispatch", {
+      method: "POST",
+      body: JSON.stringify({ limit: 10 }),
+    });
+
+    await doFetch(registry, "http://registry/register", {
+      method: "POST",
+      body: JSON.stringify({
+        id: "analyst-recovery",
+        type: "analyst",
+        status: "active",
+        lastHeartbeat: Date.now(),
+        capabilities: [],
+      }),
+    });
+
+    const requeueRes = await doFetch(registry, "http://registry/recovery/requeue-dead-letter", {
+      method: "POST",
+      body: JSON.stringify({ limit: 10 }),
+    });
+    const requeueData = await requeueRes.json() as { requeued: number; remaining: number };
+    expect(requeueData.requeued).toBe(1);
+    expect(requeueData.remaining).toBe(0);
+
+    const poll = await doFetch(
+      registry,
+      "http://registry/queue/poll?agentId=analyst-recovery&limit=10",
+      { method: "GET" }
+    );
+    const pollData = await poll.json() as { messages: Array<{ id: string }> };
+    expect(pollData.messages).toHaveLength(1);
+    expect(pollData.messages[0]?.id).toBe("dlq-msg-1");
+  });
 });
