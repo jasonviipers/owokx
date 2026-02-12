@@ -7,11 +7,14 @@ export interface OkxSymbolInfo {
 
 export function normalizeOkxSymbol(symbol: string, defaultQuote: string): OkxSymbolInfo {
   const upper = symbol.trim().toUpperCase();
+  const normalizedDefaultQuote = defaultQuote.trim().toUpperCase();
+  const resolveQuote = (quote: string): string => (quote === "USD" ? normalizedDefaultQuote : quote);
 
   if (upper.includes("-")) {
-    const [base, quote] = upper.split("-", 2) as [string, string];
+    const [base, rawQuote] = upper.split("-", 2) as [string, string];
+    const quote = resolveQuote(rawQuote);
     return {
-      instId: upper,
+      instId: `${base}-${quote}`,
       normalizedSymbol: `${base}/${quote}`,
       base,
       quote,
@@ -20,7 +23,7 @@ export function normalizeOkxSymbol(symbol: string, defaultQuote: string): OkxSym
 
   if (upper.includes("/")) {
     const [base, rawQuote] = upper.split("/", 2) as [string, string];
-    const quote = rawQuote; // Keep the specified quote currency instead of converting USD
+    const quote = resolveQuote(rawQuote);
     return {
       instId: `${base}-${quote}`,
       normalizedSymbol: `${base}/${quote}`,
@@ -32,7 +35,7 @@ export function normalizeOkxSymbol(symbol: string, defaultQuote: string): OkxSym
   const match = upper.match(/^([A-Z0-9]{2,10})(USD|USDT|USDC)$/);
   if (match) {
     const base = match[1]!;
-    const quote = match[2]!; // Keep the matched quote currency instead of converting USD
+    const quote = resolveQuote(match[2]!);
     return {
       instId: `${base}-${quote}`,
       normalizedSymbol: `${base}/${quote}`,
@@ -44,10 +47,10 @@ export function normalizeOkxSymbol(symbol: string, defaultQuote: string): OkxSym
   // Fallback: If it looks like a single currency (e.g. BTC, ETH), append default quote
   if (/^[A-Z0-9]{2,10}$/.test(upper)) {
     return {
-      instId: `${upper}-${defaultQuote}`,
-      normalizedSymbol: `${upper}/${defaultQuote}`,
+      instId: `${upper}-${normalizedDefaultQuote}`,
+      normalizedSymbol: `${upper}/${normalizedDefaultQuote}`,
       base: upper,
-      quote: defaultQuote,
+      quote: normalizedDefaultQuote,
     };
   }
 

@@ -1,5 +1,6 @@
+import { RestClient } from "okx-api";
 import { createError, ErrorCode } from "../../lib/errors";
-import { nowISO, sanitizeForLog, sleep } from "../../lib/utils";
+import { sanitizeForLog, sleep } from "../../lib/utils";
 
 type LogLevel = "debug" | "info" | "warn" | "error";
 
@@ -24,28 +25,10 @@ export interface OkxApiResponse<T> {
   data: T[];
 }
 
-function base64Encode(bytes: Uint8Array): string {
-  if (typeof btoa === "function") {
-    let bin = "";
-    for (const b of bytes) bin += String.fromCharCode(b);
-    return btoa(bin);
-  }
-  const maybeBuffer = (
-    globalThis as unknown as { Buffer?: { from?: (b: Uint8Array) => { toString: (enc: string) => string } } }
-  ).Buffer;
-  const buf = maybeBuffer?.from?.(bytes);
-  if (buf) return buf.toString("base64");
-  throw createError(ErrorCode.INTERNAL_ERROR, "No base64 encoder available in this runtime");
-}
-
-async function hmacSha256Base64(message: string, secret: string): Promise<string> {
-  const encoder = new TextEncoder();
-  const keyData = encoder.encode(secret);
-  const msgData = encoder.encode(message);
-
-  const key = await crypto.subtle.importKey("raw", keyData, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
-  const signature = await crypto.subtle.sign("HMAC", key, msgData);
-  return base64Encode(new Uint8Array(signature));
+interface ParsedOkxError {
+  code: string;
+  message: string;
+  httpStatus: number;
 }
 
 function toQueryString(params: Record<string, unknown> | undefined): string {
@@ -77,21 +60,75 @@ function mapOkxError(code: string, httpStatus: number): ErrorCode {
   return ErrorCode.PROVIDER_ERROR;
 }
 
+function parseOkxError(error: unknown): ParsedOkxError {
+  const source = error as
+    | {
+        code?: unknown;
+        msg?: unknown;
+        message?: unknown;
+        status?: unknown;
+        response?: {
+          status?: unknown;
+          data?: {
+            code?: unknown;
+            msg?: unknown;
+            message?: unknown;
+          };
+        };
+      }
+    | undefined;
+
+  const responseStatus = source?.response?.status;
+  const status =
+    typeof source?.status === "number"
+      ? source.status
+      : typeof responseStatus === "number"
+        ? responseStatus
+        : 0;
+
+  const responseData = source?.response?.data;
+  const codeCandidate = responseData?.code ?? source?.code;
+  const msgCandidate = responseData?.msg ?? responseData?.message ?? source?.msg ?? source?.message;
+
+  const code = typeof codeCandidate === "string" && codeCandidate.length > 0 ? codeCandidate : "HTTP_ERROR";
+  const message = typeof msgCandidate === "string" && msgCandidate.length > 0 ? msgCandidate : String(error);
+
+  return {
+    code,
+    message,
+    httpStatus: status,
+  };
+}
+
+function normalizeData<T>(payload: unknown): T[] {
+  if (Array.isArray(payload)) {
+    return payload as T[];
+  }
+  if (payload === undefined || payload === null) {
+    return [];
+  }
+  return [payload as T];
+}
+
 export class OkxClient {
-  private baseUrl: string;
-  private simulatedTrading: boolean;
   private maxRequestsPerSecond: number;
   private maxRetries: number;
   private logger?: OkxLogger;
-
   private lastRequestAt = 0;
+  private readonly restClient: RestClient;
 
-  constructor(private config: OkxClientConfig) {
-    this.baseUrl = (config.baseUrl ?? "https://eea.okx.com").replace(/\/+$/, "");
-    this.simulatedTrading = config.simulatedTrading === true;
+  constructor(config: OkxClientConfig) {
     this.maxRequestsPerSecond = Math.max(1, config.maxRequestsPerSecond ?? 5);
     this.maxRetries = Math.max(0, config.maxRetries ?? 2);
     this.logger = config.logger;
+
+    this.restClient = new RestClient({
+      apiKey: config.apiKey,
+      apiSecret: config.secret,
+      apiPass: config.passphrase,
+      baseUrl: (config.baseUrl ?? "https://eea.okx.com").replace(/\/+$/, ""),
+      demoTrading: config.simulatedTrading === true,
+    });
   }
 
   async request<T>(
@@ -101,120 +138,117 @@ export class OkxClient {
     body?: unknown,
     options?: { auth?: boolean }
   ): Promise<OkxApiResponse<T>> {
-    const queryString = toQueryString(params);
-    const requestPath = `${path}${queryString}`;
-    const url = `${this.baseUrl}${requestPath}`;
+    const wantsAuth = options?.auth !== false;
 
-    const bodyForRequest = body !== undefined ? JSON.stringify(body) : "";
-    const bodyForSignature = method === "GET" || method === "DELETE" ? "" : bodyForRequest;
-
-    for (let attempt = 1; attempt <= this.maxRetries + 1; attempt++) {
+    for (let attempt = 1; attempt <= this.maxRetries + 1; attempt += 1) {
       const minIntervalMs = Math.ceil(1000 / this.maxRequestsPerSecond);
       const now = Date.now();
       const waitMs = Math.max(0, this.lastRequestAt + minIntervalMs - now);
       if (waitMs > 0) await sleep(waitMs);
 
-      const headers: Record<string, string> = { "Content-Type": "application/json" };
+      const startedAt = Date.now();
 
-      const wantsAuth = options?.auth !== false;
-      if (wantsAuth) {
-        const timestamp = nowISO();
-        const signPayload = `${timestamp}${method}${requestPath}${bodyForSignature}`;
-        const signature = await hmacSha256Base64(signPayload, this.config.secret);
+      try {
+        const rawData = await this.executeRequest(method, path, params, body, wantsAuth);
+        this.lastRequestAt = Date.now();
 
-        headers["OK-ACCESS-KEY"] = this.config.apiKey;
-        headers["OK-ACCESS-SIGN"] = signature;
-        headers["OK-ACCESS-TIMESTAMP"] = timestamp;
-        headers["OK-ACCESS-PASSPHRASE"] = this.config.passphrase;
-      }
+        this.logger?.log("info", "okx_request", {
+          method,
+          path,
+          okx_code: "0",
+          latency_ms: this.lastRequestAt - startedAt,
+          attempt,
+        });
 
-      if (this.simulatedTrading) {
-        headers["x-simulated-trading"] = "1";
-      }
+        return {
+          code: "0",
+          msg: "",
+          data: normalizeData<T>(rawData),
+        };
+      } catch (error) {
+        this.lastRequestAt = Date.now();
 
-      const start = Date.now();
-      const res = await fetch(url, {
-        method,
-        headers,
-        body: bodyForRequest || undefined,
-      });
-      this.lastRequestAt = Date.now();
+        const parsedError = parseOkxError(error);
+        const shouldRetry =
+          parsedError.httpStatus === 429 ||
+          (parsedError.httpStatus >= 500 && parsedError.httpStatus <= 599) ||
+          parsedError.code === "50011" ||
+          parsedError.code === "50013";
 
-      const latencyMs = this.lastRequestAt - start;
+        this.logger?.log(shouldRetry ? "warn" : "error", "okx_request", {
+          method,
+          path,
+          okx_code: parsedError.code,
+          status: parsedError.httpStatus || undefined,
+          latency_ms: this.lastRequestAt - startedAt,
+          attempt,
+        });
 
-      const retryAfterHeader = res.headers.get("retry-after");
-      const retryAfterMs = retryAfterHeader ? Math.max(0, Number(retryAfterHeader) * 1000) : 0;
-
-      const text = await res.text();
-      const isJson = text.trim().startsWith("{");
-
-      let parsed: OkxApiResponse<T> | null = null;
-      if (isJson) {
-        try {
-          parsed = JSON.parse(text) as OkxApiResponse<T>;
-        } catch {
-          parsed = null;
+        if (shouldRetry && attempt <= this.maxRetries) {
+          const backoffMs = Math.min(5000, 200 * 2 ** (attempt - 1));
+          this.logger?.log("warn", "okx_retry", {
+            method,
+            path,
+            okx_code: parsedError.code,
+            status: parsedError.httpStatus || undefined,
+            backoff_ms: backoffMs,
+            attempt,
+          });
+          await sleep(backoffMs);
+          continue;
         }
+
+        const mapped = mapOkxError(parsedError.code, parsedError.httpStatus);
+        throw createError(
+          mapped,
+          `OKX API error (${parsedError.code}${parsedError.httpStatus ? `, HTTP ${parsedError.httpStatus}` : ""}): ${parsedError.message}`,
+          {
+            method,
+            path,
+            params: sanitizeForLog(params),
+            body: sanitizeForLog(body),
+          }
+        );
       }
-
-      const okxCode = parsed?.code ?? (res.ok ? "0" : "HTTP_ERROR");
-      const okxMsg = parsed?.msg ?? text;
-
-      const level: "info" | "warn" | "error" =
-        !res.ok || okxCode !== "0"
-          ? res.status === 429 || (res.status >= 500 && res.status <= 599) || okxCode === "51001"
-            ? "warn"
-            : "error"
-          : "info";
-
-      this.logger?.log(level, "okx_request", {
-        method,
-        path,
-        status: res.status,
-        okx_code: okxCode,
-        latency_ms: latencyMs,
-        attempt,
-      });
-
-      const shouldRetry = res.status === 429 || (res.status >= 500 && res.status <= 599);
-      if ((shouldRetry || okxCode === "50011" || okxCode === "50013") && attempt <= this.maxRetries) {
-        const backoffMs = retryAfterMs || Math.min(5000, 200 * 2 ** (attempt - 1));
-        this.logger?.log("warn", "okx_retry", {
-          method,
-          path,
-          status: res.status,
-          okx_code: okxCode,
-          backoff_ms: backoffMs,
-        });
-        await sleep(backoffMs);
-        continue;
-      }
-
-      if (!res.ok || (parsed && parsed.code !== "0")) {
-        const code = parsed?.code ?? "HTTP_ERROR";
-        const message = parsed?.msg ?? okxMsg;
-        const mapped = mapOkxError(code, res.status);
-        throw createError(mapped, `OKX API error (${code}, HTTP ${res.status}): ${message}`, {
-          method,
-          path,
-          params: sanitizeForLog(params),
-          body: sanitizeForLog(body),
-        });
-      }
-
-      if (!parsed) {
-        throw createError(ErrorCode.PROVIDER_ERROR, "OKX API returned non-JSON response", {
-          method,
-          path,
-          status: res.status,
-          body: text.slice(0, 500),
-        });
-      }
-
-      return parsed;
     }
 
     throw createError(ErrorCode.PROVIDER_ERROR, "OKX request failed after retries", { method, path });
+  }
+
+  private async executeRequest(
+    method: "GET" | "POST" | "DELETE",
+    path: string,
+    params: Record<string, unknown> | undefined,
+    body: unknown,
+    wantsAuth: boolean
+  ): Promise<unknown> {
+    if (method === "GET") {
+      return wantsAuth
+        ? this.restClient.getPrivate(path, params)
+        : this.restClient.get(path, params);
+    }
+
+    if (method === "POST") {
+      const payload = body ?? {};
+      if (params && Object.keys(params).length > 0) {
+        const endpoint = `${path}${toQueryString(params)}`;
+        return wantsAuth
+          ? this.restClient.postPrivate(endpoint, payload)
+          : this.restClient.post(endpoint, payload);
+      }
+      return wantsAuth
+        ? this.restClient.postPrivate(path, payload)
+        : this.restClient.post(path, payload);
+    }
+
+    if (method === "DELETE") {
+      if (!wantsAuth) {
+        throw createError(ErrorCode.NOT_SUPPORTED, "Public DELETE requests are not supported by OKX adapter");
+      }
+      return this.restClient.deletePrivate(path, body ?? params ?? {});
+    }
+
+    throw createError(ErrorCode.INVALID_INPUT, `Unsupported method: ${method}`);
   }
 }
 

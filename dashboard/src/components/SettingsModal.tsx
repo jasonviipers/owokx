@@ -13,6 +13,8 @@ export function SettingsModal({ config, onSave, onClose, onReset }: SettingsModa
   const [localConfig, setLocalConfig] = useState<Config>(config)
   const [saving, setSaving] = useState(false)
   const [resetting, setResetting] = useState(false)
+  const [showResetConfirm, setShowResetConfirm] = useState(false)
+  const [resetError, setResetError] = useState<string | null>(null)
   const [apiToken, setApiToken] = useState(localStorage.getItem('OWOKX_API_TOKEN') || '')
 
   // Note: We intentionally do NOT sync localConfig with the config prop after initial mount.
@@ -56,17 +58,23 @@ export function SettingsModal({ config, onSave, onClose, onReset }: SettingsModa
     }
   }
 
-  const handleReset = async () => {
+  const handleResetRequest = () => {
+    setResetError(null)
+    setShowResetConfirm(true)
+  }
+
+  const handleResetConfirm = async () => {
     if (!onReset) return
-    if (!confirm("Are you sure you want to reset the agent? This will clear all history, logs, and restore default configuration. This action cannot be undone.")) return
-    
+
     setResetting(true)
+    setResetError(null)
     try {
       await onReset()
+      setShowResetConfirm(false)
       onClose()
     } catch (error) {
       console.error('Failed to reset agent:', error)
-      alert('Failed to reset agent. Check console for details.')
+      setResetError('Failed to reset agent. Please try again.')
     } finally {
       setResetting(false)
     }
@@ -644,7 +652,7 @@ export function SettingsModal({ config, onSave, onClose, onReset }: SettingsModa
                 </div>
                 <button
                   className="px-3 py-1.5 bg-hud-error/20 hover:bg-hud-error/40 text-hud-error border border-hud-error/50 rounded text-xs transition-colors"
-                  onClick={handleReset}
+                  onClick={handleResetRequest}
                   disabled={resetting}
                 >
                   {resetting ? 'Resetting...' : 'Reset Everything'}
@@ -668,6 +676,48 @@ export function SettingsModal({ config, onSave, onClose, onReset }: SettingsModa
           </div>
         </div>
       </Panel>
+
+      {showResetConfirm && (
+        <div
+          className="fixed inset-0 z-[60] bg-black/70 flex items-center justify-center p-4"
+          onClick={(e) => {
+            e.stopPropagation()
+            if (!resetting) setShowResetConfirm(false)
+          }}
+        >
+          <Panel title="CONFIRM RESET" className="w-full max-w-md" titleRight={null}>
+            <div onClick={(e) => e.stopPropagation()} className="space-y-4">
+              <p className="text-sm text-hud-text">
+                Are you sure you want to reset the agent? This will clear all history, logs, and restore default configuration.
+              </p>
+              <p className="text-xs text-hud-error font-medium">
+                This action cannot be undone.
+              </p>
+              {resetError && (
+                <div className="text-xs text-hud-error border border-hud-error/40 bg-hud-error/10 rounded p-2">
+                  {resetError}
+                </div>
+              )}
+              <div className="flex justify-end gap-3 pt-2">
+                <button
+                  className="hud-button"
+                  onClick={() => setShowResetConfirm(false)}
+                  disabled={resetting}
+                >
+                  Cancel
+                </button>
+                <button
+                  className="px-3 py-1.5 bg-hud-error/20 hover:bg-hud-error/40 text-hud-error border border-hud-error/50 rounded text-xs transition-colors disabled:opacity-50"
+                  onClick={handleResetConfirm}
+                  disabled={resetting}
+                >
+                  {resetting ? 'Resetting...' : 'Confirm Reset'}
+                </button>
+              </div>
+            </div>
+          </Panel>
+        </div>
+      )}
     </div>
   )
 }

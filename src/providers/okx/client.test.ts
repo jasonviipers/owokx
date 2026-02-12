@@ -1,27 +1,48 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ErrorCode } from "../../lib/errors";
+
+const {
+  restClientCtorMock,
+  getPrivateMock,
+  getPublicMock,
+  postPrivateMock,
+  postPublicMock,
+  deletePrivateMock,
+} = vi.hoisted(() => ({
+  restClientCtorMock: vi.fn(),
+  getPrivateMock: vi.fn(),
+  getPublicMock: vi.fn(),
+  postPrivateMock: vi.fn(),
+  postPublicMock: vi.fn(),
+  deletePrivateMock: vi.fn(),
+}));
+
+vi.mock("okx-api", () => ({
+  RestClient: vi.fn().mockImplementation((options: unknown) => {
+    restClientCtorMock(options);
+    return {
+      getPrivate: getPrivateMock,
+      get: getPublicMock,
+      postPrivate: postPrivateMock,
+      post: postPublicMock,
+      deletePrivate: deletePrivateMock,
+    };
+  }),
+}));
+
 import { createOkxClient } from "./client";
 
 describe("OKX Client", () => {
-  const mockFetch = vi.fn();
-  const originalFetch = global.fetch;
-
   beforeEach(() => {
     vi.clearAllMocks();
-    global.fetch = mockFetch;
   });
 
   afterEach(() => {
-    global.fetch = originalFetch;
+    vi.clearAllMocks();
   });
 
-  it("sends required auth headers", async () => {
-    mockFetch.mockResolvedValueOnce({
-      ok: true,
-      status: 200,
-      headers: new Headers(),
-      text: async () => JSON.stringify({ code: "0", msg: "", data: [] }),
-    });
+  it("initializes official okx-api RestClient with auth config", async () => {
+    getPrivateMock.mockResolvedValueOnce([]);
 
     const client = createOkxClient({
       apiKey: "test-key",
@@ -32,26 +53,20 @@ describe("OKX Client", () => {
 
     await client.request("GET", "/api/v5/account/balance");
 
-    const call = mockFetch.mock.calls[0] as [string, RequestInit];
-    expect(call[0]).toContain("https://eea.okx.com/api/v5/account/balance");
-    expect(call[1].headers).toMatchObject({
-      "OK-ACCESS-KEY": "test-key",
-      "OK-ACCESS-PASSPHRASE": "test-pass",
-      "Content-Type": "application/json",
-    });
-
-    const headers = call[1].headers as Record<string, string>;
-    expect(headers["OK-ACCESS-SIGN"]).toBeTruthy();
-    expect(headers["OK-ACCESS-TIMESTAMP"]).toBeTruthy();
+    expect(restClientCtorMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        apiKey: "test-key",
+        apiSecret: "test-secret",
+        apiPass: "test-pass",
+        baseUrl: "https://eea.okx.com",
+        demoTrading: false,
+      })
+    );
+    expect(getPrivateMock).toHaveBeenCalledWith("/api/v5/account/balance", undefined);
   });
 
-  it("sends simulated trading header when enabled", async () => {
-    mockFetch.mockResolvedValueOnce({
-      ok: true,
-      status: 200,
-      headers: new Headers(),
-      text: async () => JSON.stringify({ code: "0", msg: "", data: [] }),
-    });
+  it("enables demo trading mode when simulatedTrading is true", async () => {
+    getPrivateMock.mockResolvedValueOnce([]);
 
     const client = createOkxClient({
       apiKey: "test-key",
@@ -63,19 +78,15 @@ describe("OKX Client", () => {
 
     await client.request("GET", "/api/v5/account/balance");
 
-    const call = mockFetch.mock.calls[0] as [string, RequestInit];
-    expect(call[1].headers).toMatchObject({
-      "x-simulated-trading": "1",
-    });
+    expect(restClientCtorMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        demoTrading: true,
+      })
+    );
   });
 
-  it("maps OKX business errors even when HTTP 200", async () => {
-    mockFetch.mockResolvedValueOnce({
-      ok: true,
-      status: 200,
-      headers: new Headers(),
-      text: async () => JSON.stringify({ code: "51008", msg: "Insufficient balance", data: [] }),
-    });
+  it("maps OKX business errors from SDK responses", async () => {
+    postPrivateMock.mockRejectedValueOnce({ code: "51008", msg: "Insufficient balance", data: [] });
 
     const client = createOkxClient({
       apiKey: "test-key",
@@ -90,12 +101,12 @@ describe("OKX Client", () => {
     });
   });
 
-  it("maps HTTP 429 to RATE_LIMITED", async () => {
-    mockFetch.mockResolvedValueOnce({
-      ok: false,
-      status: 429,
-      headers: new Headers(),
-      text: async () => JSON.stringify({ code: "50011", msg: "Too many requests", data: [] }),
+  it("maps HTTP 429-style responses to RATE_LIMITED", async () => {
+    getPrivateMock.mockRejectedValueOnce({
+      response: {
+        status: 429,
+        data: { code: "50011", msg: "Too many requests", data: [] },
+      },
     });
 
     const client = createOkxClient({
@@ -110,13 +121,8 @@ describe("OKX Client", () => {
     });
   });
 
-  it("does not send auth headers when auth is disabled", async () => {
-    mockFetch.mockResolvedValueOnce({
-      ok: true,
-      status: 200,
-      headers: new Headers(),
-      text: async () => JSON.stringify({ code: "0", msg: "", data: [] }),
-    });
+  it("uses public SDK methods when auth is disabled", async () => {
+    getPublicMock.mockResolvedValueOnce([{ instId: "BTC-USDT" }]);
 
     const client = createOkxClient({
       apiKey: "test-key",
@@ -127,11 +133,7 @@ describe("OKX Client", () => {
 
     await client.request("GET", "/api/v5/market/ticker", { instId: "BTC-USDT" }, undefined, { auth: false });
 
-    const call = mockFetch.mock.calls[0] as [string, RequestInit];
-    const headers = call[1].headers as Record<string, string>;
-    expect(headers["OK-ACCESS-KEY"]).toBeUndefined();
-    expect(headers["OK-ACCESS-SIGN"]).toBeUndefined();
-    expect(headers["OK-ACCESS-TIMESTAMP"]).toBeUndefined();
-    expect(headers["OK-ACCESS-PASSPHRASE"]).toBeUndefined();
+    expect(getPublicMock).toHaveBeenCalledWith("/api/v5/market/ticker", { instId: "BTC-USDT" });
+    expect(getPrivateMock).not.toHaveBeenCalled();
   });
 });
