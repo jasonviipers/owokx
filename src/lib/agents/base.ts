@@ -12,6 +12,7 @@ export interface AgentBaseState {
 export abstract class AgentBase<TState extends AgentBaseState = AgentBaseState> extends DurableObject<Env> {
   protected state: TState;
   protected abstract agentType: AgentType;
+  private readonly heartbeatIntervalMs = 60_000;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -27,6 +28,7 @@ export abstract class AgentBase<TState extends AgentBaseState = AgentBaseState> 
         this.state = { ...this.state, ...stored };
       }
       await this.onStart();
+      await this.scheduleHeartbeat();
     });
   }
 
@@ -110,5 +112,44 @@ export abstract class AgentBase<TState extends AgentBaseState = AgentBaseState> 
 
   protected getCapabilities(): string[] {
       return [];
+  }
+
+  // Heartbeat scheduler to keep registry health green
+  async alarm(): Promise<void> {
+    await this.sendHeartbeat();
+    await this.scheduleHeartbeat();
+  }
+
+  private async scheduleHeartbeat(): Promise<void> {
+    if (this.agentType === "registry") return; // Registry doesn't heartbeat itself
+    if (!this.env.SWARM_REGISTRY) return;
+    const next = Date.now() + this.heartbeatIntervalMs;
+    await this.ctx.storage.setAlarm(next);
+  }
+
+  private async sendHeartbeat(): Promise<void> {
+    if (this.agentType === "registry") return;
+    if (!this.env.SWARM_REGISTRY) return;
+
+    try {
+      const registryId = this.env.SWARM_REGISTRY.idFromName("default");
+      const registry = this.env.SWARM_REGISTRY.get(registryId);
+      const message: AgentMessage = {
+        id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+        source: this.ctx.id.toString(),
+        target: "registry",
+        type: "EVENT",
+        topic: "heartbeat",
+        payload: null,
+        timestamp: Date.now(),
+      };
+
+      await registry.fetch("http://registry/message", {
+        method: "POST",
+        body: JSON.stringify(message),
+      });
+    } catch (err) {
+      this.log("warn", "Heartbeat failed", { error: String(err) });
+    }
   }
 }

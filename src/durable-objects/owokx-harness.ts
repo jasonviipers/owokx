@@ -1339,7 +1339,7 @@ export class OwokxHarness extends DurableObject<Env> {
       }
     }
 
-    let swarm: any = undefined;
+    let swarm: any;
     if (this.env.SWARM_REGISTRY) {
       try {
         const id = this.env.SWARM_REGISTRY.idFromName("main");
@@ -1353,7 +1353,7 @@ export class OwokxHarness extends DurableObject<Env> {
           const agents = (await agentsRes.json()) as Record<string, any>;
           swarm = { ...health, agents };
         }
-      } catch (e) {
+      } catch (_e) {
         // ignore
       }
     }

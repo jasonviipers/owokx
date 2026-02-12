@@ -69,12 +69,23 @@ export function createLLMProvider(env: Env): LLMProvider | null {
     }
     default:
       // Backward compatible: use existing OpenAI provider
+      if (model.includes("/")) {
+        const [modelProvider, modelName] = model.split("/", 2);
+        if (modelProvider && modelProvider.toLowerCase() !== "openai") {
+          console.warn(
+            `LLM_MODEL='${model}' is not compatible with LLM_PROVIDER=openai-raw. Use LLM_PROVIDER=ai-sdk or cloudflare-gateway instead.`
+          );
+          return null;
+        }
+        // Normalize to bare OpenAI model name
+        env = { ...env, LLM_MODEL: modelName };
+      }
       if (!env.OPENAI_API_KEY) {
         return null;
       }
       return createOpenAIProvider({
         apiKey: env.OPENAI_API_KEY,
-        model: model.includes("/") ? model.split("/")[1] : model,
+        model: env.LLM_MODEL ?? model,
         baseUrl: openaiBaseUrl,
       });
   }

@@ -720,7 +720,15 @@ export default function App() {
             <Panel title="ACTIVE SIGNALS" titleRight={signals.length.toString()} className="h-80">
               <div className="overflow-y-auto h-full space-y-1">
                 {signals.length === 0 ? (
-                  <div className="text-hud-text-dim text-sm py-4 text-center">Gathering signals...</div>
+                  <div className="text-hud-text-dim text-sm py-4 text-center">
+                    {!status?.enabled ? (
+                      <span className="text-hud-warning">Agent paused. Enable to gather signals.</span>
+                    ) : status?.swarm?.healthy === false ? (
+                      <span className="text-hud-error">Swarm unhealthy - Waiting for peers...</span>
+                    ) : (
+                      "Gathering signals..."
+                    )}
+                  </div>
                 ) : (
                   signals.slice(0, 20).map((sig: Signal, i: number) => (
                     <Tooltip
@@ -812,7 +820,15 @@ export default function App() {
             <Panel title="SIGNAL RESEARCH" titleRight={Object.keys(status?.signalResearch || {}).length.toString()} className="h-80">
               <div className="overflow-y-auto h-full space-y-2">
                 {Object.entries(status?.signalResearch || {}).length === 0 ? (
-                  <div className="text-hud-text-dim text-sm py-4 text-center">Researching candidates...</div>
+                  <div className="text-hud-text-dim text-sm py-4 text-center">
+                    {!status?.enabled ? (
+                      <span className="text-hud-warning">Agent paused.</span>
+                    ) : status?.swarm?.healthy === false ? (
+                      <span className="text-hud-error">Swarm unhealthy.</span>
+                    ) : (
+                      "Researching candidates..."
+                    )}
+                  </div>
                 ) : (
                   Object.entries(status?.signalResearch || {})
                     .sort(([, a], [, b]) => b.timestamp - a.timestamp)
