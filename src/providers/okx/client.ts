@@ -80,11 +80,7 @@ function parseOkxError(error: unknown): ParsedOkxError {
 
   const responseStatus = source?.response?.status;
   const status =
-    typeof source?.status === "number"
-      ? source.status
-      : typeof responseStatus === "number"
-        ? responseStatus
-        : 0;
+    typeof source?.status === "number" ? source.status : typeof responseStatus === "number" ? responseStatus : 0;
 
   const responseData = source?.response?.data;
   const codeCandidate = responseData?.code ?? source?.code;
@@ -223,22 +219,16 @@ export class OkxClient {
     wantsAuth: boolean
   ): Promise<unknown> {
     if (method === "GET") {
-      return wantsAuth
-        ? this.restClient.getPrivate(path, params)
-        : this.restClient.get(path, params);
+      return wantsAuth ? this.restClient.getPrivate(path, params) : this.restClient.get(path, params);
     }
 
     if (method === "POST") {
       const payload = body ?? {};
       if (params && Object.keys(params).length > 0) {
         const endpoint = `${path}${toQueryString(params)}`;
-        return wantsAuth
-          ? this.restClient.postPrivate(endpoint, payload)
-          : this.restClient.post(endpoint, payload);
+        return wantsAuth ? this.restClient.postPrivate(endpoint, payload) : this.restClient.post(endpoint, payload);
       }
-      return wantsAuth
-        ? this.restClient.postPrivate(path, payload)
-        : this.restClient.post(path, payload);
+      return wantsAuth ? this.restClient.postPrivate(path, payload) : this.restClient.post(path, payload);
     }
 
     if (method === "DELETE") {

@@ -1,4 +1,3 @@
-
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "../../env.d";
 import {
@@ -65,19 +64,22 @@ export abstract class AgentBase<TState extends AgentBaseState = AgentBaseState> 
 
     try {
       if (path === "/health") {
-        return new Response(JSON.stringify({
-          status: "ok",
-          type: this.agentType,
-          agentId: this.getAgentId(),
-          lastHeartbeat: this.state.lastHeartbeat,
-        }), {
-          headers: { "Content-Type": "application/json" },
-        });
+        return new Response(
+          JSON.stringify({
+            status: "ok",
+            type: this.agentType,
+            agentId: this.getAgentId(),
+            lastHeartbeat: this.state.lastHeartbeat,
+          }),
+          {
+            headers: { "Content-Type": "application/json" },
+          }
+        );
       }
 
       if (path === "/message") {
         if (request.method !== "POST") return new Response("Method not allowed", { status: 405 });
-        const message = await request.json() as AgentMessage;
+        const message = (await request.json()) as AgentMessage;
         const response = await this.handleMessage(message);
         return new Response(JSON.stringify(response || { ack: true }), {
           headers: { "Content-Type": "application/json" },
@@ -95,7 +97,7 @@ export abstract class AgentBase<TState extends AgentBaseState = AgentBaseState> 
 
       if (path === "/swarm/subscribe") {
         if (request.method !== "POST") return new Response("Method not allowed", { status: 405 });
-        const body = await request.json() as { topic?: string };
+        const body = (await request.json()) as { topic?: string };
         if (!body.topic) {
           return new Response(JSON.stringify({ error: "Missing topic" }), {
             status: 400,
@@ -110,7 +112,7 @@ export abstract class AgentBase<TState extends AgentBaseState = AgentBaseState> 
 
       if (path === "/swarm/unsubscribe") {
         if (request.method !== "POST") return new Response("Method not allowed", { status: 405 });
-        const body = await request.json() as { topic?: string };
+        const body = (await request.json()) as { topic?: string };
         if (!body.topic) {
           return new Response(JSON.stringify({ error: "Missing topic" }), {
             status: 400,
@@ -131,7 +133,6 @@ export abstract class AgentBase<TState extends AgentBaseState = AgentBaseState> 
 
       // Allow subclasses to handle custom routes
       return this.handleCustomFetch(request, url);
-
     } catch (error) {
       console.error(`[${this.agentType}] Error handling request:`, error);
       return new Response(JSON.stringify({ error: String(error) }), {
@@ -250,7 +251,7 @@ export abstract class AgentBase<TState extends AgentBaseState = AgentBaseState> 
       return { enqueued: 0 };
     }
 
-    const data = await response.json() as { enqueued?: number };
+    const data = (await response.json()) as { enqueued?: number };
     return { enqueued: data.enqueued ?? 0 };
   }
 
@@ -296,7 +297,7 @@ export abstract class AgentBase<TState extends AgentBaseState = AgentBaseState> 
       return [];
     }
 
-    const data = await response.json() as PollResult;
+    const data = (await response.json()) as PollResult;
     return Array.isArray(data.messages) ? data.messages : [];
   }
 

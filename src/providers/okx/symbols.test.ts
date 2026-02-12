@@ -14,4 +14,3 @@ describe("OKX symbol normalization", () => {
     expect(info.normalizedSymbol).toBe("ETH/USDC");
   });
 });
-

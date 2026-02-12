@@ -1,6 +1,6 @@
 /**
  * DataScout - Simplified Durable Object for Data Gathering
- * 
+ *
  * Follows the same pattern as OwokxHarness for consistency.
  */
 
@@ -29,13 +29,16 @@ interface PipelineMetrics {
 }
 
 interface DataScoutState extends AgentBaseState {
-  signals: Record<string, {
-    symbol: string;
-    sentiment: number;
-    sources: string[];
-    timestamp: number;
-    volume: number;
-  }>;
+  signals: Record<
+    string,
+    {
+      symbol: string;
+      sentiment: number;
+      sources: string[];
+      timestamp: number;
+      volume: number;
+    }
+  >;
   lastGatherTime: number;
   sourceHealth: Record<SourceName, SourceHealth>;
   pipelineMetrics: PipelineMetrics;
@@ -100,13 +103,7 @@ export class DataScoutSimple extends AgentBase<DataScoutState> {
   }
 
   protected getCapabilities(): string[] {
-    return [
-      "gather_signals",
-      "get_signals",
-      "publish_signals",
-      "pipeline_optimized",
-      "source_circuit_breaker",
-    ];
+    return ["gather_signals", "get_signals", "publish_signals", "pipeline_optimized", "source_circuit_breaker"];
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -148,12 +145,15 @@ export class DataScoutSimple extends AgentBase<DataScoutState> {
   private async handleGather(): Promise<Response> {
     try {
       await this.runGatherCycle();
-      return new Response(JSON.stringify({ 
-        success: true, 
-        signalCount: Object.keys(this.state.signals).length 
-      }), {
-        headers: { "Content-Type": "application/json" },
-      });
+      return new Response(
+        JSON.stringify({
+          success: true,
+          signalCount: Object.keys(this.state.signals).length,
+        }),
+        {
+          headers: { "Content-Type": "application/json" },
+        }
+      );
     } catch (error) {
       return new Response(JSON.stringify({ error: String(error) }), {
         status: 500,
@@ -165,12 +165,15 @@ export class DataScoutSimple extends AgentBase<DataScoutState> {
   private async handleGetSignals(): Promise<Response> {
     this.cleanupStaleSignals();
     await this.saveState();
-    
-    return new Response(JSON.stringify({ 
-      signals: Object.values(this.state.signals) 
-    }), {
-      headers: { "Content-Type": "application/json" },
-    });
+
+    return new Response(
+      JSON.stringify({
+        signals: Object.values(this.state.signals),
+      }),
+      {
+        headers: { "Content-Type": "application/json" },
+      }
+    );
   }
 
   private async runGatherCycle(): Promise<void> {
@@ -211,16 +214,19 @@ export class DataScoutSimple extends AgentBase<DataScoutState> {
     const lastGatherAge = now - this.state.lastGatherTime;
     const isHealthy = lastGatherAge < 300000; // 5 minutes
 
-    return new Response(JSON.stringify({
-      healthy: isHealthy,
-      lastGatherTime: this.state.lastGatherTime,
-      lastGatherAgeMs: lastGatherAge,
-      signalCount: Object.keys(this.state.signals).length,
-      pipelineMetrics: this.state.pipelineMetrics,
-      sourceHealth: this.state.sourceHealth,
-    }), {
-      headers: { "Content-Type": "application/json" },
-    });
+    return new Response(
+      JSON.stringify({
+        healthy: isHealthy,
+        lastGatherTime: this.state.lastGatherTime,
+        lastGatherAgeMs: lastGatherAge,
+        signalCount: Object.keys(this.state.signals).length,
+        pipelineMetrics: this.state.pipelineMetrics,
+        sourceHealth: this.state.sourceHealth,
+      }),
+      {
+        headers: { "Content-Type": "application/json" },
+      }
+    );
   }
 
   private async gatherStockTwits(): Promise<number> {
@@ -240,7 +246,7 @@ export class DataScoutSimple extends AgentBase<DataScoutState> {
       throw new Error(`StockTwits request failed (${response.status})`);
     }
 
-    const data = await response.json() as { messages?: Array<{ body?: string; user?: { followers?: number } }> };
+    const data = (await response.json()) as { messages?: Array<{ body?: string; user?: { followers?: number } }> };
     const messages = data.messages ?? [];
     let processed = 0;
 
@@ -281,7 +287,7 @@ export class DataScoutSimple extends AgentBase<DataScoutState> {
       throw new Error(`Reddit auth failed (${authResponse.status})`);
     }
 
-    const authData = await authResponse.json() as { access_token?: string };
+    const authData = (await authResponse.json()) as { access_token?: string };
     const token = authData.access_token;
     if (!token) {
       throw new Error("Reddit auth token missing");
@@ -302,7 +308,7 @@ export class DataScoutSimple extends AgentBase<DataScoutState> {
       throw new Error(`Reddit subreddit fetch failed (${subredditResponse.status})`);
     }
 
-    const subredditData = await subredditResponse.json() as {
+    const subredditData = (await subredditResponse.json()) as {
       data?: {
         children?: Array<{
           data?: {
@@ -397,7 +403,8 @@ export class DataScoutSimple extends AgentBase<DataScoutState> {
     const now = Date.now();
     const existing = this.state.signals[normalized];
     if (existing) {
-      const combinedSentiment = (existing.sentiment * existing.volume + sentiment * volume) / (existing.volume + volume);
+      const combinedSentiment =
+        (existing.sentiment * existing.volume + sentiment * volume) / (existing.volume + volume);
       const combinedSources = Array.from(new Set([...existing.sources, source]));
       this.state.signals[normalized] = {
         symbol: normalized,
@@ -432,9 +439,8 @@ export class DataScoutSimple extends AgentBase<DataScoutState> {
   private updatePipelineMetrics(cycleMs: number, success: boolean): void {
     const previous = this.state.pipelineMetrics;
     const cycles = previous.cycles + 1;
-    const avgCycleMs = previous.avgCycleMs <= 0
-      ? cycleMs
-      : Math.round((previous.avgCycleMs * previous.cycles + cycleMs) / cycles);
+    const avgCycleMs =
+      previous.avgCycleMs <= 0 ? cycleMs : Math.round((previous.avgCycleMs * previous.cycles + cycleMs) / cycles);
 
     this.state.pipelineMetrics = {
       cycles,
@@ -446,11 +452,7 @@ export class DataScoutSimple extends AgentBase<DataScoutState> {
     };
   }
 
-  private async fetchWithTimeout(
-    input: RequestInfo | URL,
-    init: RequestInit,
-    timeoutMs: number
-  ): Promise<Response> {
+  private async fetchWithTimeout(input: RequestInfo | URL, init: RequestInit, timeoutMs: number): Promise<Response> {
     let timer: ReturnType<typeof setTimeout> | undefined;
     const timeout = new Promise<Response>((_, reject) => {
       timer = setTimeout(() => {
@@ -467,17 +469,38 @@ export class DataScoutSimple extends AgentBase<DataScoutState> {
 
   private calculateSentiment(text: string): number {
     const lowerText = text.toLowerCase();
-    
+
     const bullishWords = [
-      "buy", "bull", "long", "moon", "rocket", "squeeze", "breakout",
-      "upgrade", "beat", "earnings", "growth", "positive", "strong"
+      "buy",
+      "bull",
+      "long",
+      "moon",
+      "rocket",
+      "squeeze",
+      "breakout",
+      "upgrade",
+      "beat",
+      "earnings",
+      "growth",
+      "positive",
+      "strong",
     ];
-    
+
     const bearishWords = [
-      "sell", "bear", "short", "crash", "dump", "breakdown",
-      "downgrade", "miss", "loss", "negative", "weak", "warning"
+      "sell",
+      "bear",
+      "short",
+      "crash",
+      "dump",
+      "breakdown",
+      "downgrade",
+      "miss",
+      "loss",
+      "negative",
+      "weak",
+      "warning",
     ];
-    
+
     let score = 0;
     for (const word of bullishWords) {
       if (lowerText.includes(word)) score += 1;
@@ -485,10 +508,10 @@ export class DataScoutSimple extends AgentBase<DataScoutState> {
     for (const word of bearishWords) {
       if (lowerText.includes(word)) score -= 1;
     }
-    
+
     // Normalize to -1 to 1 range
     const totalWords = bullishWords.length + bearishWords.length;
-    return totalWords > 0 ? Math.tanh(score / totalWords * 3) : 0;
+    return totalWords > 0 ? Math.tanh((score / totalWords) * 3) : 0;
   }
 
   async alarm(): Promise<void> {

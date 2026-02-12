@@ -57,4 +57,3 @@ describe("Backtest providers", () => {
     expect(history.profit_loss_pct.length).toBe(history.timestamp.length);
   });
 });
-

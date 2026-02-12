@@ -33,12 +33,12 @@ export class BacktestMarketDataProvider implements MarketDataProvider {
   private readonly latencyMs: number;
   private readonly slippageBps: number;
 
-  constructor(
-    barsBySymbol: Record<string, Bar[]>,
-    config: BacktestMarketDataConfig
-  ) {
+  constructor(barsBySymbol: Record<string, Bar[]>, config: BacktestMarketDataConfig) {
     this.barsBySymbol = new Map(
-      Object.entries(barsBySymbol).map(([symbol, bars]) => [symbol.toUpperCase(), [...bars].sort((a, b) => Date.parse(a.t) - Date.parse(b.t))])
+      Object.entries(barsBySymbol).map(([symbol, bars]) => [
+        symbol.toUpperCase(),
+        [...bars].sort((a, b) => Date.parse(a.t) - Date.parse(b.t)),
+      ])
     );
     this.nowMs = config.now_ms;
     this.spreadBps = config.spread_bps ?? 10;
@@ -84,7 +84,7 @@ export class BacktestMarketDataProvider implements MarketDataProvider {
   async getQuote(symbol: string): Promise<Quote> {
     // Latency simulation
     if (this.latencyMs > 0) {
-      await new Promise(resolve => setTimeout(resolve, Math.random() * this.latencyMs));
+      await new Promise((resolve) => setTimeout(resolve, Math.random() * this.latencyMs));
     }
     const bar = await this.getLatestBar(symbol);
     const mid = bar.c;
@@ -539,4 +539,3 @@ export class BacktestBrokerProvider implements BrokerProvider {
     this.equityTimeline.push({ t_ms: this.nowMs, equity: equityEstimate, cash: this.cash });
   }
 }
-

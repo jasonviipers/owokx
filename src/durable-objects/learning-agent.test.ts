@@ -120,7 +120,7 @@ describe("LearningAgent", () => {
     });
 
     const summaryRes = await doFetch(agent, "http://learning/summary", { method: "GET" });
-    const summary = await summaryRes.json() as {
+    const summary = (await summaryRes.json()) as {
       performance: { samples: number; wins: number; losses: number };
       symbols: Array<{ symbol: string; samples: number }>;
     };
@@ -153,7 +153,7 @@ describe("LearningAgent", () => {
       method: "POST",
       body: JSON.stringify({ reason: "test" }),
     });
-    const optimize = await optimizeRes.json() as {
+    const optimize = (await optimizeRes.json()) as {
       updated: boolean;
       strategy: { minConfidenceBuy: number; maxPositionNotional: number };
     };
@@ -187,7 +187,7 @@ describe("LearningAgent", () => {
         confidence: 0.72,
       }),
     });
-    const advice = await adviceRes.json() as {
+    const advice = (await adviceRes.json()) as {
       approved: boolean;
       adjustedConfidence: number;
       reasons: string[];

@@ -340,4 +340,3 @@ export function detectSentiment(text: string): number {
   if (total === 0) return 0;
   return (bull - bear) / total;
 }
-

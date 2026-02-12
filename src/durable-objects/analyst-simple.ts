@@ -1,6 +1,6 @@
 /**
  * Analyst - Simplified Durable Object for Signal Analysis
- * 
+ *
  * Follows the same pattern as OwokxHarness for consistency.
  */
 
@@ -31,13 +31,16 @@ interface AnalystMetrics {
 }
 
 interface AnalystState extends AgentBaseState {
-  researchResults: Record<string, {
-    symbol: string;
-    verdict: "BUY" | "SKIP" | "WAIT";
-    confidence: number;
-    reasoning: string;
-    timestamp: number;
-  }>;
+  researchResults: Record<
+    string,
+    {
+      symbol: string;
+      verdict: "BUY" | "SKIP" | "WAIT";
+      confidence: number;
+      reasoning: string;
+      timestamp: number;
+    }
+  >;
   analysisCache: Record<string, AnalysisCacheEntry>;
   llmHealth: LlmHealth;
   metrics: AnalystMetrics;
@@ -63,7 +66,10 @@ function createDefaultMetrics(): AnalystMetrics {
   };
 }
 
-const DEFAULT_STATE: Pick<AnalystState, "researchResults" | "analysisCache" | "llmHealth" | "metrics" | "lastAnalysisTime"> = {
+const DEFAULT_STATE: Pick<
+  AnalystState,
+  "researchResults" | "analysisCache" | "llmHealth" | "metrics" | "lastAnalysisTime"
+> = {
   researchResults: {},
   analysisCache: {},
   llmHealth: createDefaultLlmHealth(),
@@ -191,8 +197,8 @@ export class AnalystSimple extends AgentBase<AnalystState> {
 
   private async handleAnalyze(request: Request): Promise<Response> {
     try {
-      const { signals } = await request.json() as { signals: any[] };
-      
+      const { signals } = (await request.json()) as { signals: any[] };
+
       if (!signals || signals.length === 0) {
         return new Response(JSON.stringify({ recommendations: [] }), {
           headers: { "Content-Type": "application/json" },
@@ -200,10 +206,10 @@ export class AnalystSimple extends AgentBase<AnalystState> {
       }
 
       const recommendations = await this.analyzeSignals(signals);
-      
+
       this.state.lastAnalysisTime = Date.now();
       await this.ctx.storage.put("state", this.state);
-      
+
       return new Response(JSON.stringify({ recommendations }), {
         headers: { "Content-Type": "application/json" },
       });
@@ -217,13 +223,13 @@ export class AnalystSimple extends AgentBase<AnalystState> {
 
   private async handleResearch(request: Request): Promise<Response> {
     try {
-      const { symbol, sentiment } = await request.json() as {
+      const { symbol, sentiment } = (await request.json()) as {
         symbol: string;
         sentiment: number;
       };
-      
+
       const research = await this.researchSignal(symbol, sentiment);
-      
+
       return new Response(JSON.stringify({ research }), {
         headers: { "Content-Type": "application/json" },
       });
@@ -237,7 +243,7 @@ export class AnalystSimple extends AgentBase<AnalystState> {
 
   private async handleResearchBatch(request: Request): Promise<Response> {
     try {
-      const payload = await request.json() as {
+      const payload = (await request.json()) as {
         signals?: Array<{ symbol?: string; sentiment?: number }>;
       };
       const signals = Array.isArray(payload.signals) ? payload.signals : [];
@@ -261,7 +267,7 @@ export class AnalystSimple extends AgentBase<AnalystState> {
       return;
     }
 
-    const payload = await response.json() as { signals?: unknown[] };
+    const payload = (await response.json()) as { signals?: unknown[] };
     const signals = Array.isArray(payload.signals) ? payload.signals : [];
     const batchedResearch = await this.researchSignalsBatch(
       signals.map((signal) => {
@@ -292,18 +298,21 @@ export class AnalystSimple extends AgentBase<AnalystState> {
     const lastAnalysisAge = now - this.state.lastAnalysisTime;
     const isHealthy = lastAnalysisAge < 600000; // 10 minutes
 
-    return new Response(JSON.stringify({
-      healthy: isHealthy,
-      lastAnalysisTime: this.state.lastAnalysisTime,
-      lastAnalysisAgeMs: lastAnalysisAge,
-      researchCount: Object.keys(this.state.researchResults).length,
-      llmAvailable: !!this._llm,
-      llmHealth: this.state.llmHealth,
-      metrics: this.state.metrics,
-      analysisCacheEntries: Object.keys(this.state.analysisCache).length,
-    }), {
-      headers: { "Content-Type": "application/json" },
-    });
+    return new Response(
+      JSON.stringify({
+        healthy: isHealthy,
+        lastAnalysisTime: this.state.lastAnalysisTime,
+        lastAnalysisAgeMs: lastAnalysisAge,
+        researchCount: Object.keys(this.state.researchResults).length,
+        llmAvailable: !!this._llm,
+        llmHealth: this.state.llmHealth,
+        metrics: this.state.metrics,
+        analysisCacheEntries: Object.keys(this.state.analysisCache).length,
+      }),
+      {
+        headers: { "Content-Type": "application/json" },
+      }
+    );
   }
 
   private async analyzeSignals(signals: unknown[]): Promise<any[]> {
@@ -388,15 +397,18 @@ Output JSON array of recommendations:
   }
 
   private async researchSignal(symbol: string, sentimentScore: number): Promise<any> {
-    const result = await this.researchSignalsBatch([
-      { symbol, sentiment: sentimentScore },
-    ]);
+    const result = await this.researchSignalsBatch([{ symbol, sentiment: sentimentScore }]);
     return result[symbol.toUpperCase()] ?? null;
   }
 
   private async researchSignalsBatch(
     signals: Array<{ symbol?: string; sentiment?: number }>
-  ): Promise<Record<string, { symbol: string; verdict: "BUY" | "SKIP" | "WAIT"; confidence: number; reasoning: string; timestamp: number }>> {
+  ): Promise<
+    Record<
+      string,
+      { symbol: string; verdict: "BUY" | "SKIP" | "WAIT"; confidence: number; reasoning: string; timestamp: number }
+    >
+  > {
     const now = Date.now();
     const normalizedInputs = signals
       .map((signal) => ({
@@ -405,11 +417,15 @@ Output JSON array of recommendations:
       }))
       .filter((signal) => signal.symbol.length > 0);
 
-    const deduped = Array.from(
-      new Map(normalizedInputs.map((signal) => [signal.symbol, signal])).values()
-    ).slice(0, this.maxBatchResearchSymbols * 2);
+    const deduped = Array.from(new Map(normalizedInputs.map((signal) => [signal.symbol, signal])).values()).slice(
+      0,
+      this.maxBatchResearchSymbols * 2
+    );
 
-    const results: Record<string, { symbol: string; verdict: "BUY" | "SKIP" | "WAIT"; confidence: number; reasoning: string; timestamp: number }> = {};
+    const results: Record<
+      string,
+      { symbol: string; verdict: "BUY" | "SKIP" | "WAIT"; confidence: number; reasoning: string; timestamp: number }
+    > = {};
     const uncached: Array<{ symbol: string; sentiment: number }> = [];
 
     for (const signal of deduped) {
@@ -535,8 +551,9 @@ Return JSON array:
     signals: Array<{ symbol: string; sentiment: number; volume: number; sources: string[] }>
   ): string {
     return signals
-      .map((signal) =>
-        `${signal.symbol}:${signal.sentiment.toFixed(3)}:${signal.volume}:${signal.sources.sort().join("|")}`
+      .map(
+        (signal) =>
+          `${signal.symbol}:${signal.sentiment.toFixed(3)}:${signal.volume}:${signal.sources.sort().join("|")}`
       )
       .join(";");
   }
@@ -576,11 +593,7 @@ Return JSON array:
     };
   }
 
-  private async runLlmWithResilience<T>(
-    operation: () => Promise<T>,
-    fallback: T,
-    context: string
-  ): Promise<T> {
+  private async runLlmWithResilience<T>(operation: () => Promise<T>, fallback: T, context: string): Promise<T> {
     if (!this._llm) {
       return fallback;
     }
@@ -638,7 +651,7 @@ Return JSON array:
     // Clean up old research results (older than 1 hour)
     const now = Date.now();
     const oneHourAgo = now - 60 * 60 * 1000;
-    
+
     for (const symbol in this.state.researchResults) {
       const research = this.state.researchResults[symbol];
       if (research && research.timestamp < oneHourAgo) {

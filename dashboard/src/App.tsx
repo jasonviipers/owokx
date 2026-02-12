@@ -62,12 +62,86 @@ function getAgentColor(agent: string): string {
     'Analyst': 'text-hud-purple',
     'Executor': 'text-hud-cyan',
     'StockTwits': 'text-hud-success',
+    'Reddit': 'text-hud-primary',
+    'X': 'text-hud-warning',
+    'SEC': 'text-hud-primary',
     'SignalResearch': 'text-hud-cyan',
     'PositionResearch': 'text-hud-purple',
+    'Options': 'text-hud-warning',
+    'Discord': 'text-hud-text-dim',
     'Crypto': 'text-hud-warning',
     'System': 'text-hud-text-dim',
   }
   return colors[agent] || 'text-hud-text'
+}
+
+const NOISY_SYSTEM_ACTIONS = new Set(['alarm_skipped', 'agent_reset'])
+
+function isNoisySystemLog(log: LogEntry): boolean {
+  return log.agent === 'System' && NOISY_SYSTEM_ACTIONS.has(log.action)
+}
+
+function titleCaseAction(action: string): string {
+  return action
+    .replace(/_/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/\b\w/g, (char) => char.toUpperCase())
+}
+
+function getLogString(log: LogEntry, key: string): string | null {
+  const value = log[key]
+  if (typeof value !== 'string') return null
+  const trimmed = value.trim()
+  return trimmed.length > 0 ? trimmed : null
+}
+
+function getLogNumber(log: LogEntry, key: string): number | null {
+  const value = log[key]
+  if (typeof value === 'number' && Number.isFinite(value)) return value
+  if (typeof value === 'string') {
+    const parsed = Number(value)
+    if (Number.isFinite(parsed)) return parsed
+  }
+  return null
+}
+
+function truncate(value: string, maxChars: number = 120): string {
+  if (value.length <= maxChars) return value
+  return `${value.slice(0, maxChars - 1)}…`
+}
+
+function formatActivityDetails(log: LogEntry): string {
+  const summary = getLogString(log, 'reason')
+    ?? getLogString(log, 'message')
+    ?? getLogString(log, 'error')
+    ?? getLogString(log, 'contract')
+
+  const meta: string[] = []
+  const symbol = typeof log.symbol === 'string' ? log.symbol.trim() : ''
+  if (symbol) meta.push(symbol)
+
+  const confidence = getLogNumber(log, 'confidence')
+  if (confidence !== null) meta.push(`conf ${Math.round(confidence * 100)}%`)
+
+  const verdict = getLogString(log, 'verdict')
+  if (verdict) meta.push(`verdict ${verdict}`)
+
+  const recommendation = getLogString(log, 'recommendation')
+  if (recommendation) meta.push(`reco ${recommendation}`)
+
+  const count = getLogNumber(log, 'count')
+  if (count !== null) meta.push(`count ${count}`)
+
+  const source = getLogString(log, 'source')
+  if (source) meta.push(`src ${source}`)
+
+  const primary = summary ? truncate(summary) : ''
+  const secondary = meta.join(' · ')
+
+  if (primary && secondary) return `${primary} · ${secondary}`
+  if (primary) return primary
+  return secondary
 }
 
 function isCryptoSymbol(symbol: string, cryptoSymbols: string[] = []): boolean {
@@ -267,10 +341,22 @@ export default function App() {
   const positions = status?.positions || []
   const signals = status?.signals || []
   const logs = status?.logs || []
+  const agentEnabled = status?.enabled ?? null
+
+  const activityLogs = useMemo(() => {
+    return logs.filter((log) => !isNoisySystemLog(log)).slice(-50).reverse()
+  }, [logs])
+
+  const activityEmptyText = useMemo(() => {
+    if (agentEnabled === false) return 'Agent paused. Enable it to start research and execution activity.'
+    if (status?.swarm?.healthy === false) return 'Swarm unhealthy. Activity will resume once quorum is restored.'
+    if (logs.length > 0) return 'No research or trade events yet. Waiting for the next agent cycle.'
+    return 'Waiting for research and execution activity...'
+  }, [agentEnabled, status?.swarm?.healthy, logs.length])
+
   const costs = status?.costs || { total_usd: 0, calls: 0, tokens_in: 0, tokens_out: 0 }
   const config = status?.config
   const isMarketOpen = status?.clock?.is_open ?? false
-  const agentEnabled = status?.enabled ?? null
 
   const setAgentEnabledRemote = useCallback(async (nextEnabled: boolean) => {
     if (agentBusy) return
@@ -790,28 +876,35 @@ export default function App() {
           <div className="col-span-4 md:col-span-4 lg:col-span-4">
             <Panel title="ACTIVITY FEED" titleRight="LIVE" className="h-80">
               <div className="overflow-y-auto h-full font-mono text-xs space-y-1">
-                {logs.length === 0 ? (
-                  <div className="text-hud-text-dim py-4 text-center">Waiting for activity...</div>
+                {activityLogs.length === 0 ? (
+                  <div className="text-hud-text-dim py-4 text-center">{activityEmptyText}</div>
                 ) : (
-                  logs.slice(-50).reverse().map((log: LogEntry, i: number) => (
-                    <motion.div
-                      key={`${log.timestamp}-${i}`}
-                      initial={{ opacity: 0 }}
-                      animate={{ opacity: 1 }}
-                      className="flex items-start gap-2 py-1 border-b border-hud-line/10"
-                    >
-                      <span className="text-hud-text-dim shrink-0 hidden sm:inline w-[52px]">
-                        {new Date(log.timestamp).toLocaleTimeString('en-US', { hour12: false })}
-                      </span>
-                      <span className={clsx('shrink-0 w-[72px] text-right', getAgentColor(log.agent))}>
-                        {log.agent}
-                      </span>
-                      <span className="text-hud-text flex-1 text-right wrap-break-word">
-                        {log.action}
-                        {log.symbol && <span className="text-hud-primary ml-1">({log.symbol})</span>}
-                      </span>
-                    </motion.div>
-                  ))
+                  activityLogs.map((log: LogEntry, i: number) => {
+                    const details = formatActivityDetails(log)
+                    return (
+                      <motion.div
+                        key={`${log.timestamp}-${i}`}
+                        initial={{ opacity: 0 }}
+                        animate={{ opacity: 1 }}
+                        className="flex items-start gap-2 py-1 border-b border-hud-line/10"
+                      >
+                        <span className="text-hud-text-dim shrink-0 hidden sm:inline w-[52px]">
+                          {new Date(log.timestamp).toLocaleTimeString('en-US', { hour12: false })}
+                        </span>
+                        <span className={clsx('shrink-0 w-[92px] text-right', getAgentColor(log.agent))}>
+                          {log.agent}
+                        </span>
+                        <div className="text-hud-text flex-1 min-w-0">
+                          <div className="break-words">{titleCaseAction(log.action)}</div>
+                          {details && (
+                            <div className="text-hud-text-dim break-words mt-0.5">
+                              {details}
+                            </div>
+                          )}
+                        </div>
+                      </motion.div>
+                    )
+                  })
                 )}
 
               </div>

@@ -91,11 +91,7 @@ export class LearningAgent extends AgentBase<LearningState> {
   }
 
   protected getCapabilities(): string[] {
-    return [
-      "trade_outcome_analysis",
-      "strategy_optimization",
-      "collaborative_trade_advice",
-    ];
+    return ["trade_outcome_analysis", "strategy_optimization", "collaborative_trade_advice"];
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -139,14 +135,14 @@ export class LearningAgent extends AgentBase<LearningState> {
     }
 
     if (path === "/advice" && request.method === "POST") {
-      const payload = await request.json() as { symbol?: string; confidence?: number };
+      const payload = (await request.json()) as { symbol?: string; confidence?: number };
       return new Response(JSON.stringify(this.getTradeAdvice(payload)), {
         headers: { "Content-Type": "application/json" },
       });
     }
 
     if (path === "/record-outcome" && request.method === "POST") {
-      const payload = await request.json() as Partial<TradeOutcome>;
+      const payload = (await request.json()) as Partial<TradeOutcome>;
       await this.recordTradeOutcome(payload);
       return new Response(JSON.stringify({ ok: true }), {
         headers: { "Content-Type": "application/json" },
@@ -154,7 +150,7 @@ export class LearningAgent extends AgentBase<LearningState> {
     }
 
     if (path === "/optimize" && request.method === "POST") {
-      const payload = await request.json().catch(() => ({})) as { reason?: string };
+      const payload = (await request.json().catch(() => ({}))) as { reason?: string };
       const result = await this.optimizeStrategy(payload.reason ?? "manual");
       return new Response(JSON.stringify(result), {
         headers: { "Content-Type": "application/json" },
@@ -165,15 +161,18 @@ export class LearningAgent extends AgentBase<LearningState> {
   }
 
   private handleHealth(): Response {
-    return new Response(JSON.stringify({
-      healthy: true,
-      samples: this.state.performance.samples,
-      winRate: this.state.performance.winRate,
-      strategy: this.state.strategy,
-      lastOptimizationTime: this.state.lastOptimizationTime,
-    }), {
-      headers: { "Content-Type": "application/json" },
-    });
+    return new Response(
+      JSON.stringify({
+        healthy: true,
+        samples: this.state.performance.samples,
+        winRate: this.state.performance.winRate,
+        strategy: this.state.strategy,
+        lastOptimizationTime: this.state.lastOptimizationTime,
+      }),
+      {
+        headers: { "Content-Type": "application/json" },
+      }
+    );
   }
 
   private async recordTradeOutcome(payload: Partial<TradeOutcome>): Promise<void> {

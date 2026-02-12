@@ -1,12 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Env } from "../env.d";
 
-const {
-  completeMock,
-  executeOrderMock,
-  createBrokerProvidersMock,
-  createD1ClientMock,
-} = vi.hoisted(() => ({
+const { completeMock, executeOrderMock, createBrokerProvidersMock, createD1ClientMock } = vi.hoisted(() => ({
   completeMock: vi.fn(),
   executeOrderMock: vi.fn(),
   createBrokerProvidersMock: vi.fn(),
@@ -55,9 +50,7 @@ function createId(id: string): DurableObjectId {
   return { toString: () => id } as unknown as DurableObjectId;
 }
 
-function createNamespace(
-  fetchImpl?: (request: Request) => Promise<Response> | Response
-): DurableObjectNamespace {
+function createNamespace(fetchImpl?: (request: Request) => Promise<Response> | Response): DurableObjectNamespace {
   const impl = fetchImpl ?? (() => new Response(JSON.stringify({ ok: true }), { status: 200 }));
   return {
     idFromName: (name: string) => createId(name),
@@ -189,9 +182,7 @@ describe("Swarm integration", () => {
       if (new URL(request.url).pathname === "/signals") {
         return new Response(
           JSON.stringify({
-            signals: [
-              { symbol: "AAPL", sentiment: 0.82, volume: 150, sources: ["reddit"] },
-            ],
+            signals: [{ symbol: "AAPL", sentiment: 0.82, volume: 150, sources: ["reddit"] }],
           }),
           { status: 200 }
         );
@@ -217,7 +208,7 @@ describe("Swarm integration", () => {
         );
       }
       if (path === "/advice") {
-        const body = await request.json() as { confidence?: number };
+        const body = (await request.json()) as { confidence?: number };
         return new Response(
           JSON.stringify({
             approved: true,
@@ -260,7 +251,7 @@ describe("Swarm integration", () => {
       method: "POST",
       body: JSON.stringify({ limit: 25 }),
     });
-    const dispatch = await dispatchRes.json() as { delivered: number };
+    const dispatch = (await dispatchRes.json()) as { delivered: number };
     expect(dispatch.delivered).toBeGreaterThanOrEqual(1);
     expect(executeOrderMock).toHaveBeenCalledTimes(1);
 
@@ -268,7 +259,7 @@ describe("Swarm integration", () => {
     expect(orderArgs?.order?.symbol).toBe("AAPL");
 
     const historyRes = await doFetch(trader, "http://trader/history");
-    const history = await historyRes.json() as {
+    const history = (await historyRes.json()) as {
       trades: Array<{ symbol: string; success: boolean }>;
     };
     expect(history.trades).toHaveLength(1);
@@ -306,7 +297,7 @@ describe("Swarm integration", () => {
         );
       }
       if (path === "/advice") {
-        const body = await request.json() as { confidence?: number };
+        const body = (await request.json()) as { confidence?: number };
         return new Response(
           JSON.stringify({
             approved: true,
@@ -340,9 +331,7 @@ describe("Swarm integration", () => {
           type: "EVENT",
           topic: "analysis_ready",
           payload: {
-            recommendations: [
-              { symbol: "MSFT", action: "BUY", confidence: 0.88 },
-            ],
+            recommendations: [{ symbol: "MSFT", action: "BUY", confidence: 0.88 }],
           },
           timestamp: Date.now(),
         },
@@ -358,7 +347,7 @@ describe("Swarm integration", () => {
     const firstStateRes = await doFetch(registry, "http://registry/queue/state", {
       method: "GET",
     });
-    const firstState = await firstStateRes.json() as {
+    const firstState = (await firstStateRes.json()) as {
       deadLettered: number;
       queued: number;
     };
@@ -374,7 +363,7 @@ describe("Swarm integration", () => {
       method: "POST",
       body: JSON.stringify({ limit: 10 }),
     });
-    const requeue = await requeueRes.json() as { requeued: number; remaining: number };
+    const requeue = (await requeueRes.json()) as { requeued: number; remaining: number };
     expect(requeue.requeued).toBe(1);
     expect(requeue.remaining).toBe(0);
 
@@ -382,7 +371,7 @@ describe("Swarm integration", () => {
       method: "POST",
       body: JSON.stringify({ limit: 25 }),
     });
-    const dispatch = await dispatchRes.json() as { delivered: number };
+    const dispatch = (await dispatchRes.json()) as { delivered: number };
     expect(dispatch.delivered).toBe(1);
     expect(executeOrderMock).toHaveBeenCalledTimes(1);
 

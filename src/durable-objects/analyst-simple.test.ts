@@ -80,9 +80,7 @@ function createAnalystEnv(): Env {
     SESSION: inert,
     MCP_AGENT: inert,
     OWOKX_HARNESS: inert,
-    DATA_SCOUT: createNamespace(async () =>
-      new Response(JSON.stringify({ signals: [] }), { status: 200 })
-    ),
+    DATA_SCOUT: createNamespace(async () => new Response(JSON.stringify({ signals: [] }), { status: 200 })),
     ANALYST: inert,
     TRADER: inert,
     SWARM_REGISTRY: inert,
@@ -131,9 +129,7 @@ describe("AnalystSimple Phase 4", () => {
     await waitForInit();
 
     const payload = {
-      signals: [
-        { symbol: "AAPL", sentiment: 0.8, volume: 120, sources: ["reddit"] },
-      ],
+      signals: [{ symbol: "AAPL", sentiment: 0.8, volume: 120, sources: ["reddit"] }],
     };
 
     const first = await doFetch(analyst, "http://analyst/analyze", {
@@ -145,8 +141,8 @@ describe("AnalystSimple Phase 4", () => {
       body: JSON.stringify(payload),
     });
 
-    const firstData = await first.json() as { recommendations: unknown[] };
-    const secondData = await second.json() as { recommendations: unknown[] };
+    const firstData = (await first.json()) as { recommendations: unknown[] };
+    const secondData = (await second.json()) as { recommendations: unknown[] };
     expect(firstData.recommendations.length).toBe(1);
     expect(secondData.recommendations.length).toBe(1);
     expect(completeMock).toHaveBeenCalledTimes(1);
@@ -180,8 +176,8 @@ describe("AnalystSimple Phase 4", () => {
       body: JSON.stringify(batchPayload),
     });
 
-    const firstData = await first.json() as { results: Record<string, { verdict: string }> };
-    const secondData = await second.json() as { results: Record<string, { verdict: string }> };
+    const firstData = (await first.json()) as { results: Record<string, { verdict: string }> };
+    const secondData = (await second.json()) as { results: Record<string, { verdict: string }> };
     expect(firstData.results.AAPL?.verdict).toBe("BUY");
     expect(secondData.results.TSLA?.verdict).toBe("WAIT");
     expect(completeMock).toHaveBeenCalledTimes(1);

@@ -1,11 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Env } from "../env.d";
 
-const {
-  executeOrderMock,
-  createBrokerProvidersMock,
-  createD1ClientMock,
-} = vi.hoisted(() => ({
+const { executeOrderMock, createBrokerProvidersMock, createD1ClientMock } = vi.hoisted(() => ({
   executeOrderMock: vi.fn(),
   createBrokerProvidersMock: vi.fn(),
   createD1ClientMock: vi.fn(() => ({})),
@@ -82,7 +78,9 @@ function createContext(id: string): {
 }
 
 function createTraderEnv(riskApproved: { current: boolean }): Env {
-  const swarmRegistryNamespace = createNamespace(async () => new Response(JSON.stringify({ ok: true }), { status: 200 }));
+  const swarmRegistryNamespace = createNamespace(
+    async () => new Response(JSON.stringify({ ok: true }), { status: 200 })
+  );
   const riskNamespace = createNamespace(async (request: Request) => {
     if (new URL(request.url).pathname === "/validate") {
       if (riskApproved.current) {
@@ -163,7 +161,7 @@ describe("TraderSimple risk gating", () => {
         account: { cash: 10_000 },
       }),
     });
-    const payload = await response.json() as { success: boolean };
+    const payload = (await response.json()) as { success: boolean };
 
     expect(payload.success).toBe(false);
     expect(executeOrderMock).not.toHaveBeenCalled();
@@ -183,7 +181,7 @@ describe("TraderSimple risk gating", () => {
         account: { cash: 10_000 },
       }),
     });
-    const payload = await response.json() as { success: boolean };
+    const payload = (await response.json()) as { success: boolean };
 
     expect(payload.success).toBe(true);
     expect(executeOrderMock).toHaveBeenCalledTimes(1);

@@ -27,9 +27,7 @@ function createId(id: string): DurableObjectId {
   return { toString: () => id } as unknown as DurableObjectId;
 }
 
-function createNamespace(
-  fetchImpl?: (request: Request) => Promise<Response> | Response
-): DurableObjectNamespace {
+function createNamespace(fetchImpl?: (request: Request) => Promise<Response> | Response): DurableObjectNamespace {
   const impl = fetchImpl ?? (() => new Response(JSON.stringify({ ok: true }), { status: 200 }));
   return {
     idFromName: (name: string) => createId(name),
@@ -98,11 +96,7 @@ function createRegistryEnv(overrides: Partial<Env> = {}): Env {
   } as Env;
 }
 
-async function doFetch(
-  registry: SwarmRegistry,
-  url: string,
-  init?: RequestInit
-): Promise<Response> {
+async function doFetch(registry: SwarmRegistry, url: string, init?: RequestInit): Promise<Response> {
   return registry.fetch(new Request(url, init));
 }
 
@@ -112,14 +106,10 @@ describe("SwarmRegistry", () => {
     const registry = new SwarmRegistry(ctx, createRegistryEnv());
     await waitForInit();
 
-    const subscribeRes = await doFetch(
-      registry,
-      "http://registry/subscriptions/subscribe",
-      {
-        method: "POST",
-        body: JSON.stringify({ agentId: "agent-1", topic: "signals_updated" }),
-      }
-    );
+    const subscribeRes = await doFetch(registry, "http://registry/subscriptions/subscribe", {
+      method: "POST",
+      body: JSON.stringify({ agentId: "agent-1", topic: "signals_updated" }),
+    });
     expect(subscribeRes.ok).toBe(true);
 
     const publishRes = await doFetch(registry, "http://registry/queue/publish", {
@@ -130,21 +120,17 @@ describe("SwarmRegistry", () => {
         payload: { count: 2 },
       }),
     });
-    const publishData = await publishRes.json() as { enqueued: number };
+    const publishData = (await publishRes.json()) as { enqueued: number };
     expect(publishData.enqueued).toBe(1);
 
-    const pollRes = await doFetch(
-      registry,
-      "http://registry/queue/poll?agentId=agent-1&limit=10",
-      { method: "GET" }
-    );
-    const pollData = await pollRes.json() as { messages: Array<{ topic: string; source: string }> };
+    const pollRes = await doFetch(registry, "http://registry/queue/poll?agentId=agent-1&limit=10", { method: "GET" });
+    const pollData = (await pollRes.json()) as { messages: Array<{ topic: string; source: string }> };
     expect(pollData.messages).toHaveLength(1);
     expect(pollData.messages[0]?.topic).toBe("signals_updated");
     expect(pollData.messages[0]?.source).toBe("scout-1");
 
     const queueStateRes = await doFetch(registry, "http://registry/queue/state", { method: "GET" });
-    const queueState = await queueStateRes.json() as { queued: number; stats: { delivered: number } };
+    const queueState = (await queueStateRes.json()) as { queued: number; stats: { delivered: number } };
     expect(queueState.queued).toBe(0);
     expect(queueState.stats.delivered).toBe(1);
   });
@@ -153,7 +139,7 @@ describe("SwarmRegistry", () => {
     const deliveredMessages: Array<{ topic: string; target: string }> = [];
     const analystNamespace = createNamespace(async (request: Request) => {
       if (new URL(request.url).pathname === "/message") {
-        const body = await request.json() as { topic: string; target: string };
+        const body = (await request.json()) as { topic: string; target: string };
         deliveredMessages.push({ topic: body.topic, target: body.target });
       }
       return new Response(JSON.stringify({ ok: true }), { status: 200 });
@@ -198,7 +184,7 @@ describe("SwarmRegistry", () => {
       method: "POST",
       body: JSON.stringify({ limit: 10 }),
     });
-    const dispatchData = await dispatchRes.json() as { delivered: number; pending: number };
+    const dispatchData = (await dispatchRes.json()) as { delivered: number; pending: number };
     expect(dispatchData.delivered).toBe(1);
     expect(dispatchData.pending).toBe(0);
     expect(deliveredMessages).toHaveLength(1);
@@ -227,16 +213,14 @@ describe("SwarmRegistry", () => {
       }),
     });
 
-    const pollRes = await doFetch(
-      registry,
-      "http://registry/queue/poll?agentId=agent-expired&limit=10",
-      { method: "GET" }
-    );
-    const pollData = await pollRes.json() as { messages: unknown[] };
+    const pollRes = await doFetch(registry, "http://registry/queue/poll?agentId=agent-expired&limit=10", {
+      method: "GET",
+    });
+    const pollData = (await pollRes.json()) as { messages: unknown[] };
     expect(pollData.messages).toHaveLength(0);
 
     const queueStateRes = await doFetch(registry, "http://registry/queue/state", { method: "GET" });
-    const queueState = await queueStateRes.json() as { deadLettered: number; queued: number };
+    const queueState = (await queueStateRes.json()) as { deadLettered: number; queued: number };
     expect(queueState.deadLettered).toBe(1);
     expect(queueState.queued).toBe(0);
   });
@@ -299,8 +283,8 @@ describe("SwarmRegistry", () => {
 
     const poll1 = await doFetch(registry, "http://registry/queue/poll?agentId=analyst-1&limit=10", { method: "GET" });
     const poll2 = await doFetch(registry, "http://registry/queue/poll?agentId=analyst-2&limit=10", { method: "GET" });
-    const data1 = await poll1.json() as { messages: Array<{ id: string }> };
-    const data2 = await poll2.json() as { messages: Array<{ id: string }> };
+    const data1 = (await poll1.json()) as { messages: Array<{ id: string }> };
+    const data2 = (await poll2.json()) as { messages: Array<{ id: string }> };
 
     expect(data1.messages).toHaveLength(1);
     expect(data2.messages).toHaveLength(1);
@@ -349,16 +333,14 @@ describe("SwarmRegistry", () => {
       method: "POST",
       body: JSON.stringify({ limit: 10 }),
     });
-    const requeueData = await requeueRes.json() as { requeued: number; remaining: number };
+    const requeueData = (await requeueRes.json()) as { requeued: number; remaining: number };
     expect(requeueData.requeued).toBe(1);
     expect(requeueData.remaining).toBe(0);
 
-    const poll = await doFetch(
-      registry,
-      "http://registry/queue/poll?agentId=analyst-recovery&limit=10",
-      { method: "GET" }
-    );
-    const pollData = await poll.json() as { messages: Array<{ id: string }> };
+    const poll = await doFetch(registry, "http://registry/queue/poll?agentId=analyst-recovery&limit=10", {
+      method: "GET",
+    });
+    const pollData = (await poll.json()) as { messages: Array<{ id: string }> };
     expect(pollData.messages).toHaveLength(1);
     expect(pollData.messages[0]?.id).toBe("dlq-msg-1");
   });

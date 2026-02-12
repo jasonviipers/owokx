@@ -201,10 +201,10 @@ export default {
         );
       }
 
-      const health = await healthRes.json() as {
+      const health = (await healthRes.json()) as {
         healthy?: boolean;
       };
-      const queue = await queueRes.json() as {
+      const queue = (await queueRes.json()) as {
         deadLettered?: number;
         staleAgents?: number;
       };
@@ -253,13 +253,16 @@ export default {
 
       const now = Date.now();
       const staleThresholdMs = 300_000;
-      const agents = await agentsRes.json() as Record<string, {
-        id?: string;
-        type?: string;
-        status?: string;
-        lastHeartbeat?: number;
-      }>;
-      const queue = await queueRes.json() as {
+      const agents = (await agentsRes.json()) as Record<
+        string,
+        {
+          id?: string;
+          type?: string;
+          status?: string;
+          lastHeartbeat?: number;
+        }
+      >;
+      const queue = (await queueRes.json()) as {
         queued?: number;
         deadLettered?: number;
         stats?: Record<string, number>;

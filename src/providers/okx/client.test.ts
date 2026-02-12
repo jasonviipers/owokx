@@ -1,21 +1,15 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ErrorCode } from "../../lib/errors";
 
-const {
-  restClientCtorMock,
-  getPrivateMock,
-  getPublicMock,
-  postPrivateMock,
-  postPublicMock,
-  deletePrivateMock,
-} = vi.hoisted(() => ({
-  restClientCtorMock: vi.fn(),
-  getPrivateMock: vi.fn(),
-  getPublicMock: vi.fn(),
-  postPrivateMock: vi.fn(),
-  postPublicMock: vi.fn(),
-  deletePrivateMock: vi.fn(),
-}));
+const { restClientCtorMock, getPrivateMock, getPublicMock, postPrivateMock, postPublicMock, deletePrivateMock } =
+  vi.hoisted(() => ({
+    restClientCtorMock: vi.fn(),
+    getPrivateMock: vi.fn(),
+    getPublicMock: vi.fn(),
+    postPrivateMock: vi.fn(),
+    postPublicMock: vi.fn(),
+    deletePrivateMock: vi.fn(),
+  }));
 
 vi.mock("okx-api", () => ({
   RestClient: vi.fn().mockImplementation((options: unknown) => {

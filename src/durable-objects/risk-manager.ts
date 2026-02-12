@@ -1,4 +1,3 @@
-
 import { AgentBase, type AgentBaseState } from "../lib/agents/base";
 import type { AgentMessage, AgentType } from "../lib/agents/protocol";
 import type { Env } from "../env.d";
@@ -28,7 +27,7 @@ export class RiskManager extends AgentBase<RiskManagerState> {
     const url = new URL(request.url);
 
     if (url.pathname === "/validate") {
-      const order = await request.json() as {
+      const order = (await request.json()) as {
         symbol: string;
         notional: number;
         side: "buy" | "sell";
@@ -56,7 +55,7 @@ export class RiskManager extends AgentBase<RiskManagerState> {
     }
 
     if (url.pathname === "/update-loss" && request.method === "POST") {
-      const { profitLoss } = await request.json() as { profitLoss: number };
+      const { profitLoss } = (await request.json()) as { profitLoss: number };
       await this.updateDailyLoss({ profitLoss });
       return new Response(JSON.stringify({ ok: true }), {
         headers: { "Content-Type": "application/json" },
@@ -86,7 +85,10 @@ export class RiskManager extends AgentBase<RiskManagerState> {
     }
   }
 
-  private validateOrder(order: { symbol: string; size: number; side: "buy" | "sell"; price: number }): { approved: boolean; reason?: string } {
+  private validateOrder(order: { symbol: string; size: number; side: "buy" | "sell"; price: number }): {
+    approved: boolean;
+    reason?: string;
+  } {
     if (this.state.killSwitchActive) {
       return { approved: false, reason: "Kill switch is active" };
     }
@@ -114,21 +116,21 @@ export class RiskManager extends AgentBase<RiskManagerState> {
     // Usually daily loss is "Net PnL" for the day.
     // If Net PnL < -maxDailyLoss, stop.
     // Let's assume data.profitLoss is the realized PnL of a trade.
-    
-    // Simplification: We track accumulated negative PnL? 
+
+    // Simplification: We track accumulated negative PnL?
     // Or just accumulated PnL.
-    
+
     // Let's assume we want to track "Drawdown from start of day".
     // For now, let's just track realized PnL accumulator.
-    
+
     // NOTE: This is a placeholder. Real implementation needs a proper PnL tracker.
     this.state.dailyLoss -= data.profitLoss; // If profit positive, dailyLoss decreases (good).
-    
+
     if (this.state.dailyLoss > this.state.maxDailyLoss) {
       this.state.killSwitchActive = true;
       this.log("warn", "Max daily loss exceeded. Kill switch activated.");
     }
-    
+
     await this.saveState();
   }
 
@@ -139,18 +141,19 @@ export class RiskManager extends AgentBase<RiskManagerState> {
     if (this.state.killSwitchActive) {
       return { approved: false, reason: "Kill switch active" };
     }
-    
+
     // Use equity to calculate % drawdown if needed
     if (equity > 0) {
-        const drawdownPct = (currentDrawdown / equity) * 100;
-        if (drawdownPct > 10) { // Example 10% max drawdown
-            return { approved: false, reason: `Drawdown (${drawdownPct.toFixed(1)}%) exceeds limit` };
-        }
+      const drawdownPct = (currentDrawdown / equity) * 100;
+      if (drawdownPct > 10) {
+        // Example 10% max drawdown
+        return { approved: false, reason: `Drawdown (${drawdownPct.toFixed(1)}%) exceeds limit` };
+      }
     }
 
     // Check open exposure or other risk metrics here
     if (currentDrawdown > this.state.maxDailyLoss) {
-       return { approved: false, reason: `Drawdown ($${currentDrawdown.toFixed(2)}) exceeds max daily loss` };
+      return { approved: false, reason: `Drawdown ($${currentDrawdown.toFixed(2)}) exceeds max daily loss` };
     }
 
     return { approved: true };

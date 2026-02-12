@@ -213,6 +213,10 @@ interface PremarketPlan {
 interface AgentState {
   config: AgentConfig;
   signalCache: Signal[];
+  signalCacheBytesEstimate: number;
+  signalCachePeakBytes: number;
+  signalCacheCleanupCount: number;
+  signalCacheLastCleanupAt: number;
   positionEntries: Record<string, PositionEntry>;
   socialHistory: Record<string, SocialHistoryEntry[]>;
   logs: LogEntry[];
@@ -228,6 +232,8 @@ interface AgentState {
   twitterConfirmations: Record<string, TwitterConfirmation>;
   twitterDailyReads: number;
   twitterDailyReadReset: number;
+  twitterReadTokens: number;
+  twitterReadLastRefill: number;
   premarketPlan: PremarketPlan | null;
   lastBrokerAuthError?: { at: number; message: string };
   lastLLMAuthError?: { at: number; message: string };
@@ -325,9 +331,35 @@ const DEFAULT_CONFIG: AgentConfig = {
   allowed_exchanges: ["NYSE", "NASDAQ", "ARCA", "AMEX", "BATS"],
 };
 
+type GathererSource = "stocktwits" | "reddit" | "crypto" | "sec";
+
+const SIGNAL_CACHE_MAX = 200;
+const SIGNAL_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+const SIGNAL_CACHE_MEMORY_BUDGET_BYTES = 5 * 1024 * 1024; // 5MB soft cap for persisted signal cache
+const SIGNAL_CACHE_EMERGENCY_MIN = 80;
+
+const DATA_GATHERER_TIMEOUT_MS: Record<GathererSource, number> = {
+  stocktwits: 6_000,
+  reddit: 6_000,
+  crypto: 4_000,
+  sec: 5_000,
+};
+
+const RESEARCH_MAX_CONCURRENT = 3;
+const RESEARCH_BATCH_DELAY_MS = 200;
+
+const TWITTER_DAILY_READ_LIMIT = 200;
+const TWITTER_BUCKET_CAPACITY = 20;
+const TWITTER_BUCKET_REFILL_PER_SECOND = TWITTER_DAILY_READ_LIMIT / 86_400;
+const TWITTER_BUCKET_DAY_MS = 86_400_000;
+
 const DEFAULT_STATE: AgentState = {
   config: DEFAULT_CONFIG,
   signalCache: [],
+  signalCacheBytesEstimate: 0,
+  signalCachePeakBytes: 0,
+  signalCacheCleanupCount: 0,
+  signalCacheLastCleanupAt: 0,
   positionEntries: {},
   socialHistory: {},
   logs: [],
@@ -343,6 +375,8 @@ const DEFAULT_STATE: AgentState = {
   twitterConfirmations: {},
   twitterDailyReads: 0,
   twitterDailyReadReset: 0,
+  twitterReadTokens: TWITTER_BUCKET_CAPACITY,
+  twitterReadLastRefill: 0,
   premarketPlan: null,
   enabled: false,
 };
@@ -862,21 +896,21 @@ export class OwokxHarness extends DurableObject<Env> {
       const stored = await this.ctx.storage.get<AgentState>("state");
       if (stored) {
         this.state = { ...DEFAULT_STATE, ...stored };
-        
+
         // AUTO-CORRECTION: Fix corrupted crypto_symbols in persisted state
         if (this.state.config.crypto_symbols && Array.isArray(this.state.config.crypto_symbols)) {
-           const fixedSymbols = this.state.config.crypto_symbols.map(s => {
-              if (s.endsWith("USDTTT")) return s.replace("USDTTT", "USDT");
-              if (s.endsWith("USDTT")) return s.replace("USDTT", "USDT");
-              return s;
-           });
-           
-           // If changes were made, save them immediately
-           if (JSON.stringify(fixedSymbols) !== JSON.stringify(this.state.config.crypto_symbols)) {
-              this.state.config.crypto_symbols = fixedSymbols;
-              console.log("[OwokxHarness] Fixed corrupted crypto_symbols in state:", fixedSymbols);
-              await this.persist();
-           }
+          const fixedSymbols = this.state.config.crypto_symbols.map((s) => {
+            if (s.endsWith("USDTTT")) return s.replace("USDTTT", "USDT");
+            if (s.endsWith("USDTT")) return s.replace("USDTT", "USDT");
+            return s;
+          });
+
+          // If changes were made, save them immediately
+          if (JSON.stringify(fixedSymbols) !== JSON.stringify(this.state.config.crypto_symbols)) {
+            this.state.config.crypto_symbols = fixedSymbols;
+            console.log("[OwokxHarness] Fixed corrupted crypto_symbols in state:", fixedSymbols);
+            await this.persist();
+          }
         }
       }
       this.initializeLLM();
@@ -935,7 +969,7 @@ export class OwokxHarness extends DurableObject<Env> {
         const stub = this.env.RISK_MANAGER.get(id);
         const res = await stub.fetch("http://risk/status");
         if (res.ok) {
-          const data = await res.json() as { killSwitchActive: boolean };
+          const data = (await res.json()) as { killSwitchActive: boolean };
           if (data.killSwitchActive) {
             this.log("System", "kill_switch_from_risk_manager", {
               reason: "RiskManager kill switch is active",
@@ -967,10 +1001,10 @@ export class OwokxHarness extends DurableObject<Env> {
 
       const res = await stub.fetch("http://registry/health");
       if (res.ok) {
-        const data = await res.json() as { healthy: boolean };
+        const data = (await res.json()) as { healthy: boolean };
         return data.healthy;
       }
-      
+
       this.log("System", "swarm_health_check_failed", { status: res.status });
       return false;
     } catch (e) {
@@ -983,10 +1017,12 @@ export class OwokxHarness extends DurableObject<Env> {
     if (!snapshot) return false;
     // Task 4: Market data integrity
     const MAX_AGE_MS = 10_000; // 10 seconds
-    const dataTimestamp = snapshot.latest_trade?.timestamp ? new Date(snapshot.latest_trade.timestamp).getTime() : Date.now();
+    const dataTimestamp = snapshot.latest_trade?.timestamp
+      ? new Date(snapshot.latest_trade.timestamp).getTime()
+      : Date.now();
     if (Date.now() - dataTimestamp > MAX_AGE_MS) {
-       this.log("System", "stale_market_data", { symbol: snapshot.symbol, age_ms: Date.now() - dataTimestamp });
-       return false;
+      this.log("System", "stale_market_data", { symbol: snapshot.symbol, age_ms: Date.now() - dataTimestamp });
+      return false;
     }
     return true;
   }
@@ -1569,36 +1605,148 @@ export class OwokxHarness extends DurableObject<Env> {
 
   private async runDataGatherers(): Promise<void> {
     this.log("System", "gathering_data", {});
+    const startedAt = Date.now();
 
-    await tickerCache.refreshSecTickersIfNeeded();
+    try {
+      await this.withTimeout(tickerCache.refreshSecTickersIfNeeded(), 3_000, "sec_ticker_refresh_timeout");
+    } catch (error) {
+      this.log("System", "sec_ticker_refresh_failed", { error: String(error) });
+    }
 
-    const [stocktwitsSignals, redditSignals, cryptoSignals, secSignals] = await Promise.all([
-      this.gatherStockTwits(),
-      this.gatherReddit(),
-      this.gatherCrypto(),
-      this.gatherSECFilings(),
-    ]);
+    const gatherers: Array<{ source: GathererSource; run: () => Promise<Signal[]> }> = [
+      { source: "stocktwits", run: () => this.gatherStockTwits() },
+      { source: "reddit", run: () => this.gatherReddit() },
+      { source: "crypto", run: () => this.gatherCrypto() },
+      { source: "sec", run: () => this.gatherSECFilings() },
+    ];
 
-    const allSignals = [...stocktwitsSignals, ...redditSignals, ...cryptoSignals, ...secSignals];
+    const sourceCounts: Record<GathererSource, number> = {
+      stocktwits: 0,
+      reddit: 0,
+      crypto: 0,
+      sec: 0,
+    };
+    const sourceDurations: Partial<Record<GathererSource, number>> = {};
 
-    const MAX_SIGNALS = 200;
-    const MAX_AGE_MS = 24 * 60 * 60 * 1000;
-    const now = Date.now();
+    const settled = await Promise.allSettled(
+      gatherers.map(async (gatherer) => {
+        const sourceStart = Date.now();
+        const signals = await this.withTimeout(
+          gatherer.run(),
+          DATA_GATHERER_TIMEOUT_MS[gatherer.source],
+          `${gatherer.source}_gather_timeout`
+        );
+        return {
+          source: gatherer.source,
+          signals,
+          durationMs: Date.now() - sourceStart,
+        };
+      })
+    );
 
-    const freshSignals = allSignals
-      .filter((s) => now - s.timestamp < MAX_AGE_MS)
-      .sort((a, b) => Math.abs(b.sentiment) - Math.abs(a.sentiment))
-      .slice(0, MAX_SIGNALS);
+    const allSignals: Signal[] = [];
+    const failures: GathererSource[] = [];
 
-    this.state.signalCache = freshSignals;
+    settled.forEach((result, index) => {
+      const source = gatherers[index]!.source;
+      if (result.status === "fulfilled") {
+        sourceCounts[source] = result.value.signals.length;
+        sourceDurations[source] = result.value.durationMs;
+        allSignals.push(...result.value.signals);
+        return;
+      }
+
+      failures.push(source);
+      this.log("DataGather", "source_failed", { source, error: String(result.reason) });
+    });
+
+    this.updateSignalCache(allSignals);
 
     this.log("System", "data_gathered", {
-      stocktwits: stocktwitsSignals.length,
-      reddit: redditSignals.length,
-      crypto: cryptoSignals.length,
-      sec: secSignals.length,
+      stocktwits: sourceCounts.stocktwits,
+      reddit: sourceCounts.reddit,
+      crypto: sourceCounts.crypto,
+      sec: sourceCounts.sec,
       total: this.state.signalCache.length,
+      gather_duration_ms: Date.now() - startedAt,
+      source_durations_ms: sourceDurations,
+      failed_sources: failures,
+      signal_cache_bytes: this.state.signalCacheBytesEstimate,
     });
+  }
+
+  private updateSignalCache(incomingSignals: Signal[]): void {
+    const now = Date.now();
+    const existingSignals = Array.isArray(this.state.signalCache) ? this.state.signalCache : [];
+    const merged = [...incomingSignals, ...existingSignals].filter((signal) => this.isSignalFreshAndValid(signal, now));
+
+    // Prevent duplicate entries from growing cache footprint between runs.
+    const deduped = new Map<string, Signal>();
+    for (const signal of merged) {
+      const key = `${signal.symbol}|${signal.source_detail}`;
+      const previous = deduped.get(key);
+      if (!previous) {
+        deduped.set(key, signal);
+        continue;
+      }
+
+      const shouldReplace =
+        signal.timestamp > previous.timestamp ||
+        (signal.timestamp === previous.timestamp && Math.abs(signal.sentiment) > Math.abs(previous.sentiment));
+      if (shouldReplace) {
+        deduped.set(key, signal);
+      }
+    }
+
+    let nextSignals = Array.from(deduped.values())
+      .sort((a, b) => {
+        const sentimentDelta = Math.abs(b.sentiment) - Math.abs(a.sentiment);
+        if (sentimentDelta !== 0) return sentimentDelta;
+        return b.timestamp - a.timestamp;
+      })
+      .slice(0, SIGNAL_CACHE_MAX);
+
+    const estimatedBytes = this.estimateObjectSizeBytes(nextSignals);
+    this.state.signalCacheBytesEstimate = estimatedBytes;
+    this.state.signalCachePeakBytes = Math.max(this.state.signalCachePeakBytes, estimatedBytes);
+
+    if (estimatedBytes > SIGNAL_CACHE_MEMORY_BUDGET_BYTES) {
+      const avgBytesPerSignal = Math.max(1, Math.round(estimatedBytes / Math.max(1, nextSignals.length)));
+      const memoryBoundLimit = Math.floor(SIGNAL_CACHE_MEMORY_BUDGET_BYTES / avgBytesPerSignal);
+      const emergencyLimit = Math.max(SIGNAL_CACHE_EMERGENCY_MIN, Math.min(nextSignals.length, memoryBoundLimit));
+      nextSignals = nextSignals.slice(0, emergencyLimit);
+
+      this.state.signalCacheCleanupCount += 1;
+      this.state.signalCacheLastCleanupAt = now;
+      this.state.signalCacheBytesEstimate = this.estimateObjectSizeBytes(nextSignals);
+
+      this.log("System", "signal_cache_cleanup", {
+        before_count: deduped.size,
+        after_count: nextSignals.length,
+        estimated_bytes: estimatedBytes,
+        budget_bytes: SIGNAL_CACHE_MEMORY_BUDGET_BYTES,
+        cleanup_count: this.state.signalCacheCleanupCount,
+      });
+    }
+
+    this.state.signalCache = nextSignals;
+  }
+
+  private isSignalFreshAndValid(signal: Signal | null | undefined, now: number): signal is Signal {
+    if (!signal) return false;
+    if (!signal.symbol || !signal.source || !signal.source_detail) return false;
+    if (!Number.isFinite(signal.timestamp) || signal.timestamp <= 0) return false;
+    if (!Number.isFinite(signal.sentiment) || !Number.isFinite(signal.raw_sentiment)) return false;
+    if (now - signal.timestamp > SIGNAL_MAX_AGE_MS) return false;
+    return true;
+  }
+
+  private estimateObjectSizeBytes(value: unknown): number {
+    try {
+      return new TextEncoder().encode(JSON.stringify(value)).length;
+    } catch {
+      return 0;
+    }
   }
 
   private async gatherStockTwits(): Promise<Signal[]> {
@@ -1863,7 +2011,7 @@ export class OwokxHarness extends DurableObject<Env> {
         const isBullish = momentum > 0;
 
         let rawSentiment = hasSignificantMove && isBullish ? Math.min(Math.abs(momentum) / 5, 1) : 0.1;
-        
+
         // Safety check: Ensure sentiment is finite. Default to 0.1 (neutral-ish) or 0 if invalid.
         if (!Number.isFinite(rawSentiment)) {
           rawSentiment = 0;
@@ -2191,7 +2339,7 @@ export class OwokxHarness extends DurableObject<Env> {
         ],
         max_tokens: 250,
         temperature: 0, // Task 2: Deterministic
-        seed: 42,       // Task 2: Deterministic
+        seed: 42, // Task 2: Deterministic
         response_format: { type: "json_object" },
       });
 
@@ -2232,12 +2380,16 @@ export class OwokxHarness extends DurableObject<Env> {
       return result;
     } catch (error) {
       const errorMsg = String(error);
-      if (errorMsg.includes("Authentication Fails") || errorMsg.includes("401") || errorMsg.includes("invalid api key")) {
+      if (
+        errorMsg.includes("Authentication Fails") ||
+        errorMsg.includes("401") ||
+        errorMsg.includes("invalid api key")
+      ) {
         this.state.lastLLMAuthError = { at: Date.now(), message: errorMsg };
-        this.log("Crypto", "auth_error", { 
-          symbol, 
+        this.log("Crypto", "auth_error", {
+          symbol,
           message: "ACTION REQUIRED: Invalid LLM API Key. Research disabled for 5 minutes.",
-          details: errorMsg
+          details: errorMsg,
         });
         return null;
       }
@@ -2378,10 +2530,8 @@ export class OwokxHarness extends DurableObject<Env> {
             title = (parsed.title as string) || "";
             detail = (parsed.detail as string) || "";
             errors = parsed.errors;
-          } catch {
-          }
-        } catch {
-        }
+          } catch {}
+        } catch {}
         const rateRemaining = res.headers.get("x-rate-limit-remaining") || "";
         const rateReset = res.headers.get("x-rate-limit-reset") || "";
         this.log("X", "api_error", {
@@ -2621,8 +2771,8 @@ export class OwokxHarness extends DurableObject<Env> {
       } else {
         const snapshot = await broker.marketData.getSnapshot(symbol).catch(() => null);
         if (!this.validateMarketData(snapshot)) {
-           this.log("SignalResearch", "stale_data", { symbol });
-           return null;
+          this.log("SignalResearch", "stale_data", { symbol });
+          return null;
         }
         price =
           snapshot?.latest_trade?.price || snapshot?.latest_quote?.ask_price || snapshot?.latest_quote?.bid_price || 0;
@@ -2713,12 +2863,16 @@ export class OwokxHarness extends DurableObject<Env> {
       return result;
     } catch (error) {
       const errorMsg = String(error);
-      if (errorMsg.includes("Authentication Fails") || errorMsg.includes("401") || errorMsg.includes("invalid api key")) {
+      if (
+        errorMsg.includes("Authentication Fails") ||
+        errorMsg.includes("401") ||
+        errorMsg.includes("invalid api key")
+      ) {
         this.state.lastLLMAuthError = { at: Date.now(), message: errorMsg };
-        this.log("SignalResearch", "auth_error", { 
-          symbol, 
+        this.log("SignalResearch", "auth_error", {
+          symbol,
           message: "ACTION REQUIRED: Invalid LLM API Key. Research disabled for 5 minutes.",
-          details: errorMsg
+          details: errorMsg,
         });
         return null;
       }
@@ -2820,7 +2974,7 @@ Provide a brief risk assessment and recommendation (HOLD, SELL, or ADD). JSON fo
         ],
         max_tokens: 200,
         temperature: 0, // Task 2: Deterministic
-        seed: 42,       // Task 2: Deterministic
+        seed: 42, // Task 2: Deterministic
         response_format: { type: "json_object" },
       });
 
@@ -3307,7 +3461,7 @@ Response format:
         });
 
         if (res.ok) {
-          const { approved, reason } = await res.json() as { approved: boolean; reason?: string };
+          const { approved, reason } = (await res.json()) as { approved: boolean; reason?: string };
           if (!approved) {
             this.log("Executor", "buy_blocked_by_risk_manager", { symbol, reason });
             return false;

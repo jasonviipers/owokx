@@ -287,7 +287,9 @@ export class OwokxMcpAgent extends McpAgent<Env> {
             message: `Position close order submitted`,
             order: { id: order.id, symbol: order.symbol, status: order.status },
             kill_switch_active: riskState.kill_switch_active,
-            kill_switch_reason: riskState.kill_switch_active ? (riskState.kill_switch_reason ?? "Kill switch active") : null,
+            kill_switch_reason: riskState.kill_switch_active
+              ? (riskState.kill_switch_reason ?? "Kill switch active")
+              : null,
           });
 
           return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };

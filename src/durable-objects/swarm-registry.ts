@@ -1,4 +1,3 @@
-
 import { AgentBase, type AgentBaseState } from "../lib/agents/base";
 import {
   createMessageId,
@@ -116,7 +115,7 @@ export class SwarmRegistry extends AgentBase<RegistryState> {
     const path = url.pathname;
 
     if (path === "/register") {
-      const status = await request.json() as AgentStatus;
+      const status = (await request.json()) as AgentStatus;
       await this.handleRegister(status);
       return new Response(JSON.stringify({ success: true }), {
         headers: { "Content-Type": "application/json" },
@@ -138,7 +137,7 @@ export class SwarmRegistry extends AgentBase<RegistryState> {
     }
 
     if (path === "/subscriptions/subscribe" && request.method === "POST") {
-      const body = await request.json() as { agentId?: string; topic?: string };
+      const body = (await request.json()) as { agentId?: string; topic?: string };
       if (!body.agentId || !body.topic) {
         return new Response(JSON.stringify({ error: "agentId and topic are required" }), {
           status: 400,
@@ -152,7 +151,7 @@ export class SwarmRegistry extends AgentBase<RegistryState> {
     }
 
     if (path === "/subscriptions/unsubscribe" && request.method === "POST") {
-      const body = await request.json() as { agentId?: string; topic?: string };
+      const body = (await request.json()) as { agentId?: string; topic?: string };
       if (!body.agentId || !body.topic) {
         return new Response(JSON.stringify({ error: "agentId and topic are required" }), {
           status: 400,
@@ -166,7 +165,7 @@ export class SwarmRegistry extends AgentBase<RegistryState> {
     }
 
     if (path === "/queue/enqueue" && request.method === "POST") {
-      const body = await request.json() as {
+      const body = (await request.json()) as {
         message?: AgentMessage;
         delayMs?: number;
         maxAttempts?: number;
@@ -179,16 +178,19 @@ export class SwarmRegistry extends AgentBase<RegistryState> {
       }
 
       const queued = await this.enqueueMessage(body.message, body.delayMs, body.maxAttempts);
-      return new Response(JSON.stringify({
-        ok: true,
-        queueId: queued.queueId,
-      }), {
-        headers: { "Content-Type": "application/json" },
-      });
+      return new Response(
+        JSON.stringify({
+          ok: true,
+          queueId: queued.queueId,
+        }),
+        {
+          headers: { "Content-Type": "application/json" },
+        }
+      );
     }
 
     if (path === "/queue/publish" && request.method === "POST") {
-      const body = await request.json() as {
+      const body = (await request.json()) as {
         source?: string;
         topic?: string;
         payload?: unknown;
@@ -224,7 +226,7 @@ export class SwarmRegistry extends AgentBase<RegistryState> {
     }
 
     if (path === "/queue/dispatch" && request.method === "POST") {
-      const body = await request.json().catch(() => ({})) as { limit?: number };
+      const body = (await request.json().catch(() => ({}))) as { limit?: number };
       const limit = body.limit ?? 50;
       const result = await this.dispatchQueue(Math.max(1, Math.min(limit, 200)));
       return new Response(JSON.stringify(result), {
@@ -233,15 +235,18 @@ export class SwarmRegistry extends AgentBase<RegistryState> {
     }
 
     if (path === "/queue/state" && request.method === "GET") {
-      return new Response(JSON.stringify({
-        queued: this.state.queueOrder.length,
-        deadLettered: Object.keys(this.state.deadLetterQueue).length,
-        stats: this.state.deliveryStats,
-        routingState: this.state.routingState,
-        staleAgents: this.countStaleAgents(),
-      }), {
-        headers: { "Content-Type": "application/json" },
-      });
+      return new Response(
+        JSON.stringify({
+          queued: this.state.queueOrder.length,
+          deadLettered: Object.keys(this.state.deadLetterQueue).length,
+          stats: this.state.deliveryStats,
+          routingState: this.state.routingState,
+          staleAgents: this.countStaleAgents(),
+        }),
+        {
+          headers: { "Content-Type": "application/json" },
+        }
+      );
     }
 
     if (path === "/routing/preview" && request.method === "GET") {
@@ -260,7 +265,7 @@ export class SwarmRegistry extends AgentBase<RegistryState> {
     }
 
     if (path === "/recovery/requeue-dead-letter" && request.method === "POST") {
-      const body = await request.json().catch(() => ({})) as { limit?: number };
+      const body = (await request.json().catch(() => ({}))) as { limit?: number };
       const limit = Number.isFinite(body.limit) ? Math.max(1, Math.min(Number(body.limit), 500)) : 50;
       const result = await this.requeueDeadLetter(limit);
       return new Response(JSON.stringify(result), {
@@ -269,7 +274,7 @@ export class SwarmRegistry extends AgentBase<RegistryState> {
     }
 
     if (path === "/recovery/prune-stale-agents" && request.method === "POST") {
-      const body = await request.json().catch(() => ({})) as { staleMs?: number };
+      const body = (await request.json().catch(() => ({}))) as { staleMs?: number };
       const staleMs = Number.isFinite(body.staleMs) ? Math.max(60_000, Number(body.staleMs)) : HEARTBEAT_STALE_MS * 2;
       const result = await this.pruneStaleAgents(staleMs);
       return new Response(JSON.stringify(result), {
@@ -278,16 +283,21 @@ export class SwarmRegistry extends AgentBase<RegistryState> {
     }
 
     if (path === "/health") {
-      const activeAgents = Object.values(this.state.agents).filter((a) => Date.now() - a.lastHeartbeat < HEARTBEAT_STALE_MS).length;
-      return new Response(JSON.stringify({
-        healthy: true,
-        active_agents: activeAgents,
-        total_agents: Object.keys(this.state.agents).length,
-        queue_depth: this.state.queueOrder.length,
-        dead_letter_depth: Object.keys(this.state.deadLetterQueue).length,
-      }), {
-        headers: { "Content-Type": "application/json" },
-      });
+      const activeAgents = Object.values(this.state.agents).filter(
+        (a) => Date.now() - a.lastHeartbeat < HEARTBEAT_STALE_MS
+      ).length;
+      return new Response(
+        JSON.stringify({
+          healthy: true,
+          active_agents: activeAgents,
+          total_agents: Object.keys(this.state.agents).length,
+          queue_depth: this.state.queueOrder.length,
+          dead_letter_depth: Object.keys(this.state.deadLetterQueue).length,
+        }),
+        {
+          headers: { "Content-Type": "application/json" },
+        }
+      );
     }
 
     return super.handleCustomFetch(request, url);
@@ -341,11 +351,7 @@ export class SwarmRegistry extends AgentBase<RegistryState> {
     return true;
   }
 
-  private async enqueueMessage(
-    message: AgentMessage,
-    delayMs = 0,
-    maxAttempts = 3
-  ): Promise<QueuedMessage> {
+  private async enqueueMessage(message: AgentMessage, delayMs = 0, maxAttempts = 3): Promise<QueuedMessage> {
     if (!this.isValidMessage(message)) {
       throw new Error("Invalid message payload");
     }
@@ -641,7 +647,10 @@ export class SwarmRegistry extends AgentBase<RegistryState> {
     return selected.id;
   }
 
-  private previewRouting(agentType: AgentType, count: number): {
+  private previewRouting(
+    agentType: AgentType,
+    count: number
+  ): {
     agentType: AgentType;
     targets: string[];
   } {

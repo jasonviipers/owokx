@@ -1,11 +1,4 @@
-
-export type AgentType = 
-  | "scout" 
-  | "analyst" 
-  | "trader" 
-  | "risk_manager" 
-  | "learning"
-  | "registry";
+export type AgentType = "scout" | "analyst" | "trader" | "risk_manager" | "learning" | "registry";
 
 export type MessageType = "COMMAND" | "EVENT" | "QUERY" | "RESPONSE";
 export type MessagePriority = "low" | "normal" | "high" | "critical";

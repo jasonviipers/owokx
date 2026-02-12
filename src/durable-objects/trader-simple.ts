@@ -1,6 +1,6 @@
 /**
  * Trader - Simplified Durable Object for Order Execution
- * 
+ *
  * Follows the same pattern as OwokxHarness for consistency.
  */
 
@@ -135,12 +135,12 @@ export class TraderSimple extends AgentBase<TraderState> {
 
   private async handleBuy(request: Request): Promise<Response> {
     try {
-      const { symbol, confidence, account } = await request.json() as {
+      const { symbol, confidence, account } = (await request.json()) as {
         symbol: string;
         confidence: number;
         account: { cash: number };
       };
-      
+
       const result = await this.executeBuy(symbol, confidence, account);
       return new Response(JSON.stringify({ success: result }), {
         headers: { "Content-Type": "application/json" },
@@ -155,11 +155,11 @@ export class TraderSimple extends AgentBase<TraderState> {
 
   private async handleSell(request: Request): Promise<Response> {
     try {
-      const { symbol, reason } = await request.json() as {
+      const { symbol, reason } = (await request.json()) as {
         symbol: string;
         reason: string;
       };
-      
+
       const result = await this.executeSell(symbol, reason);
       return new Response(JSON.stringify({ success: result }), {
         headers: { "Content-Type": "application/json" },
@@ -235,21 +235,20 @@ export class TraderSimple extends AgentBase<TraderState> {
     const lastTradeAge = now - this.state.lastTradeTime;
     const isHealthy = lastTradeAge < 3600000; // 1 hour
 
-    return new Response(JSON.stringify({
-      healthy: isHealthy,
-      lastTradeTime: this.state.lastTradeTime,
-      lastTradeAgeMs: lastTradeAge,
-      tradeCount: this.state.tradeHistory.length,
-    }), {
-      headers: { "Content-Type": "application/json" },
-    });
+    return new Response(
+      JSON.stringify({
+        healthy: isHealthy,
+        lastTradeTime: this.state.lastTradeTime,
+        lastTradeAgeMs: lastTradeAge,
+        tradeCount: this.state.tradeHistory.length,
+      }),
+      {
+        headers: { "Content-Type": "application/json" },
+      }
+    );
   }
 
-  private async executeBuy(
-    symbol: string,
-    confidence: number,
-    account: { cash: number }
-  ): Promise<boolean> {
+  private async executeBuy(symbol: string, confidence: number, account: { cash: number }): Promise<boolean> {
     // Input validation
     if (!symbol || symbol.trim().length === 0) {
       this.recordTrade(symbol, "buy", 0, false, "Empty symbol");
@@ -336,14 +335,8 @@ export class TraderSimple extends AgentBase<TraderState> {
       });
 
       const success = execution.submission.state === "SUBMITTED" || execution.submission.state === "SUBMITTING";
-      
-      this.recordTrade(
-        symbol,
-        "buy",
-        positionSize,
-        success,
-        undefined
-      );
+
+      this.recordTrade(symbol, "buy", positionSize, success, undefined);
 
       if (success) {
         this.state.lastTradeTime = Date.now();
@@ -374,10 +367,7 @@ export class TraderSimple extends AgentBase<TraderState> {
     }
   }
 
-  private async executeSell(
-    symbol: string,
-    reason: string
-  ): Promise<boolean> {
+  private async executeSell(symbol: string, reason: string): Promise<boolean> {
     // Input validation
     if (!symbol || symbol.trim().length === 0) {
       this.recordTrade(symbol, "sell", 0, false, "Empty symbol");
@@ -392,7 +382,7 @@ export class TraderSimple extends AgentBase<TraderState> {
     try {
       const broker = createBrokerProviders(this.env, "alpaca");
       const position = await broker.trading.getPosition(symbol).catch(() => null);
-      
+
       if (!position) {
         this.recordTrade(symbol, "sell", 0, false, "Position not found");
         await this.publishTradeOutcome({
@@ -425,14 +415,8 @@ export class TraderSimple extends AgentBase<TraderState> {
       });
 
       const success = execution.submission.state === "SUBMITTED" || execution.submission.state === "SUBMITTING";
-      
-      this.recordTrade(
-        position.symbol,
-        "sell",
-        position.market_value,
-        success,
-        undefined
-      );
+
+      this.recordTrade(position.symbol, "sell", position.market_value, success, undefined);
 
       if (success) {
         this.state.lastTradeTime = Date.now();
@@ -462,13 +446,7 @@ export class TraderSimple extends AgentBase<TraderState> {
     }
   }
 
-  private recordTrade(
-    symbol: string,
-    side: "buy" | "sell",
-    size: number,
-    success: boolean,
-    error?: string
-  ): void {
+  private recordTrade(symbol: string, side: "buy" | "sell", size: number, success: boolean, error?: string): void {
     const trade = {
       symbol,
       side,
@@ -477,9 +455,9 @@ export class TraderSimple extends AgentBase<TraderState> {
       success,
       error,
     };
-    
+
     this.state.tradeHistory.push(trade);
-    
+
     // Keep history manageable
     if (this.state.tradeHistory.length > 100) {
       this.state.tradeHistory = this.state.tradeHistory.slice(-50);
@@ -502,7 +480,7 @@ export class TraderSimple extends AgentBase<TraderState> {
     try {
       const response = await learningAgent.fetch("http://learning/strategy");
       if (!response.ok) return;
-      const strategy = await response.json() as {
+      const strategy = (await response.json()) as {
         minConfidenceBuy?: number;
         maxPositionNotional?: number;
         riskMultiplier?: number;
@@ -531,14 +509,16 @@ export class TraderSimple extends AgentBase<TraderState> {
   }
 
   private async applyStrategyUpdate(payload: unknown): Promise<void> {
-    const strategy = (payload as {
-      strategy?: {
-        minConfidenceBuy?: number;
-        maxPositionNotional?: number;
-        riskMultiplier?: number;
-        updatedAt?: number;
-      };
-    })?.strategy;
+    const strategy = (
+      payload as {
+        strategy?: {
+          minConfidenceBuy?: number;
+          maxPositionNotional?: number;
+          riskMultiplier?: number;
+          updatedAt?: number;
+        };
+      }
+    )?.strategy;
 
     if (
       !strategy ||
@@ -559,7 +539,10 @@ export class TraderSimple extends AgentBase<TraderState> {
     await this.saveState();
   }
 
-  private async getLearningAdvice(symbol: string, confidence: number): Promise<{
+  private async getLearningAdvice(
+    symbol: string,
+    confidence: number
+  ): Promise<{
     approved: boolean;
     adjustedConfidence: number;
     reasons: string[];
@@ -587,7 +570,7 @@ export class TraderSimple extends AgentBase<TraderState> {
         };
       }
 
-      const payload = await response.json() as {
+      const payload = (await response.json()) as {
         approved?: boolean;
         adjustedConfidence?: number;
         reasons?: string[];
@@ -634,7 +617,7 @@ export class TraderSimple extends AgentBase<TraderState> {
         return { approved: false, reason: `Risk manager unavailable (${response.status})` };
       }
 
-      const payload = await response.json() as RiskValidationResult;
+      const payload = (await response.json()) as RiskValidationResult;
       return payload;
     } catch (error) {
       return { approved: false, reason: `Risk manager error: ${String(error)}` };
@@ -664,10 +647,8 @@ export class TraderSimple extends AgentBase<TraderState> {
     // Clean up old trade history (older than 7 days)
     const now = Date.now();
     const sevenDaysAgo = now - 7 * 24 * 60 * 60 * 1000;
-    
-    this.state.tradeHistory = this.state.tradeHistory.filter(
-      trade => trade.timestamp >= sevenDaysAgo
-    );
+
+    this.state.tradeHistory = this.state.tradeHistory.filter((trade) => trade.timestamp >= sevenDaysAgo);
 
     await this.saveState();
     await super.alarm();

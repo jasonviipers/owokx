@@ -22,9 +22,7 @@ function createId(id: string): DurableObjectId {
   return { toString: () => id } as unknown as DurableObjectId;
 }
 
-function createNamespace(
-  fetchImpl?: (request: Request) => Promise<Response> | Response
-): DurableObjectNamespace {
+function createNamespace(fetchImpl?: (request: Request) => Promise<Response> | Response): DurableObjectNamespace {
   const impl = fetchImpl ?? (() => new Response(JSON.stringify({ ok: true }), { status: 200 }));
   return {
     idFromName: (name: string) => createId(name),
@@ -126,7 +124,7 @@ describe("swarm monitoring routes", () => {
       createEnv({ SWARM_REGISTRY: registryNamespace }),
       {} as ExecutionContext
     );
-    const payload = await response.json() as {
+    const payload = (await response.json()) as {
       healthy: boolean;
       degraded: boolean;
       deadLettered: number;
@@ -188,7 +186,7 @@ describe("swarm monitoring routes", () => {
       createEnv({ SWARM_REGISTRY: registryNamespace }),
       {} as ExecutionContext
     );
-    const payload = await response.json() as {
+    const payload = (await response.json()) as {
       agents: {
         total: number;
         byType: Record<string, number>;
