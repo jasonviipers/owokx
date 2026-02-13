@@ -1,0 +1,236 @@
+{
+	"$schema": "https://raw.githubusercontent.com/cloudflare/workers-sdk/main/packages/wrangler/config-schema.json",
+	"name": "owokx",
+	"main": "src/index.ts",
+	"compatibility_date": "2024-12-01",
+	"compatibility_flags": [
+		"nodejs_compat"
+	],
+	"vars": {
+		"ENVIRONMENT": "staging",
+		"FEATURE_LLM_RESEARCH": "true",
+		"FEATURE_OPTIONS": "true",
+		"DEFAULT_MAX_POSITION_PCT": "0.10",
+		"DEFAULT_MAX_NOTIONAL_PER_TRADE": "5000",
+		"DEFAULT_MAX_DAILY_LOSS_PCT": "0.02",
+		"DEFAULT_COOLDOWN_MINUTES": "30",
+		"DEFAULT_MAX_OPEN_POSITIONS": "10",
+		"DEFAULT_APPROVAL_TTL_SECONDS": "300"
+	},
+	"env": {
+		"production": {
+			"vars": {
+				"ENVIRONMENT": "production",
+				"FEATURE_LLM_RESEARCH": "true",
+				"FEATURE_OPTIONS": "true",
+				"DEFAULT_MAX_POSITION_PCT": "0.10",
+				"DEFAULT_MAX_NOTIONAL_PER_TRADE": "5000",
+				"DEFAULT_MAX_DAILY_LOSS_PCT": "0.02",
+				"DEFAULT_COOLDOWN_MINUTES": "30",
+				"DEFAULT_MAX_OPEN_POSITIONS": "10",
+				"DEFAULT_APPROVAL_TTL_SECONDS": "300"
+			},
+			"d1_databases": [
+				{
+					"binding": "Okx_db",
+					"database_name": "Okx-db",
+					"database_id": "7d388d30-92d0-4bd0-a13d-d4231b307f70",
+					"remote": true
+				}
+			],
+			"kv_namespaces": [
+				{
+					"binding": "okx_cache",
+					"id": "99c5d6c0ae3c48409c255a094c4b8918",
+					"remote": true
+				}
+			],
+			"r2_buckets": [
+				{
+					"binding": "ARTIFACTS",
+					"bucket_name": "owokx-artifacts"
+				}
+			],
+			"durable_objects": {
+				"bindings": [
+					{
+						"name": "SESSION",
+						"class_name": "SessionDO"
+					},
+					{
+						"name": "MCP_AGENT",
+						"class_name": "owokxMcpAgent"
+					},
+					{
+						"name": "OWOKX_HARNESS",
+						"class_name": "owokxHarness"
+					},
+					{
+						"name": "DATA_SCOUT",
+						"class_name": "DataScout"
+					},
+					{
+						"name": "ANALYST",
+						"class_name": "Analyst"
+					},
+					{
+						"name": "TRADER",
+						"class_name": "Trader"
+					},
+					{
+						"name": "SWARM_REGISTRY",
+						"class_name": "SwarmRegistry"
+					},
+					{
+						"name": "RISK_MANAGER",
+						"class_name": "RiskManager"
+					},
+					{
+						"name": "LEARNING_AGENT",
+						"class_name": "LearningAgent"
+					}
+				]
+			}
+		}
+	},
+	// Secrets (set via `wrangler secret put <NAME>`):
+	// Required:
+	// - OWOKX_API_TOKEN (API authentication - generate with: openssl rand -base64 48)
+	// - KILL_SWITCH_SECRET (emergency kill switch + approval token signing)
+	// - BROKER_PROVIDER ("alpaca" | "okx", default: "alpaca")
+	//
+	// Broker credentials (based on BROKER_PROVIDER):
+	// Alpaca:
+	// - ALPACA_API_KEY
+	// - ALPACA_API_SECRET
+	// - ALPACA_PAPER ("true" for paper trading)
+	// OKX:
+	// - OKX_API_KEY
+	// - OKX_SECRET
+	// - OKX_PASSPHRASE
+	// - OKX_SIMULATED_TRADING ("true" to enable demo trading)
+	// 
+	// LLM Provider (choose one mode):
+	// - LLM_PROVIDER ("openai-raw" | "ai-sdk" | "vercel-gateway", default: "openai-raw")
+	// - LLM_MODEL (model identifier, e.g. "gpt-4o-mini" or "anthropic/claude-sonnet-4")
+	//
+	// Provider API Keys (based on LLM_PROVIDER mode):
+	// - OPENAI_API_KEY (for openai-raw, or ai-sdk with OpenAI models)
+	// - OPENAI_BASE_URL (optional override for OpenAI-compatible proxy; affects openai-raw and ai-sdk OpenAI models)
+	// - ANTHROPIC_API_KEY (for ai-sdk with Anthropic models)
+	// - GOOGLE_GENERATIVE_AI_API_KEY (for ai-sdk with Google models)
+	// - XAI_API_KEY (for ai-sdk with xAI/Grok models)
+	// - DEEPSEEK_API_KEY (for ai-sdk with DeepSeek models)
+	// - AI_GATEWAY_API_KEY (for vercel-gateway unified access)
+	//
+	// Optional:
+	// - TWITTER_BEARER_TOKEN
+	// - DISCORD_WEBHOOK_URL
+	"d1_databases": [
+		{
+			"binding": "Okx_db",
+			"database_name": "Okx-db",
+			"database_id": "7d388d30-92d0-4bd0-a13d-d4231b307f70",
+			"remote": true
+		}
+	],
+	"kv_namespaces": [
+		{
+			"binding": "okx_cache",
+			"id": "99c5d6c0ae3c48409c255a094c4b8918",
+			"remote": true
+		}
+	],
+	"r2_buckets": [
+		{
+			"binding": "ARTIFACTS",
+			"bucket_name": "owokx-artifacts"
+		}
+	],
+	"durable_objects": {
+		"bindings": [
+			{
+				"name": "SESSION",
+				"class_name": "SessionDO"
+			},
+			{
+				"name": "MCP_AGENT",
+				"class_name": "owokxMcpAgent"
+			},
+			{
+				"name": "OWOKX_HARNESS",
+				"class_name": "owokxHarness"
+			},
+			{
+				"name": "DATA_SCOUT",
+				"class_name": "DataScout"
+			},
+			{
+				"name": "ANALYST",
+				"class_name": "Analyst"
+			},
+			{
+				"name": "TRADER",
+				"class_name": "Trader"
+			},
+			{
+				"name": "SWARM_REGISTRY",
+				"class_name": "SwarmRegistry"
+			},
+			{
+				"name": "RISK_MANAGER",
+				"class_name": "RiskManager"
+			},
+			{
+				"name": "LEARNING_AGENT",
+				"class_name": "LearningAgent"
+			}
+		]
+	},
+	"migrations": [
+		{
+			"tag": "v1",
+			"new_sqlite_classes": [
+				"SessionDO",
+				"owokxMcpAgent",
+				"owokxHarness"
+			]
+		},
+		{
+			"tag": "v2",
+			"new_sqlite_classes": [
+				"DataScout",
+				"Analyst",
+				"Trader"
+			]
+		},
+		{
+			"tag": "v3",
+			"new_sqlite_classes": [
+				"SwarmRegistry",
+				"RiskManager"
+			]
+		},
+		{
+			"tag": "v4",
+			"new_sqlite_classes": [
+				"LearningAgent"
+			]
+		}
+	],
+	"triggers": {
+		"crons": [
+			"*/5 13-20 * * 1-5",
+			"0 14 * * 1-5",
+			"30 21 * * 1-5",
+			"0 5 * * *",
+			"0 * * * *"
+		]
+	},
+	"build": {
+		"command": "npm run build"
+	},
+	"dev": {
+		"port": 8787
+	}
+}
