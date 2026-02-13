@@ -9,7 +9,9 @@ import type { Env } from "../env.d";
 import type { AgentMessage, AgentType } from "../lib/agents/protocol";
 import { extractTickers, DEFAULT_TICKER_BLACKLIST } from "../lib/ticker";
 
-type SourceName = "stocktwits" | "reddit";
+type SourceName = "stocktwits" | "reddit" | "alphavantage";
+
+const REDDIT_BACKUP_SUBREDDITS = ["wallstreetbets", "stocks", "investing", "options"] as const;
 
 interface SourceHealth {
   failures: number;
@@ -53,6 +55,12 @@ function createDefaultSourceHealth(): Record<SourceName, SourceHealth> {
       lastFailureAt: 0,
     },
     reddit: {
+      failures: 0,
+      circuitOpenUntil: 0,
+      lastSuccessAt: 0,
+      lastFailureAt: 0,
+    },
+    alphavantage: {
       failures: 0,
       circuitOpenUntil: 0,
       lastSuccessAt: 0,
@@ -103,7 +111,14 @@ export class DataScoutSimple extends AgentBase<DataScoutState> {
   }
 
   protected getCapabilities(): string[] {
-    return ["gather_signals", "get_signals", "publish_signals", "pipeline_optimized", "source_circuit_breaker"];
+    return [
+      "gather_signals",
+      "get_signals",
+      "publish_signals",
+      "pipeline_optimized",
+      "source_circuit_breaker",
+      "alphavantage_news_sentiment",
+    ];
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -179,15 +194,16 @@ export class DataScoutSimple extends AgentBase<DataScoutState> {
   private async runGatherCycle(): Promise<void> {
     const startedAt = Date.now();
 
-    const [stocktwitsResult, redditResult] = await Promise.all([
+    const [stocktwitsResult, redditResult, alphaVantageResult] = await Promise.all([
       this.runSourceWithCircuitBreaker("stocktwits", () => this.gatherStockTwits()),
       this.runSourceWithCircuitBreaker("reddit", () => this.gatherReddit()),
+      this.runSourceWithCircuitBreaker("alphavantage", () => this.gatherAlphaVantage()),
     ]);
 
     this.cleanupStaleSignals();
 
     const cycleMs = Date.now() - startedAt;
-    const hadAnySuccess = stocktwitsResult.success || redditResult.success;
+    const hadAnySuccess = stocktwitsResult.success || redditResult.success || alphaVantageResult.success;
     this.updatePipelineMetrics(cycleMs, hadAnySuccess);
     if (hadAnySuccess) {
       this.state.lastGatherTime = Date.now();
@@ -202,6 +218,7 @@ export class DataScoutSimple extends AgentBase<DataScoutState> {
         sourceStats: {
           stocktwits: stocktwitsResult,
           reddit: redditResult,
+          alphavantage: alphaVantageResult,
         },
       });
     } catch (error) {
@@ -268,78 +285,175 @@ export class DataScoutSimple extends AgentBase<DataScoutState> {
   }
 
   private async gatherReddit(): Promise<number> {
-    if (!this.env.REDDIT_CLIENT_ID || !this.env.REDDIT_CLIENT_SECRET) return 0;
+    return this.gatherRedditViaRss();
+  }
 
-    const authResponse = await this.fetchWithTimeout(
-      "https://www.reddit.com/api/v1/access_token",
+  private async gatherRedditViaRss(): Promise<number> {
+    let processed = 0;
+    let successfulFeeds = 0;
+
+    for (const subreddit of REDDIT_BACKUP_SUBREDDITS) {
+      try {
+        const response = await this.fetchWithTimeout(
+          `https://www.reddit.com/r/${subreddit}/hot/.rss?limit=25`,
+          {
+            headers: {
+              "User-Agent": "okx-trading/1.0 (rss-backup)",
+              Accept: "application/atom+xml,application/rss+xml,application/xml,text/xml",
+            },
+          },
+          this.sourceTimeoutMs
+        );
+
+        if (!response.ok) {
+          throw new Error(`Reddit RSS fetch failed (${response.status})`);
+        }
+
+        const xml = await response.text();
+        const entries = this.parseRedditRssEntries(xml);
+        successfulFeeds += 1;
+
+        for (const entry of entries) {
+          const text = `${entry.title} ${entry.content}`.trim();
+          if (!text) continue;
+
+          const tickers = extractTickers(text);
+          const sentiment = this.calculateSentiment(text);
+          if (Math.abs(sentiment) < 0.3) continue;
+
+          for (const ticker of tickers) {
+            if (DEFAULT_TICKER_BLACKLIST.has(ticker.toUpperCase())) continue;
+            this.upsertSignal(ticker, sentiment, "reddit", 1);
+            processed += 1;
+          }
+        }
+      } catch (error) {
+        this.log("warn", "Reddit RSS feed failed", {
+          subreddit,
+          error: String(error),
+        });
+      }
+    }
+
+    if (successfulFeeds === 0) {
+      throw new Error("Reddit RSS backup failed for all subreddits");
+    }
+
+    return processed;
+  }
+
+  private async gatherAlphaVantage(): Promise<number> {
+    const apiKey = this.env.ALPHA_VANTAGE_API_KEY?.trim();
+    if (!apiKey) return 0;
+
+    const params = new URLSearchParams({
+      function: "NEWS_SENTIMENT",
+      sort: "LATEST",
+      limit: "50",
+      apikey: apiKey,
+    });
+
+    const response = await this.fetchWithTimeout(
+      `https://www.alphavantage.co/query?${params.toString()}`,
       {
-        method: "POST",
         headers: {
-          "Content-Type": "application/x-www-form-urlencoded",
-          Authorization: `Basic ${btoa(`${this.env.REDDIT_CLIENT_ID}:${this.env.REDDIT_CLIENT_SECRET}`)}`,
+          Accept: "application/json",
+          "User-Agent": "okx-trading/1.0 (alphavantage)",
         },
-        body: "grant_type=client_credentials",
       },
       this.sourceTimeoutMs
     );
 
-    if (!authResponse.ok) {
-      throw new Error(`Reddit auth failed (${authResponse.status})`);
+    if (!response.ok) {
+      throw new Error(`Alpha Vantage request failed (${response.status})`);
     }
 
-    const authData = (await authResponse.json()) as { access_token?: string };
-    const token = authData.access_token;
-    if (!token) {
-      throw new Error("Reddit auth token missing");
-    }
-
-    const subredditResponse = await this.fetchWithTimeout(
-      "https://oauth.reddit.com/r/wallstreetbets/hot.json?limit=20",
-      {
-        headers: {
-          Authorization: `Bearer ${token}`,
-          "User-Agent": "okx-trading/1.0",
-        },
-      },
-      this.sourceTimeoutMs
-    );
-
-    if (!subredditResponse.ok) {
-      throw new Error(`Reddit subreddit fetch failed (${subredditResponse.status})`);
-    }
-
-    const subredditData = (await subredditResponse.json()) as {
-      data?: {
-        children?: Array<{
-          data?: {
-            title?: string;
-            selftext?: string;
-            score?: number;
-          };
+    const payload = (await response.json()) as {
+      feed?: Array<{
+        ticker_sentiment?: Array<{
+          ticker?: string;
+          ticker_sentiment_score?: string;
+          relevance_score?: string;
         }>;
-      };
+      }>;
+      Note?: string;
+      Information?: string;
+      ErrorMessage?: string;
     };
-    const posts = subredditData.data?.children ?? [];
+
+    if (payload.ErrorMessage) {
+      throw new Error(`Alpha Vantage error: ${payload.ErrorMessage}`);
+    }
+    if (payload.Note) {
+      throw new Error(`Alpha Vantage rate limit: ${payload.Note}`);
+    }
+    if (payload.Information) {
+      throw new Error(`Alpha Vantage info: ${payload.Information}`);
+    }
+
+    const feed = Array.isArray(payload.feed) ? payload.feed : [];
     let processed = 0;
 
-    for (const post of posts) {
-      const data = post.data;
-      const title = data?.title || "";
-      const selftext = data?.selftext || "";
-      const text = `${title} ${selftext}`;
-      const tickers = extractTickers(text);
-      const sentiment = this.calculateSentiment(text);
-      if (Math.abs(sentiment) < 0.3) continue;
+    for (const item of feed.slice(0, 50)) {
+      const tickerSentiments = Array.isArray(item.ticker_sentiment) ? item.ticker_sentiment : [];
+      for (const sentimentItem of tickerSentiments.slice(0, 15)) {
+        const ticker = typeof sentimentItem.ticker === "string" ? sentimentItem.ticker.trim().toUpperCase() : "";
+        if (!ticker || ticker.length > 5) continue;
+        if (DEFAULT_TICKER_BLACKLIST.has(ticker)) continue;
 
-      for (const ticker of tickers) {
-        if (DEFAULT_TICKER_BLACKLIST.has(ticker.toUpperCase())) continue;
-        const volume = data?.score || 1;
-        this.upsertSignal(ticker, sentiment, "reddit", volume);
+        const score = Number.parseFloat(sentimentItem.ticker_sentiment_score || "");
+        if (!Number.isFinite(score)) continue;
+        if (Math.abs(score) < 0.15) continue;
+
+        const relevance = Number.parseFloat(sentimentItem.relevance_score || "0");
+        const volume = Number.isFinite(relevance) ? Math.max(1, Math.round(relevance * 100)) : 1;
+        const normalizedSentiment = Math.max(-1, Math.min(1, score));
+
+        this.upsertSignal(ticker, normalizedSentiment, "alphavantage", volume);
         processed += 1;
       }
     }
 
     return processed;
+  }
+
+  private parseRedditRssEntries(xml: string): Array<{ title: string; content: string }> {
+    const entries: Array<{ title: string; content: string }> = [];
+    const entryMatches = xml.match(/<entry\b[\s\S]*?<\/entry>/gi) ?? [];
+
+    for (const entryXml of entryMatches.slice(0, 25)) {
+      const titleRaw = this.extractXmlTag(entryXml, "title");
+      const contentRaw = this.extractXmlTag(entryXml, "content") || this.extractXmlTag(entryXml, "summary");
+      const title = this.stripHtml(this.decodeXmlEntities(titleRaw));
+      const content = this.stripHtml(this.decodeXmlEntities(contentRaw));
+
+      if (!title && !content) continue;
+      entries.push({ title, content });
+    }
+
+    return entries;
+  }
+
+  private extractXmlTag(xml: string, tagName: string): string {
+    const pattern = new RegExp(`<${tagName}(?:\\s[^>]*)?>([\\s\\S]*?)<\\/${tagName}>`, "i");
+    const match = xml.match(pattern);
+    if (!match?.[1]) return "";
+    return match[1].replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, "$1").trim();
+  }
+
+  private decodeXmlEntities(value: string): string {
+    return value
+      .replace(/&amp;/g, "&")
+      .replace(/&lt;/g, "<")
+      .replace(/&gt;/g, ">")
+      .replace(/&quot;/g, '"')
+      .replace(/&apos;/g, "'")
+      .replace(/&#x([0-9a-fA-F]+);/g, (_m, hex: string) => String.fromCharCode(Number.parseInt(hex, 16)))
+      .replace(/&#([0-9]+);/g, (_m, dec: string) => String.fromCharCode(Number.parseInt(dec, 10)));
+  }
+
+  private stripHtml(value: string): string {
+    return value.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
   }
 
   private async runSourceWithCircuitBreaker(

@@ -13,7 +13,7 @@ Okx monitors social sentiment from StockTwits and Reddit, uses AI (OpenAI, Anthr
 ## Features
 
 - **24/7 Operation** — Runs on Cloudflare Workers, no local machine required
-- **Multi-Source Signals** — StockTwits, Reddit (4 subreddits), Twitter confirmation
+- **Multi-Source Signals** - StockTwits, Reddit RSS (4 subreddits), Alpha Vantage sentiment, Twitter confirmation
 - **Multi-Provider LLM** — OpenAI, Anthropic, Google, xAI, DeepSeek via AI SDK or Cloudflare AI Gateway
 - **Multi-Broker Trading** — Switch between Alpaca and OKX via config
 - **Crypto Trading** — Trade BTC, ETH, SOL around the clock
@@ -95,6 +95,7 @@ npx wrangler secret put OPENAI_BASE_URL        # Optional: override OpenAI base 
 # Optional
 npx wrangler secret put TWITTER_BEARER_TOKEN
 npx wrangler secret put DISCORD_WEBHOOK_URL
+npx wrangler secret put ALPHA_VANTAGE_API_KEY
 ```
 
 ### 4. Deploy

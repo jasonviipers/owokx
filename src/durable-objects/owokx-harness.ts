@@ -479,7 +479,7 @@ const SIGNAL_CACHE_EMERGENCY_MIN = 80;
 
 const DATA_GATHERER_TIMEOUT_MS: Record<GathererSource, number> = {
   stocktwits: 6_000,
-  reddit: 6_000,
+  reddit: 12_000,
   crypto: 4_000,
   sec: 5_000,
   scout: 4_000,
@@ -496,8 +496,12 @@ const MEMORY_MIN_IMPORTANCE_TO_KEEP = 0.15;
 const SWARM_ROLE_SYNC_INTERVAL_MS = 120_000;
 const STRESS_TEST_INTERVAL_MS = 300_000;
 const OPTIMIZATION_INTERVAL_MS = 180_000;
-const LOG_RETENTION_MAX = 5_000;
+const LOG_RETENTION_MAX = 1_000;
 const LOG_FLUSH_INTERVAL_MS = 2_000;
+const PERSIST_RETRY_LOG_LIMITS = [700, 400, 200, 100] as const;
+const PERSIST_RETRY_MEMORY_LIMITS = [300, 200, 120, 80] as const;
+const PERSIST_RETRY_PORTFOLIO_LIMITS = [2_500, 1_500, 900, 500] as const;
+const PERSIST_RETRY_SIGNAL_CACHE_LIMITS = [160, 120, 90, 60] as const;
 
 const TWITTER_DAILY_READ_LIMIT = 200;
 const TWITTER_BUCKET_CAPACITY = 20;
@@ -2596,14 +2600,19 @@ export class OwokxHarness extends DurableObject<Env> {
       }
     >();
 
-    for (const sub of subreddits) {
-      const sourceWeight = SOURCE_CONFIG.weights[`reddit_${sub}` as keyof typeof SOURCE_CONFIG.weights] || 0.7;
-
-      try {
-        const res = await fetch(`https://www.reddit.com/r/${sub}/hot.json?limit=25`, {
-          headers: { "User-Agent": "Owokx/2.0" },
-        });
-        if (!res.ok) continue;
+    const subredditBatches = await Promise.allSettled(
+      subreddits.map(async (sub) => {
+        const sourceWeight = SOURCE_CONFIG.weights[`reddit_${sub}` as keyof typeof SOURCE_CONFIG.weights] || 0.7;
+        const res = await this.withTimeout(
+          fetch(`https://www.reddit.com/r/${sub}/hot.json?limit=25`, {
+            headers: { "User-Agent": "Owokx/2.0" },
+          }),
+          3_500,
+          `reddit_${sub}_timeout`
+        );
+        if (!res.ok) {
+          throw new Error(`Reddit ${sub} request failed (${res.status})`);
+        }
         const data = (await res.json()) as {
           data?: {
             children?: Array<{
@@ -2619,57 +2628,63 @@ export class OwokxHarness extends DurableObject<Env> {
           };
         };
         const posts = data.data?.children?.map((c) => c.data) || [];
+        return { sub, sourceWeight, posts };
+      })
+    );
 
-        for (const post of posts) {
-          const text = `${post.title || ""} ${post.selftext || ""}`;
-          const tickers = extractTickers(text, this.state.config.ticker_blacklist);
-          const rawSentiment = detectSentiment(text);
+    subredditBatches.forEach((batch, index) => {
+      const sub = subreddits[index]!;
+      if (batch.status !== "fulfilled") {
+        this.log("Reddit", "subreddit_error", { subreddit: sub, error: String(batch.reason) });
+        return;
+      }
 
-          const timeDecay = calculateTimeDecay(post.created_utc || Date.now() / 1000);
-          const engagementMult = getEngagementMultiplier(post.ups || 0, post.num_comments || 0);
-          const flairMult = getFlairMultiplier(post.link_flair_text);
-          const qualityScore = timeDecay * engagementMult * flairMult * sourceWeight;
+      const { sourceWeight, posts } = batch.value;
+      for (const post of posts) {
+        const text = `${post.title || ""} ${post.selftext || ""}`;
+        const tickers = extractTickers(text, this.state.config.ticker_blacklist);
+        const rawSentiment = detectSentiment(text);
 
-          for (const ticker of tickers) {
-            if (!tickerData.has(ticker)) {
-              tickerData.set(ticker, {
-                mentions: 0,
-                weightedSentiment: 0,
-                rawSentiment: 0,
-                totalQuality: 0,
-                upvotes: 0,
-                comments: 0,
-                sources: new Set(),
-                bestFlair: null,
-                bestFlairMult: 0,
-                freshestPost: 0,
-              });
-            }
-            const d = tickerData.get(ticker)!;
-            d.mentions++;
-            d.rawSentiment += rawSentiment;
-            d.weightedSentiment += rawSentiment * qualityScore;
-            d.totalQuality += qualityScore;
-            d.upvotes += post.ups || 0;
-            d.comments += post.num_comments || 0;
-            d.sources.add(sub);
+        const timeDecay = calculateTimeDecay(post.created_utc || Date.now() / 1000);
+        const engagementMult = getEngagementMultiplier(post.ups || 0, post.num_comments || 0);
+        const flairMult = getFlairMultiplier(post.link_flair_text);
+        const qualityScore = timeDecay * engagementMult * flairMult * sourceWeight;
 
-            if (flairMult > d.bestFlairMult) {
-              d.bestFlair = post.link_flair_text || null;
-              d.bestFlairMult = flairMult;
-            }
+        for (const ticker of tickers) {
+          if (!tickerData.has(ticker)) {
+            tickerData.set(ticker, {
+              mentions: 0,
+              weightedSentiment: 0,
+              rawSentiment: 0,
+              totalQuality: 0,
+              upvotes: 0,
+              comments: 0,
+              sources: new Set(),
+              bestFlair: null,
+              bestFlairMult: 0,
+              freshestPost: 0,
+            });
+          }
+          const d = tickerData.get(ticker)!;
+          d.mentions++;
+          d.rawSentiment += rawSentiment;
+          d.weightedSentiment += rawSentiment * qualityScore;
+          d.totalQuality += qualityScore;
+          d.upvotes += post.ups || 0;
+          d.comments += post.num_comments || 0;
+          d.sources.add(sub);
 
-            if ((post.created_utc || 0) > d.freshestPost) {
-              d.freshestPost = post.created_utc || 0;
-            }
+          if (flairMult > d.bestFlairMult) {
+            d.bestFlair = post.link_flair_text || null;
+            d.bestFlairMult = flairMult;
+          }
+
+          if ((post.created_utc || 0) > d.freshestPost) {
+            d.freshestPost = post.created_utc || 0;
           }
         }
-
-        await this.sleep(1000);
-      } catch (error) {
-        this.log("Reddit", "subreddit_error", { subreddit: sub, error: String(error) });
       }
-    }
+    });
 
     const signals: Signal[] = [];
     const broker = createBrokerProviders(this.env, this.state.config.broker);
@@ -6210,6 +6225,88 @@ Response format:
     return typeof value === "object" && value !== null && !Array.isArray(value);
   }
 
+  private sanitizeLogValue(value: unknown, depth = 0): unknown {
+    if (value === null || value === undefined) return value;
+    if (typeof value === "string") {
+      const trimmed = value.trim();
+      if (trimmed.length <= 800) return trimmed;
+      return `${trimmed.slice(0, 800)}... [truncated ${trimmed.length - 800} chars]`;
+    }
+    if (typeof value === "number" || typeof value === "boolean") return value;
+    if (depth >= 2) {
+      try {
+        const serialized = JSON.stringify(value);
+        return serialized.length <= 800
+          ? JSON.parse(serialized)
+          : `${serialized.slice(0, 800)}... [truncated ${serialized.length - 800} chars]`;
+      } catch {
+        return String(value);
+      }
+    }
+    if (Array.isArray(value)) {
+      const maxItems = 20;
+      const next = value.slice(0, maxItems).map((item) => this.sanitizeLogValue(item, depth + 1));
+      if (value.length > maxItems) {
+        next.push(`[+${value.length - maxItems} more items]`);
+      }
+      return next;
+    }
+    if (this.isRecord(value)) {
+      const entries = Object.entries(value);
+      const maxKeys = 30;
+      const next: Record<string, unknown> = {};
+      for (const [key, item] of entries.slice(0, maxKeys)) {
+        next[key] = this.sanitizeLogValue(item, depth + 1);
+      }
+      if (entries.length > maxKeys) {
+        next._truncated_keys = entries.length - maxKeys;
+      }
+      return next;
+    }
+    return String(value);
+  }
+
+  private sanitizeLogDetails(details: Record<string, unknown>): Record<string, unknown> {
+    const sanitized: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(details)) {
+      sanitized[key] = this.sanitizeLogValue(value);
+    }
+    try {
+      const bytes = new TextEncoder().encode(JSON.stringify(sanitized)).length;
+      if (bytes <= 6_000) return sanitized;
+      return {
+        _truncated: true,
+        _metadata_bytes: bytes,
+        preview: JSON.stringify(sanitized).slice(0, 1_200),
+      };
+    } catch {
+      return { _truncated: true, _metadata_error: "metadata serialization failed" };
+    }
+  }
+
+  private getLogSummaryFields(metadata: Record<string, unknown>): Record<string, unknown> {
+    const keys = [
+      "symbol",
+      "source",
+      "reason",
+      "message",
+      "error",
+      "count",
+      "confidence",
+      "verdict",
+      "recommendation",
+      "quality",
+      "broker",
+    ];
+    const summary: Record<string, unknown> = {};
+    for (const key of keys) {
+      if (key in metadata) {
+        summary[key] = metadata[key];
+      }
+    }
+    return summary;
+  }
+
   private classifyEventType(agent: string, action: string, details: Record<string, unknown>): ActivityEventType {
     const actionKey = action.toLowerCase();
     const agentKey = agent.toLowerCase();
@@ -6359,8 +6456,9 @@ Response format:
   private buildLogEntry(agent: string, action: string, details: Record<string, unknown>): LogEntry {
     const nowMs = Date.now();
     const timestamp = new Date(nowMs).toISOString();
-    const metadata = { ...details };
-    const eventType = this.normalizeEventType(details.event_type) ?? this.classifyEventType(agent, action, metadata);
+    const metadata = this.sanitizeLogDetails(details);
+    const summary = this.getLogSummaryFields(metadata);
+    const eventType = this.normalizeEventType(metadata.event_type) ?? this.classifyEventType(agent, action, metadata);
     const severity = this.classifyLogSeverity(action, metadata);
     const status = this.classifyLogStatus(action, metadata);
 
@@ -6370,7 +6468,7 @@ Response format:
       timestamp_ms: nowMs,
       agent,
       action,
-      ...details,
+      ...summary,
       event_type: eventType,
       severity,
       status,
@@ -6409,13 +6507,15 @@ Response format:
       metadata[key] = value;
     }
 
-    const eventType = this.normalizeEventType(raw.event_type) ?? this.classifyEventType(agent, action, metadata);
-    const severity = this.normalizeLogSeverity(raw.severity) ?? this.classifyLogSeverity(action, metadata);
-    const status = this.normalizeLogStatus(raw.status) ?? this.classifyLogStatus(action, metadata);
+    const sanitizedMetadata = this.sanitizeLogDetails(metadata);
+    const summary = this.getLogSummaryFields(sanitizedMetadata);
+    const eventType = this.normalizeEventType(raw.event_type) ?? this.classifyEventType(agent, action, sanitizedMetadata);
+    const severity = this.normalizeLogSeverity(raw.severity) ?? this.classifyLogSeverity(action, sanitizedMetadata);
+    const status = this.normalizeLogStatus(raw.status) ?? this.classifyLogStatus(action, sanitizedMetadata);
     const description =
       typeof raw.description === "string" && raw.description.trim().length > 0
         ? raw.description.trim()
-        : this.summarizeLogDetails(action, metadata);
+        : this.summarizeLogDetails(action, sanitizedMetadata);
     const nowMs = Date.now();
     const safeTimestampMs = Number.isFinite(timestampMs) ? timestampMs : nowMs;
 
@@ -6429,8 +6529,8 @@ Response format:
       severity,
       status,
       description,
-      metadata,
-      ...metadata,
+      metadata: sanitizedMetadata,
+      ...summary,
     };
   }
 
@@ -6515,12 +6615,109 @@ Response format:
         .catch((error) => {
           clearTimeout(timeoutHandle);
           reject(error);
-        });
+      });
     });
   }
 
+  private isSqliteTooBigError(error: unknown): boolean {
+    const message = String(error).toUpperCase();
+    return message.includes("SQLITE_TOOBIG") || message.includes("STRING OR BLOB TOO BIG");
+  }
+
+  private capRecordByTimestamp<T extends { timestamp?: number }>(
+    record: Record<string, T>,
+    maxEntries: number
+  ): Record<string, T> {
+    const entries = Object.entries(record);
+    if (entries.length <= maxEntries) return record;
+    return Object.fromEntries(
+      entries
+        .sort((a, b) => (b[1]?.timestamp ?? 0) - (a[1]?.timestamp ?? 0))
+        .slice(0, maxEntries)
+    );
+  }
+
+  private applyStatePersistenceTrim(
+    maxLogs: number,
+    maxMemoryEpisodes: number,
+    maxPortfolioPoints: number,
+    maxSignalCache: number
+  ): void {
+    if (this.state.logs.length > maxLogs) {
+      this.state.logs = this.state.logs.slice(-maxLogs);
+    }
+    if (this.state.memoryEpisodes.length > maxMemoryEpisodes) {
+      this.state.memoryEpisodes = this.state.memoryEpisodes.slice(-maxMemoryEpisodes);
+    }
+    if (this.state.portfolioEquityHistory.length > maxPortfolioPoints) {
+      this.state.portfolioEquityHistory = this.state.portfolioEquityHistory.slice(-maxPortfolioPoints);
+    }
+    if (this.state.signalCache.length > maxSignalCache) {
+      this.state.signalCache = [...this.state.signalCache]
+        .sort((a, b) => b.timestamp - a.timestamp)
+        .slice(0, maxSignalCache);
+      this.state.signalCacheBytesEstimate = this.estimateObjectSizeBytes(this.state.signalCache);
+    }
+
+    this.state.signalResearch = this.capRecordByTimestamp(this.state.signalResearch, 300);
+    this.state.positionResearch = this.capRecordByTimestamp(
+      this.state.positionResearch as Record<string, { timestamp?: number }>,
+      250
+    ) as Record<string, unknown>;
+    this.state.twitterConfirmations = this.capRecordByTimestamp(this.state.twitterConfirmations, 200);
+    this.state.stalenessAnalysis = this.capRecordByTimestamp(
+      this.state.stalenessAnalysis as Record<string, { timestamp?: number }>,
+      250
+    ) as Record<string, unknown>;
+  }
+
   private async persist(): Promise<void> {
-    await this.ctx.storage.put("state", this.state);
+    try {
+      await this.ctx.storage.put("state", this.state);
+      return;
+    } catch (error) {
+      if (!this.isSqliteTooBigError(error)) {
+        throw error;
+      }
+      console.error("[OwokxHarness] persist_oversize_detected", String(error));
+    }
+
+    for (let i = 0; i < PERSIST_RETRY_LOG_LIMITS.length; i++) {
+      this.applyStatePersistenceTrim(
+        PERSIST_RETRY_LOG_LIMITS[i]!,
+        PERSIST_RETRY_MEMORY_LIMITS[i]!,
+        PERSIST_RETRY_PORTFOLIO_LIMITS[i]!,
+        PERSIST_RETRY_SIGNAL_CACHE_LIMITS[i]!
+      );
+      try {
+        await this.ctx.storage.put("state", this.state);
+        console.warn(
+          "[OwokxHarness] persist_recovered_after_trim",
+          JSON.stringify({
+            logs: this.state.logs.length,
+            memoryEpisodes: this.state.memoryEpisodes.length,
+            portfolioPoints: this.state.portfolioEquityHistory.length,
+            signalCache: this.state.signalCache.length,
+            retry: i + 1,
+          })
+        );
+        return;
+      } catch (error) {
+        if (!this.isSqliteTooBigError(error)) {
+          throw error;
+        }
+      }
+    }
+
+    console.error(
+      "[OwokxHarness] persist_failed_after_trim",
+      JSON.stringify({
+        logs: this.state.logs.length,
+        memoryEpisodes: this.state.memoryEpisodes.length,
+        portfolioPoints: this.state.portfolioEquityHistory.length,
+        signalCache: this.state.signalCache.length,
+      })
+    );
   }
 
   private jsonResponse(data: unknown): Response {

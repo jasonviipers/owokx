@@ -1,29 +1,59 @@
 @import "tailwindcss";
 
 @theme {
-  --color-hud-bg: #0a0c0e;
-  --color-hud-bg-panel: #0d1012;
+  /* Dark background inspired by Bloomberg Terminal & TradingView */
+  --color-hud-bg: #0b0e11;
+  --color-hud-bg-panel: #131722;
   
-  --color-hud-primary: #7a9ba8;
-  --color-hud-dim: #3a4a52;
-  --color-hud-line: rgba(122, 155, 168, 0.15);
-  --color-hud-border: rgba(122, 155, 168, 0.2);
+  /* Electric blue accent inspired by Robinhood/modern fintech */
+  --color-hud-primary: #00d4ff;
+  --color-hud-dim: #2a2e39;
+  --color-hud-line: rgba(0, 212, 255, 0.12);
+  --color-hud-border: rgba(0, 212, 255, 0.25);
   
-  --color-hud-text: #7a9ba8;
-  --color-hud-text-dim: #4a5a62;
-  --color-hud-text-bright: #c8dce4;
+  /* High contrast text for readability */
+  --color-hud-text: #d1d4dc;
+  --color-hud-text-dim: #787b86;
+  --color-hud-text-bright: #ffffff;
   
-  --color-hud-success: #4a9868;
-  --color-hud-warning: #b89848;
-  --color-hud-error: #b84848;
-  --color-hud-purple: #8a6ab8;
-  --color-hud-cyan: #5a9ab8;
-  --color-hud-blue: #5a7ab8;
-  --color-hud-green: #4a9868;
-  --color-hud-yellow: #b89848;
-  --color-hud-red: #b84848;
+  /* Trading colors - green for gains, red for losses */
+  --color-hud-success: #00c853;
+  --color-hud-warning: #ffab00;
+  --color-hud-error: #ff3b69;
+  
+  /* Extended palette for data visualization */
+  --color-hud-purple: #b794f6;
+  --color-hud-cyan: #00d4ff;
+  --color-hud-blue: #2962ff;
+  --color-hud-green: #00c853;
+  --color-hud-yellow: #ffab00;
+  --color-hud-red: #ff3b69;
   
   --font-mono: 'JetBrains Mono', 'SF Mono', 'Consolas', monospace;
+  
+  /* Responsive spacing scale */
+  --spacing-mobile: 0.5rem;
+  --spacing-tablet: 1rem;
+  --spacing-desktop: 1.5rem;
+  
+  /* Responsive font sizes - mobile first */
+  --font-xs-mobile: 7px;
+  --font-sm-mobile: 9px;
+  --font-md-mobile: 11px;
+  --font-lg-mobile: 14px;
+  --font-xl-mobile: 20px;
+  
+  --font-xs-tablet: 7.5px;
+  --font-sm-tablet: 10px;
+  --font-md-tablet: 12px;
+  --font-lg-tablet: 18px;
+  --font-xl-tablet: 28px;
+  
+  --font-xs-desktop: 8px;
+  --font-sm-desktop: 11px;
+  --font-md-desktop: 14px;
+  --font-lg-desktop: 24px;
+  --font-xl-desktop: 36px;
 }
 
 @layer base {
@@ -31,23 +61,35 @@
     box-sizing: border-box;
   }
   
+  /* Mobile first - base styles */
   html {
     font-family: var(--font-mono);
     font-size: 10px;
     background-color: var(--color-hud-bg);
     color: var(--color-hud-text);
     letter-spacing: 0.05em;
+    -webkit-text-size-adjust: 100%; /* Prevent text size adjustment on iOS */
   }
   
   body {
     margin: 0;
     min-height: 100vh;
     -webkit-font-smoothing: antialiased;
+    -webkit-overflow-scrolling: touch; /* Smooth scrolling on iOS */
   }
 
+  /* Scrollbar styles - thinner on mobile */
   ::-webkit-scrollbar {
-    width: 4px;
-    height: 4px;
+    width: 3px;
+    height: 3px;
+  }
+  
+  /* Tablet and up - slightly thicker scrollbar */
+  @media (min-width: 768px) {
+    ::-webkit-scrollbar {
+      width: 4px;
+      height: 4px;
+    }
   }
   
   ::-webkit-scrollbar-track {
@@ -58,82 +100,217 @@
     background: var(--color-hud-dim);
     border-radius: 2px;
   }
+  
+  ::-webkit-scrollbar-thumb:hover {
+    background: var(--color-hud-primary);
+  }
+  
+  /* Safe area support for notched devices */
+  @supports (padding-top: env(safe-area-inset-top)) {
+    body {
+      padding-top: env(safe-area-inset-top);
+      padding-bottom: env(safe-area-inset-bottom);
+      padding-left: env(safe-area-inset-left);
+      padding-right: env(safe-area-inset-right);
+    }
+  }
 }
 
 @layer components {
+  /* Panel - responsive */
   .hud-panel {
     background: var(--color-hud-bg-panel);
     border: 0.5px solid var(--color-hud-line);
   }
   
+  /* Labels - responsive sizing */
   .hud-label {
-    font-size: 8px;
+    font-size: var(--font-xs-mobile);
     text-transform: uppercase;
     letter-spacing: 0.15em;
     color: var(--color-hud-text-dim);
   }
   
+  @media (min-width: 768px) {
+    .hud-label {
+      font-size: var(--font-xs-tablet);
+    }
+  }
+  
+  @media (min-width: 1024px) {
+    .hud-label {
+      font-size: var(--font-xs-desktop);
+    }
+  }
+  
+  /* Value sizes - mobile first with responsive scaling */
   .hud-value-xl {
-    font-size: 36px;
+    font-size: var(--font-xl-mobile);
     font-weight: 300;
     letter-spacing: -0.02em;
     line-height: 1;
     color: var(--color-hud-text-bright);
   }
   
+  @media (min-width: 768px) {
+    .hud-value-xl {
+      font-size: var(--font-xl-tablet);
+    }
+  }
+  
+  @media (min-width: 1024px) {
+    .hud-value-xl {
+      font-size: var(--font-xl-desktop);
+    }
+  }
+  
   .hud-value-lg {
-    font-size: 24px;
+    font-size: var(--font-lg-mobile);
     font-weight: 300;
     letter-spacing: -0.01em;
     line-height: 1;
     color: var(--color-hud-text-bright);
   }
   
+  @media (min-width: 768px) {
+    .hud-value-lg {
+      font-size: var(--font-lg-tablet);
+    }
+  }
+  
+  @media (min-width: 1024px) {
+    .hud-value-lg {
+      font-size: var(--font-lg-desktop);
+    }
+  }
+  
   .hud-value-md {
-    font-size: 14px;
+    font-size: var(--font-md-mobile);
     font-weight: 400;
     line-height: 1;
     color: var(--color-hud-text);
   }
   
+  @media (min-width: 768px) {
+    .hud-value-md {
+      font-size: var(--font-md-tablet);
+    }
+  }
+  
+  @media (min-width: 1024px) {
+    .hud-value-md {
+      font-size: var(--font-md-desktop);
+    }
+  }
+  
   .hud-value-sm {
-    font-size: 11px;
+    font-size: var(--font-sm-mobile);
     font-weight: 400;
     line-height: 1;
     color: var(--color-hud-text);
   }
+  
+  @media (min-width: 768px) {
+    .hud-value-sm {
+      font-size: var(--font-sm-tablet);
+    }
+  }
+  
+  @media (min-width: 1024px) {
+    .hud-value-sm {
+      font-size: var(--font-sm-desktop);
+    }
+  }
 
+  /* Input - mobile optimized with larger touch targets */
   .hud-input {
     background: var(--color-hud-bg);
     border: 0.5px solid var(--color-hud-line);
     color: var(--color-hud-text);
     font-family: var(--font-mono);
-    font-size: 11px;
-    padding: 6px 10px;
+    font-size: var(--font-sm-mobile);
+    padding: 10px 12px; /* Larger padding for mobile */
     outline: none;
     transition: border-color 0.2s;
+    min-height: 44px; /* iOS minimum touch target */
+  }
+  
+  @media (min-width: 768px) {
+    .hud-input {
+      font-size: var(--font-sm-tablet);
+      padding: 8px 12px;
+      min-height: auto;
+    }
+  }
+  
+  @media (min-width: 1024px) {
+    .hud-input {
+      font-size: var(--font-sm-desktop);
+      padding: 6px 10px;
+    }
   }
 
   .hud-input:focus {
     border-color: var(--color-hud-primary);
+    box-shadow: 0 0 0 1px var(--color-hud-primary);
+  }
+  
+  .hud-input::placeholder {
+    color: var(--color-hud-text-dim);
+  }
+  
+  /* Select dropdown styling */
+  select.hud-input {
+    appearance: none;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%2300d4ff' d='M6 9L1 4h10z'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 12px center;
+    padding-right: 36px;
   }
 
+  /* Button - mobile optimized */
   .hud-button {
     background: transparent;
     border: 0.5px solid var(--color-hud-primary);
     color: var(--color-hud-primary);
     font-family: var(--font-mono);
-    font-size: 10px;
+    font-size: var(--font-xs-mobile);
     text-transform: uppercase;
     letter-spacing: 0.1em;
-    padding: 8px 16px;
+    padding: 12px 20px; /* Larger padding for mobile touch targets */
     cursor: pointer;
     transition: all 0.2s;
+    min-height: 44px; /* iOS minimum touch target */
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }
+  
+  @media (min-width: 768px) {
+    .hud-button {
+      font-size: var(--font-xs-tablet);
+      padding: 10px 18px;
+      min-height: auto;
+    }
+  }
+  
+  @media (min-width: 1024px) {
+    .hud-button {
+      font-size: var(--font-xs-desktop);
+      padding: 8px 16px;
+    }
   }
 
   .hud-button:hover {
     background: var(--color-hud-primary);
     color: var(--color-hud-bg);
+  }
+  
+  /* Active state for mobile - better than hover */
+  .hud-button:active {
+    background: var(--color-hud-primary);
+    color: var(--color-hud-bg);
+    transform: scale(0.98);
   }
 
   .hud-button:disabled {
@@ -146,7 +323,8 @@
     color: var(--color-hud-success);
   }
 
-  .hud-button-success:hover {
+  .hud-button-success:hover,
+  .hud-button-success:active {
     background: var(--color-hud-success);
     color: var(--color-hud-bg);
   }
@@ -156,8 +334,237 @@
     color: var(--color-hud-error);
   }
 
-  .hud-button-danger:hover {
+  .hud-button-danger:hover,
+  .hud-button-danger:active {
     background: var(--color-hud-error);
     color: var(--color-hud-bg);
+  }
+}
+
+@layer utilities {
+  /* Responsive spacing utilities */
+  .gap-responsive {
+    gap: var(--spacing-mobile);
+  }
+  
+  @media (min-width: 768px) {
+    .gap-responsive {
+      gap: var(--spacing-tablet);
+    }
+  }
+  
+  @media (min-width: 1024px) {
+    .gap-responsive {
+      gap: var(--spacing-desktop);
+    }
+  }
+  
+  /* Mobile-only utilities */
+  @media (max-width: 767px) {
+    .hide-mobile {
+      display: none !important;
+    }
+    
+    /* Prevent text selection on mobile for better UX */
+    .no-select-mobile {
+      -webkit-user-select: none;
+      user-select: none;
+    }
+    
+    /* Better tap highlighting */
+    .tap-highlight {
+      -webkit-tap-highlight-color: rgba(0, 212, 255, 0.2);
+    }
+  }
+  
+  /* Tablet-only utilities */
+  @media (min-width: 768px) and (max-width: 1023px) {
+    .hide-tablet {
+      display: none !important;
+    }
+  }
+  
+  /* Desktop-only utilities */
+  @media (min-width: 1024px) {
+    .hide-desktop {
+      display: none !important;
+    }
+  }
+  
+  /* Landscape mobile optimizations */
+  @media (max-height: 500px) and (orientation: landscape) {
+    .landscape-scroll {
+      max-height: 90vh;
+      overflow-y: auto;
+    }
+  }
+  
+  /* Touch-friendly utilities */
+  .touch-target {
+    min-height: 44px;
+    min-width: 44px;
+  }
+  
+  /* Prevent accidental zoom on iOS */
+  .prevent-zoom {
+    touch-action: manipulation;
+  }
+}
+
+/* Accessibility improvements */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* High contrast mode support */
+@media (prefers-contrast: high) {
+  .hud-panel {
+    border-width: 1px;
+  }
+  
+  .hud-button {
+    border-width: 1px;
+  }
+  
+  .hud-input {
+    border-width: 1px;
+  }
+}
+
+/* Focus visible for keyboard navigation */
+*:focus-visible {
+  outline: 1px solid var(--color-hud-primary);
+  outline-offset: 2px;
+}
+
+button:focus-visible,
+a:focus-visible,
+input:focus-visible,
+select:focus-visible {
+  outline: 1px solid var(--color-hud-primary);
+  outline-offset: 2px;
+}
+
+/* Loading animations */
+@keyframes pulse {
+  0%, 100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.5;
+  }
+}
+
+.animate-pulse {
+  animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+
+@keyframes shimmer {
+  0% {
+    background-position: -1000px 0;
+  }
+  100% {
+    background-position: 1000px 0;
+  }
+}
+
+.skeleton {
+  background: linear-gradient(
+    90deg,
+    var(--color-hud-bg-panel) 0%,
+    var(--color-hud-line) 50%,
+    var(--color-hud-bg-panel) 100%
+  );
+  background-size: 1000px 100%;
+  animation: shimmer 2s infinite;
+}
+
+/* Print styles */
+@media print {
+  body {
+    background: white;
+    color: black;
+  }
+  
+  .hud-button,
+  button {
+    display: none;
+  }
+  
+  .hud-panel {
+    border: 1px solid #ccc;
+    break-inside: avoid;
+  }
+}
+
+/* Responsive container */
+.container-responsive {
+  width: 100%;
+  margin-left: auto;
+  margin-right: auto;
+  padding-left: 0.5rem;
+  padding-right: 0.5rem;
+}
+
+@media (min-width: 768px) {
+  .container-responsive {
+    padding-left: 1rem;
+    padding-right: 1rem;
+  }
+}
+
+@media (min-width: 1024px) {
+  .container-responsive {
+    max-width: 1280px;
+    padding-left: 1.5rem;
+    padding-right: 1.5rem;
+  }
+}
+
+@media (min-width: 1440px) {
+  .container-responsive {
+    max-width: 1920px;
+  }
+}
+
+/* Mobile table improvements */
+@media (max-width: 767px) {
+  table {
+    font-size: var(--font-sm-mobile);
+  }
+  
+  table th,
+  table td {
+    padding: 0.5rem 0.25rem;
+  }
+}
+
+/* Tablet table improvements */
+@media (min-width: 768px) and (max-width: 1023px) {
+  table {
+    font-size: var(--font-sm-tablet);
+  }
+  
+  table th,
+  table td {
+    padding: 0.625rem 0.5rem;
+  }
+}
+
+/* Desktop table improvements */
+@media (min-width: 1024px) {
+  table {
+    font-size: var(--font-sm-desktop);
+  }
+  
+  table th,
+  table td {
+    padding: 0.75rem;
   }
 }

@@ -42,6 +42,7 @@ export interface Env {
   TWITTER_BEARER_TOKEN?: string;
   DISCORD_WEBHOOK_URL?: string;
   STOCKTWITS_API_TOKEN?: string;
+  ALPHA_VANTAGE_API_KEY?: string;
   REDDIT_CLIENT_ID?: string;
   REDDIT_CLIENT_SECRET?: string;
   OWOKX_API_TOKEN: string;

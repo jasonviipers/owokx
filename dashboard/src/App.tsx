@@ -12,6 +12,7 @@ import { Tooltip, TooltipContent } from './components/Tooltip'
 import { AgentControls } from './components/AgentControls'
 import { SwarmDashboard } from './components/SwarmDashboard'
 import type { Status, Config, LogEntry, Signal, Position, SignalResearch, PortfolioSnapshot } from './types'
+import { MobileNav } from './components/Mobilenav'
 
 const API_BASE = '/api'
 
@@ -326,7 +327,6 @@ async function fetchPortfolioHistory(period: string = '1D'): Promise<PortfolioSn
   }
 }
 
-// Generate mock price history for positions
 function generateMockPriceHistory(currentPrice: number, unrealizedPl: number, points: number = 20): number[] {
   if (!Number.isFinite(currentPrice) || currentPrice <= 0) return []
   const prices: number[] = []
@@ -360,29 +360,16 @@ export default function App() {
   const [activitySeverityFilter, setActivitySeverityFilter] = useState<ActivitySeverityFilter>('all')
   const [activityTimeRangeFilter, setActivityTimeRangeFilter] = useState<ActivityTimeRange>('24h')
   const [activityExpandedRows, setActivityExpandedRows] = useState<Record<string, boolean>>({})
+  const [mobileView, setMobileView] = useState<'overview' | 'positions' | 'activity' | 'signals'>('overview')
   
-  // Toast for Orchestrator connection
+  const [wasConnected, setWasConnected] = useState(false)
   useEffect(() => {
-    if (status?.swarm?.agents?.harness?.status === 'active') {
-       const lastHb = status.swarm.agents.harness.lastHeartbeat;
-       const now = Date.now();
-       if (now - lastHb < 5000) { // Only show if recently active (within 5s) to avoid spam on every poll
-          // Check if we already showed it recently to avoid loop? 
-          // Actually, we can just rely on a transient state or check previous status.
-          // For now, let's just show a subtle indicator or use the existing agentMessage if it's a new connection.
-       }
-    }
-  }, [status?.swarm?.agents?.harness?.lastHeartbeat]);
-
-  // Better approach: Watch for transition from disconnected to connected
-  const [wasConnected, setWasConnected] = useState(false);
-  useEffect(() => {
-    const isConnected = status?.swarm?.agents?.harness?.status === 'active';
+    const isConnected = status?.swarm?.agents?.harness?.status === 'active'
     if (isConnected && !wasConnected) {
-      setAgentMessage({ type: 'success', text: 'Orchestrator connected' });
+      setAgentMessage({ type: 'success', text: 'Orchestrator connected' })
     }
-    setWasConnected(!!isConnected);
-  }, [status?.swarm?.agents?.harness?.status]);
+    setWasConnected(!!isConnected)
+  }, [status?.swarm?.agents?.harness?.status])
 
   const checkSetup = useCallback(async () => {
     try {
@@ -409,7 +396,6 @@ export default function App() {
         setStatus(data.data)
         setError(null)
       } else {
-        // Still hydrate dashboard with whatever data the backend returned (logs/errors/partial status)
         setStatus(data.data || null)
         setError(data.error || 'Failed to fetch status')
       }
@@ -524,7 +510,6 @@ export default function App() {
     }
   }
 
-  // Derived state (must stay above early returns per React hooks rules)
   const account = status?.account
   const positions = status?.positions || []
   const signals = status?.signals || []
@@ -630,16 +615,27 @@ export default function App() {
     }
   }, [agentBusy, fetchStatus])
 
-  const startingEquity = Number.isFinite(config?.starting_equity) && (config?.starting_equity ?? 0) > 0 ? config!.starting_equity : 100000
+  const configuredStartingEquity =
+    Number.isFinite(config?.starting_equity) && (config?.starting_equity ?? 0) > 0
+      ? config!.starting_equity
+      : null
+  const historyStartingEquity =
+    portfolioHistory.length > 0 &&
+    Number.isFinite(portfolioHistory[0]?.equity) &&
+    (portfolioHistory[0]?.equity ?? 0) > 0
+      ? portfolioHistory[0]!.equity
+      : null
+  const startingEquity =
+    configuredStartingEquity ??
+    historyStartingEquity ??
+    (Number.isFinite(account?.equity) && (account?.equity ?? 0) > 0 ? account!.equity : 0)
   const unrealizedPl = positions.reduce((sum, p) => sum + p.unrealized_pl, 0)
-  const totalPl = account && typeof startingEquity === 'number' ? account.equity - startingEquity : 0
+  const totalPl = account && startingEquity > 0 ? account.equity - startingEquity : 0
   const realizedPl = totalPl - unrealizedPl
-  const totalPlPct = account && typeof startingEquity === 'number' ? safePercent(totalPl, startingEquity) : null
+  const totalPlPct = account && startingEquity > 0 ? safePercent(totalPl, startingEquity) : null
 
-  // Color palette for position lines (distinct colors for each stock)
   const positionColors = ['cyan', 'purple', 'yellow', 'blue', 'green'] as const
 
-  // Generate mock price histories for positions (stable per session via useMemo)
   const positionPriceHistories = useMemo(() => {
     const histories: Record<string, number[]> = {}
     positions.forEach(pos => {
@@ -648,7 +644,6 @@ export default function App() {
     return histories
   }, [positions.map(p => p.symbol).join(',')])
 
-  // Chart data derived from portfolio history
   const portfolioChartData = useMemo(() => {
     return portfolioHistory.map(s => s.equity)
   }, [portfolioHistory])
@@ -696,14 +691,12 @@ export default function App() {
     }
   }, [portfolioHistory, portfolioPeriod])
 
-  // Normalize position price histories to % change for stacked comparison view
   const normalizedPositionSeries = useMemo(() => {
     return positions.map((pos, idx) => {
       const priceHistory = positionPriceHistories[pos.symbol] || []
       if (priceHistory.length < 2) return null
       const startPrice = priceHistory[0]
       if (!Number.isFinite(startPrice) || startPrice === 0) return null
-      // Convert to % change from start
       const normalizedData = priceHistory.map(price => ((price - startPrice) / startPrice) * 100)
       return {
         label: pos.symbol,
@@ -713,7 +706,6 @@ export default function App() {
     }).filter(Boolean) as { label: string; data: number[]; variant: typeof positionColors[number] }[]
   }, [positions, positionPriceHistories])
 
-  // Early returns (after all hooks)
   if (showSetup) {
     return <SetupWizard onComplete={() => setShowSetup(false)} />
   }
@@ -721,7 +713,7 @@ export default function App() {
   if (error && !status) {
     const isAuthError = error.includes('Unauthorized')
     return (
-      <div className="min-h-screen bg-hud-bg flex items-center justify-center p-6">
+      <div className="min-h-screen bg-hud-bg flex items-center justify-center p-4 md:p-6">
         <Panel title={isAuthError ? "AUTHENTICATION REQUIRED" : "CONNECTION ERROR"} className="max-w-md w-full">
           <div className="text-center py-8">
             <div className="text-hud-error text-2xl mb-4">{isAuthError ? "NO TOKEN" : "OFFLINE"}</div>
@@ -760,10 +752,11 @@ export default function App() {
   }
 
   return (
-    <div className="min-h-screen bg-hud-bg">
-      <div className="max-w-[1920px] mx-auto p-4">
-        <header className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3 mb-4 pb-3 border-b border-hud-line">
-          <div className="flex items-center gap-4 md:gap-6">
+    <div className="min-h-screen bg-hud-bg flex flex-col">
+      <div className="max-w-[1920px] mx-auto p-2 sm:p-4 flex-1 w-full">
+        {/* Desktop Header */}
+        <header className="hidden md:flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3 mb-4 pb-3 border-b border-hud-line">
+          <div className="flex items-center gap-4 md:gap-6 flex-wrap">
             <div className="flex items-baseline gap-2">
               <span className="text-xl md:text-2xl font-light tracking-tight text-hud-text-bright">
                 owokx
@@ -807,13 +800,50 @@ export default function App() {
             >
               [CONFIG]
             </button>
-            <span className="hud-value-sm font-mono">
+            <span className="hud-value-sm font-mono hidden lg:inline">
               {time.toLocaleTimeString('en-US', { hour12: false })}
             </span>
           </div>
         </header>
 
-        <div className="grid grid-cols-4 md:grid-cols-8 lg:grid-cols-12 gap-4">
+        {/* Mobile Header */}
+        <header className="md:hidden flex flex-col gap-3 mb-4 pb-3 border-b border-hud-line">
+          <div className="flex justify-between items-center">
+            <div className="flex items-baseline gap-2">
+              <span className="text-lg font-light tracking-tight text-hud-text-bright">owokx</span>
+              <span className="hud-label text-xs">v2</span>
+            </div>
+            <div className="flex items-center gap-2">
+              <NotificationBell
+                overnightActivity={status?.overnightActivity}
+                premarketPlan={status?.premarketPlan}
+              />
+              <button
+                className="hud-label hover:text-hud-primary transition-colors text-xs"
+                onClick={() => setShowSettings(true)}
+              >
+                [CONFIG]
+              </button>
+            </div>
+          </div>
+          <div className="flex justify-between items-center gap-2">
+            <StatusIndicator
+              status={isMarketOpen ? 'active' : 'inactive'}
+              label={isMarketOpen ? 'OPEN' : 'CLOSED'}
+              pulse={isMarketOpen}
+            />
+            <StatusIndicator
+              status={agentEnabled === true ? 'active' : 'inactive'}
+              label={agentEnabled === true ? 'ENABLED' : 'DISABLED'}
+              pulse={agentEnabled === true && !agentBusy}
+            />
+            <span className="hud-value-sm text-xs">${costs.total_usd.toFixed(4)}</span>
+          </div>
+          <MobileNav view={mobileView} onViewChange={setMobileView} />
+        </header>
+
+        {/* Desktop Grid Layout */}
+        <div className="hidden md:grid grid-cols-4 md:grid-cols-8 lg:grid-cols-12 gap-4">
           {/* Row 1: Account, Positions, LLM Costs */}
           <div className="col-span-4 md:col-span-4 lg:col-span-3">
             <Panel title="ACCOUNT" className="h-full">
@@ -1002,7 +1032,6 @@ export default function App() {
                 </div>
               ) : normalizedPositionSeries.length > 0 ? (
                 <div className="h-full flex flex-col">
-                  {/* Legend */}
                   <div className="flex flex-wrap gap-3 mb-2 pb-2 border-b border-hud-line/30 shrink-0">
                     {positions.slice(0, 5).map((pos: Position, idx: number) => {
                       const isPositive = pos.unrealized_pl >= 0
@@ -1022,7 +1051,6 @@ export default function App() {
                       )
                     })}
                   </div>
-                  {/* Stacked chart */}
                   <div className="flex-1 min-h-0 w-full">
                     <LineChart
                       series={normalizedPositionSeries.slice(0, 5)}
@@ -1042,14 +1070,13 @@ export default function App() {
             </Panel>
           </div>
 
-          {/* Row 2.5: Swarm Status */}
           <div className="col-span-4 md:col-span-8 lg:col-span-12">
              <SwarmDashboard swarm={status?.swarm} />
           </div>
 
           {/* Row 3: Signals, Activity, Research */}
-          <div className="col-span-4 md:col-span-4 lg:col-span-4">
-            <Panel title="ACTIVE SIGNALS" titleRight={signals.length.toString()} className="h-80">
+          <div className="col-span-4 lg:col-span-4">
+            <Panel title="ACTIVE SIGNALS" titleRight={signals.length.toString()} className="h-100">
               <div className="overflow-y-auto h-full space-y-1">
                 {signals.length === 0 ? (
                   <div className="text-hud-text-dim text-sm py-4 text-center">
@@ -1117,7 +1144,7 @@ export default function App() {
             </Panel>
           </div>
 
-          <div className="col-span-4 md:col-span-4 lg:col-span-4">
+          <div className="col-span-6 lg:col-span-4">
             <Panel
               title="ACTIVITY FEED"
               titleRight={
@@ -1126,12 +1153,12 @@ export default function App() {
                   <span className="hud-label text-hud-text-dim">{activityLogs.length} events</span>
                 </div>
               }
-              className="h-80"
+              className="h-100"
             >
               <div className="h-full flex flex-col gap-2">
                 <div className="grid grid-cols-3 gap-2">
                   <select
-                    className="hud-input h-8 text-xs"
+                    className="hud-input h-auto text-xs"
                     value={activityEventTypeFilter}
                     onChange={(e) => setActivityEventTypeFilter(e.target.value as ActivityEventTypeFilter)}
                   >
@@ -1142,7 +1169,7 @@ export default function App() {
                     ))}
                   </select>
                   <select
-                    className="hud-input h-8 text-xs"
+                    className="hud-input h-auto text-xs"
                     value={activitySeverityFilter}
                     onChange={(e) => setActivitySeverityFilter(e.target.value as ActivitySeverityFilter)}
                   >
@@ -1152,8 +1179,8 @@ export default function App() {
                       </option>
                     ))}
                   </select>
-                  <select
-                    className="hud-input h-8 text-xs"
+                  <select 
+                    className="hud-input h-auto text-xs"
                     value={activityTimeRangeFilter}
                     onChange={(e) => setActivityTimeRangeFilter(e.target.value as ActivityTimeRange)}
                   >
@@ -1240,8 +1267,8 @@ export default function App() {
             </Panel>
           </div>
 
-          <div className="col-span-4 md:col-span-8 lg:col-span-4">
-            <Panel title="SIGNAL RESEARCH" titleRight={Object.keys(status?.signalResearch || {}).length.toString()} className="h-80">
+          <div className="col-span-4 lg:col-span-4">
+            <Panel title="SIGNAL RESEARCH" titleRight={Object.keys(status?.signalResearch || {}).length.toString()} className="h-100">
               <div className="overflow-y-auto h-full space-y-2">
                 {Object.entries(status?.signalResearch || {}).length === 0 ? (
                   <div className="text-hud-text-dim text-sm py-4 text-center">
@@ -1335,44 +1362,245 @@ export default function App() {
           </div>
         </div>
 
-        <footer className="mt-4 pt-3 border-t border-hud-line flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3">
-          <div className="flex flex-wrap gap-4 md:gap-6">
+        {/* Mobile Responsive Views */}
+        <div className="md:hidden space-y-4">
+          {mobileView === 'overview' && (
+            <>
+              <Panel title="ACCOUNT">
+                {account ? (
+                  <div className="space-y-3">
+                    <Metric label="EQUITY" value={formatCurrency(account.equity)} size="lg" />
+                    <div className="grid grid-cols-2 gap-3">
+                      <Metric label="CASH" value={formatCurrency(account.cash)} size="sm" />
+                      <Metric label="POWER" value={formatCurrency(account.buying_power)} size="sm" />
+                    </div>
+                    <div className="pt-2 border-t border-hud-line">
+                      <Metric
+                        label="TOTAL P&L"
+                        value={`${formatCurrency(totalPl)} (${formatPercent(totalPlPct)})`}
+                        size="sm"
+                        color={totalPl >= 0 ? 'success' : 'error'}
+                      />
+                    </div>
+                  </div>
+                ) : (
+                  <div className="text-hud-text-dim text-sm">Loading...</div>
+                )}
+              </Panel>
+
+              <Panel title="PORTFOLIO" className="h-[250px]">
+                {portfolioChartData.length > 1 ? (
+                  <div className="h-full w-full">
+                    <LineChart
+                      series={[{ label: 'Equity', data: portfolioChartData, variant: totalPl >= 0 ? 'green' : 'red' }]}
+                      labels={portfolioChartLabels}
+                      showArea={true}
+                      showGrid={false}
+                      showDots={false}
+                      formatValue={(v) => `$${(v / 1000).toFixed(1)}k`}
+                    />
+                  </div>
+                ) : (
+                  <div className="h-full flex items-center justify-center text-hud-text-dim text-sm">
+                    Loading...
+                  </div>
+                )}
+              </Panel>
+
+              <Panel title="LLM COSTS">
+                <div className="grid grid-cols-2 gap-3">
+                  <Metric label="SPENT" value={`$${costs.total_usd.toFixed(4)}`} size="md" />
+                  <Metric label="CALLS" value={costs.calls.toString()} size="md" />
+                </div>
+              </Panel>
+            </>
+          )}
+
+          {mobileView === 'positions' && (
+            <>
+              <Panel title="POSITIONS" titleRight={`${positions.length}/${config?.max_positions || 5}`}>
+                {positions.length === 0 ? (
+                  <div className="text-hud-text-dim text-sm py-8 text-center">No open positions</div>
+                ) : (
+                  <div className="space-y-2">
+                    {positions.map((pos: Position) => {
+                      const plPct = safePercent(pos.unrealized_pl, pos.market_value - pos.unrealized_pl)
+                      const priceHistory = positionPriceHistories[pos.symbol] || []
+                      
+                      return (
+                        <div key={pos.symbol} className="p-3 border border-hud-line/30 rounded">
+                          <div className="flex justify-between items-start mb-2">
+                            <div>
+                              <div className="hud-value-sm">{pos.symbol}</div>
+                              <div className="text-xs text-hud-text-dim">{pos.qty} shares</div>
+                            </div>
+                            <div className="text-right">
+                              <div className={clsx(
+                                'hud-value-sm',
+                                pos.unrealized_pl >= 0 ? 'text-hud-success' : 'text-hud-error'
+                              )}>
+                                {formatCurrency(pos.unrealized_pl)}
+                              </div>
+                              <div className="text-xs text-hud-text-dim">{formatPercent(plPct)}</div>
+                            </div>
+                          </div>
+                          <Sparkline data={priceHistory} width={200} height={40} />
+                        </div>
+                      )
+                    })}
+                  </div>
+                )}
+              </Panel>
+            </>
+          )}
+
+          {mobileView === 'activity' && (
+            <Panel title="ACTIVITY FEED" className="h-[500px]">
+              <div className="h-full flex flex-col gap-2">
+                <div className="grid grid-cols-2 gap-2">
+                  <select
+                    className="hud-input h-auto text-xs"
+                    value={activityEventTypeFilter}
+                    onChange={(e) => setActivityEventTypeFilter(e.target.value as ActivityEventTypeFilter)}
+                  >
+                    {ACTIVITY_EVENT_TYPES.map((eventType) => (
+                      <option key={eventType} value={eventType}>
+                        {eventType === 'all' ? 'All' : getActivityTypeBadge(eventType)}
+                      </option>
+                    ))}
+                  </select>
+                  <select 
+                    className="hud-input h-auto text-xs"
+                    value={activityTimeRangeFilter}
+                    onChange={(e) => setActivityTimeRangeFilter(e.target.value as ActivityTimeRange)}
+                  >
+                    {ACTIVITY_TIME_RANGES.map((range) => (
+                      <option key={range} value={range}>
+                        {range === 'all' ? 'All' : range}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                <div className="overflow-y-auto flex-1 font-mono text-xs space-y-1">
+                  {activityLogs.length === 0 ? (
+                    <div className="text-hud-text-dim py-4 text-center">{activityEmptyText}</div>
+                  ) : (
+                    activityLogs.slice(0, 50).map((log: LogEntry, i: number) => {
+                      const eventType = getActivityType(log)
+                      const details = getActivityDescription(log)
+
+                      return (
+                        <div
+                          key={i}
+                          className="py-2 px-2 border rounded border-hud-line/20 bg-hud-panel/30"
+                        >
+                          <div className="flex justify-between mb-1">
+                            <span className={clsx('hud-label', getActivityTypeClass(eventType))}>
+                              {getActivityTypeBadge(eventType)}
+                            </span>
+                            <span className="text-hud-text-dim text-[10px]">
+                              {new Date(getActivityTimestampMs(log)).toLocaleTimeString('en-US', { hour12: false })}
+                            </span>
+                          </div>
+                          <div className="text-hud-text">{titleCaseAction(log.action)}</div>
+                          {details && (
+                            <div className="text-hud-text-dim text-[10px] mt-1">{details.slice(0, 80)}...</div>
+                          )}
+                        </div>
+                      )
+                    })
+                  )}
+                </div>
+              </div>
+            </Panel>
+          )}
+
+          {mobileView === 'signals' && (
+            <>
+              <Panel title="ACTIVE SIGNALS" titleRight={signals.length.toString()}>
+                <div className="space-y-1">
+                  {signals.length === 0 ? (
+                    <div className="text-hud-text-dim text-sm py-4 text-center">
+                      {status?.enabled === false ? 'Agent paused' : 'Gathering signals...'}
+                    </div>
+                  ) : (
+                    signals.slice(0, 10).map((sig: Signal, i: number) => (
+                      <div
+                        key={`${sig.symbol}-${sig.source}-${i}`}
+                        className="flex items-center justify-between py-2 px-2 border-b border-hud-line/10"
+                      >
+                        <div className="flex flex-col">
+                          <span className="hud-value-sm">{sig.symbol}</span>
+                          <span className="hud-label text-xs">{sig.source.toUpperCase()}</span>
+                        </div>
+                        <span className={clsx('hud-value-sm', getSentimentColor(sig.sentiment))}>
+                          {formatRatioPercent(sig.sentiment, 0)}
+                        </span>
+                      </div>
+                    ))
+                  )}
+                </div>
+              </Panel>
+
+              <Panel title="SIGNAL RESEARCH" titleRight={Object.keys(status?.signalResearch || {}).length.toString()}>
+                <div className="space-y-2">
+                  {Object.entries(status?.signalResearch || {}).length === 0 ? (
+                    <div className="text-hud-text-dim text-sm py-4 text-center">
+                      {signalResearchEmptyText}
+                    </div>
+                  ) : (
+                    Object.entries(status?.signalResearch || {})
+                      .sort(([, a], [, b]) => b.timestamp - a.timestamp)
+                      .slice(0, 5)
+                      .map(([symbol, research]: [string, SignalResearch]) => (
+                        <div key={symbol} className="p-2 border border-hud-line/30 rounded">
+                          <div className="flex justify-between items-center mb-1">
+                            <span className="hud-value-sm">{symbol}</span>
+                            <span className={clsx('hud-value-sm font-bold', getVerdictColor(research.verdict))}>
+                              {research.verdict}
+                            </span>
+                          </div>
+                          <p className="text-xs text-hud-text-dim leading-tight">{research.reasoning.slice(0, 100)}...</p>
+                        </div>
+                      ))
+                  )}
+                </div>
+              </Panel>
+            </>
+          )}
+        </div>
+      </div>
+
+      <footer className="mt-auto w-full border-t border-hud-line bg-hud-bg">
+        <div className="max-w-[1920px] mx-auto px-2 sm:px-4 py-2 flex flex-col sm:flex-row justify-between items-start sm:items-center gap-2 sm:gap-3">
+          <div className="flex flex-wrap gap-2 md:gap-4 text-xs sm:text-sm">
             {config && (
               <>
-                <MetricInline label="MAX POS" value={`$${config.max_position_value}`} />
-                <MetricInline label="MIN SENT" value={formatRatioPercent(config.min_sentiment_score, 0)} />
-                <MetricInline label="TAKE PROFIT" value={`${config.take_profit_pct}%`} />
-                <MetricInline label="STOP LOSS" value={`${config.stop_loss_pct}%`} />
-                <span className="hidden lg:inline text-hud-line">|</span>
+                <MetricInline label="MAX POS" value={`$${config.max_position_value}`} className="text-xs" />
+                <MetricInline label="TAKE PROFIT" value={`${config.take_profit_pct}%`} className="text-xs" />
+                <MetricInline label="STOP LOSS" value={`${config.stop_loss_pct}%`} className="text-xs" />
                 <MetricInline
                   label="OPTIONS"
                   value={config.options_enabled ? 'ON' : 'OFF'}
                   valueClassName={config.options_enabled ? 'text-hud-purple' : 'text-hud-text-dim'}
+                  className="text-xs hidden sm:flex"
                 />
-                {config.options_enabled && (
-                  <>
-                    <MetricInline label="OPT Δ" value={config.options_target_delta?.toFixed(2) || '0.35'} />
-                    <MetricInline label="OPT DTE" value={`${config.options_min_dte || 7}-${config.options_max_dte || 45}`} />
-                  </>
-                )}
-                <span className="hidden lg:inline text-hud-line">|</span>
                 <MetricInline
                   label="CRYPTO"
                   value={config.crypto_enabled ? '24/7' : 'OFF'}
                   valueClassName={config.crypto_enabled ? 'text-hud-warning' : 'text-hud-text-dim'}
+                  className="text-xs hidden sm:flex"
                 />
-                {config.crypto_enabled && (
-                  <MetricInline label="SYMBOLS" value={(config.crypto_symbols || ['BTC', 'ETH', 'SOL']).map(s => s.split('/')[0]).join('/')} />
-                )}
               </>
             )}
           </div>
-          <div className="flex items-center gap-4">
-            <span className="hud-label hidden md:inline">AUTONOMOUS TRADING SYSTEM</span>
-            <span className="hud-value-sm">PAPER MODE</span>
+          <div className="flex items-center gap-2 sm:gap-4">
+            <span className="hud-label hidden md:inline text-xs">AUTONOMOUS TRADING SYSTEM</span>
+            <span className="hud-value-sm text-xs">PAPER MODE</span>
           </div>
-        </footer>
-      </div>
+        </div>
+      </footer>
 
       <AnimatePresence>
         {showSettings && config && (
