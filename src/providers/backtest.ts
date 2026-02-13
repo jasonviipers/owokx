@@ -1,4 +1,5 @@
 import { createError, ErrorCode } from "../lib/errors";
+import { generateId } from "../lib/utils";
 import type {
   Account,
   Asset,
@@ -17,7 +18,6 @@ import type {
   Quote,
   Snapshot,
 } from "./types";
-import { generateId } from "../lib/utils";
 
 export interface BacktestMarketDataConfig {
   now_ms: number;
@@ -52,6 +52,10 @@ export class BacktestMarketDataProvider implements MarketDataProvider {
 
   getNow(): number {
     return this.nowMs;
+  }
+
+  getSlippageBps(): number {
+    return this.slippageBps;
   }
 
   async getBars(symbol: string, _timeframe: string, params?: BarsParams): Promise<Bar[]> {
@@ -303,7 +307,8 @@ export class BacktestBrokerProvider implements BrokerProvider {
     }
 
     // Slippage simulation
-    const slippage = this.marketData["slippageBps"] ? (fillPrice * this.marketData["slippageBps"]) / 10000 : 0;
+    const slippageBps = this.marketData.getSlippageBps();
+    const slippage = slippageBps ? (fillPrice * slippageBps) / 10000 : 0;
     const finalPrice = params.side === "buy" ? fillPrice + slippage : fillPrice - slippage;
 
     if (params.side === "buy") {

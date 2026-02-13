@@ -1,6 +1,6 @@
+import type { Env } from "../env.d";
 import { AgentBase, type AgentBaseState } from "../lib/agents/base";
 import type { AgentMessage, AgentType } from "../lib/agents/protocol";
-import type { Env } from "../env.d";
 
 interface RiskManagerState extends AgentBaseState {
   dailyLoss: number;

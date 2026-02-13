@@ -1,13 +1,13 @@
+import type { Env } from "../env.d";
 import { AgentBase, type AgentBaseState } from "../lib/agents/base";
 import {
-  createMessageId,
   type AgentMessage,
   type AgentStatus,
   type AgentType,
+  createMessageId,
   type QueuedMessage,
   type SwarmState,
 } from "../lib/agents/protocol";
-import type { Env } from "../env.d";
 
 interface RegistryState extends AgentBaseState, SwarmState {
   lastDispatchAt: number;

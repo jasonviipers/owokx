@@ -1515,10 +1515,12 @@ export class OwokxHarness extends DurableObject<Env> {
         }
       }
 
-      if (!this.state.optimization.lastOptimizationAt || now - this.state.optimization.lastOptimizationAt >= OPTIMIZATION_INTERVAL_MS) {
+      if (
+        !this.state.optimization.lastOptimizationAt ||
+        now - this.state.optimization.lastOptimizationAt >= OPTIMIZATION_INTERVAL_MS
+      ) {
         this.optimizeRuntimeParameters(now);
       }
-
     } catch (error) {
       this.log("System", "alarm_error", { error: String(error) });
       this.recordPerformanceSample("analyst", this.state.optimization.analystLatencyEmaMs || 1_000, true);
@@ -2148,7 +2150,8 @@ export class OwokxHarness extends DurableObject<Env> {
     }
     if (search.length > 0) {
       filtered = filtered.filter((entry) => {
-        const haystack = `${entry.agent} ${entry.action} ${entry.description} ${JSON.stringify(entry.metadata)}`.toLowerCase();
+        const haystack =
+          `${entry.agent} ${entry.action} ${entry.description} ${JSON.stringify(entry.metadata)}`.toLowerCase();
         return haystack.includes(search);
       });
     }
@@ -2499,7 +2502,11 @@ export class OwokxHarness extends DurableObject<Env> {
     try {
       const id = this.env.DATA_SCOUT.idFromName("default");
       const stub = this.env.DATA_SCOUT.get(id);
-      const res = await this.withTimeout(stub.fetch("http://data-scout/signals"), DATA_GATHERER_TIMEOUT_MS.scout, "scout_signals_timeout");
+      const res = await this.withTimeout(
+        stub.fetch("http://data-scout/signals"),
+        DATA_GATHERER_TIMEOUT_MS.scout,
+        "scout_signals_timeout"
+      );
       if (!res.ok) {
         this.log("Scout", "signals_fetch_failed", { status: res.status });
         return [];
@@ -3687,7 +3694,9 @@ export class OwokxHarness extends DurableObject<Env> {
       freshness: this.clamp01(signal.freshness),
       sourceDiversity: this.clamp01(sourceDiversity / 4),
       logVolume: this.clamp01(Math.log10(Math.max(1, signal.volume || 1)) / 3),
-      regimeAlignment: this.clamp01((this.computeRegimeAlignment(signal.sentiment, this.state.marketRegime.type) + 1) / 2),
+      regimeAlignment: this.clamp01(
+        (this.computeRegimeAlignment(signal.sentiment, this.state.marketRegime.type) + 1) / 2
+      ),
     };
     const linear =
       model.bias +
@@ -3712,7 +3721,8 @@ export class OwokxHarness extends DurableObject<Env> {
     model.weights.freshness += lr * error * 0.15;
     model.weights.sourceDiversity += lr * error * Math.min(1, (entry?.entry_sources?.length || 1) / 4);
     model.weights.logVolume += lr * error * Math.min(1, Math.log10(Math.max(1, entry?.entry_social_volume || 1)) / 3);
-    model.weights.regimeAlignment += lr * error * (entry?.entry_regime === "trending" ? 0.5 : entry?.entry_regime === "volatile" ? -0.2 : 0.1);
+    model.weights.regimeAlignment +=
+      lr * error * (entry?.entry_regime === "trending" ? 0.5 : entry?.entry_regime === "volatile" ? -0.2 : 0.1);
     model.weights.sentiment = Math.max(-3, Math.min(3, model.weights.sentiment));
     model.weights.freshness = Math.max(-3, Math.min(3, model.weights.freshness));
     model.weights.sourceDiversity = Math.max(-3, Math.min(3, model.weights.sourceDiversity));
@@ -3721,9 +3731,10 @@ export class OwokxHarness extends DurableObject<Env> {
 
     model.samples += 1;
     model.hitRate =
-      ((model.hitRate * Math.max(0, model.samples - 1) + (error === 0 ? 1 : target === (prediction >= 0.5 ? 1 : 0) ? 1 : 0)) /
-        model.samples) || 0;
-    model.mse = ((model.mse * Math.max(0, model.samples - 1) + error ** 2) / model.samples) || 0;
+      (model.hitRate * Math.max(0, model.samples - 1) +
+        (error === 0 ? 1 : target === (prediction >= 0.5 ? 1 : 0) ? 1 : 0)) /
+        model.samples || 0;
+    model.mse = (model.mse * Math.max(0, model.samples - 1) + error ** 2) / model.samples || 0;
     model.lastUpdatedAt = Date.now();
 
     const upper = symbol.toUpperCase();
@@ -3763,14 +3774,21 @@ export class OwokxHarness extends DurableObject<Env> {
   private runStressTest(account: Account, positions: Position[]): StressTestResult {
     const totalExposure = positions.reduce((sum, pos) => sum + Math.max(0, pos.market_value || 0), 0);
     const cryptoExposure = positions
-      .filter((pos) => isCryptoSymbol(pos.symbol, this.state.config.crypto_symbols || []) || pos.asset_class === "crypto")
+      .filter(
+        (pos) => isCryptoSymbol(pos.symbol, this.state.config.crypto_symbols || []) || pos.asset_class === "crypto"
+      )
       .reduce((sum, pos) => sum + Math.max(0, pos.market_value || 0), 0);
     const equityExposure = Math.max(0, totalExposure - cryptoExposure);
     const historicalShockPct = this.deriveHistoricalShockPct();
 
     const scenarios: Array<{ name: string; shockPct: number; projectedLoss: number; projectedDrawdownPct: number }> = [
       { name: "flash_crash", shockPct: -0.1, projectedLoss: totalExposure * 0.1, projectedDrawdownPct: 0 },
-      { name: "macro_bear", shockPct: -0.16, projectedLoss: equityExposure * 0.16 + cryptoExposure * 0.2, projectedDrawdownPct: 0 },
+      {
+        name: "macro_bear",
+        shockPct: -0.16,
+        projectedLoss: equityExposure * 0.16 + cryptoExposure * 0.2,
+        projectedDrawdownPct: 0,
+      },
       { name: "volatility_spike", shockPct: -0.12, projectedLoss: totalExposure * 0.12, projectedDrawdownPct: 0 },
       {
         name: "historical_10pct_tail",
@@ -3787,7 +3805,9 @@ export class OwokxHarness extends DurableObject<Env> {
     const worstCaseLoss = scenarios.reduce((max, scenario) => Math.max(max, scenario.projectedLoss), 0);
     const worstCaseDrawdownPct = account.equity > 0 ? worstCaseLoss / account.equity : 1;
     const passed = worstCaseDrawdownPct <= 0.12;
-    const recommendedRiskMultiplier = passed ? Math.max(0.7, 1 - worstCaseDrawdownPct) : Math.max(0.3, 0.95 - worstCaseDrawdownPct * 2.5);
+    const recommendedRiskMultiplier = passed
+      ? Math.max(0.7, 1 - worstCaseDrawdownPct)
+      : Math.max(0.3, 0.95 - worstCaseDrawdownPct * 2.5);
 
     const report: StressTestResult = {
       timestamp: Date.now(),
@@ -3857,9 +3877,15 @@ export class OwokxHarness extends DurableObject<Env> {
     let analyst = opt.adaptiveAnalystIntervalMs || this.state.config.analyst_interval_ms;
 
     const overloaded =
-      opt.errorRateEma > 0.2 || opt.gatherLatencyEmaMs > 4_000 || opt.researchLatencyEmaMs > 7_000 || opt.analystLatencyEmaMs > 8_000;
+      opt.errorRateEma > 0.2 ||
+      opt.gatherLatencyEmaMs > 4_000 ||
+      opt.researchLatencyEmaMs > 7_000 ||
+      opt.analystLatencyEmaMs > 8_000;
     const healthy =
-      opt.errorRateEma < 0.05 && opt.gatherLatencyEmaMs > 0 && opt.gatherLatencyEmaMs < 2_000 && opt.researchLatencyEmaMs < 4_000;
+      opt.errorRateEma < 0.05 &&
+      opt.gatherLatencyEmaMs > 0 &&
+      opt.gatherLatencyEmaMs < 2_000 &&
+      opt.researchLatencyEmaMs < 4_000;
 
     if (overloaded) {
       dataPoll = Math.min(maxDataPoll, Math.round(dataPoll * 1.15));
@@ -4020,8 +4046,7 @@ export class OwokxHarness extends DurableObject<Env> {
     const volatilityPenalty = Math.max(0, (metrics.realizedVolatility - 0.01) * 12);
     const drawdownPenalty = Math.max(0, metrics.maxDrawdownPct * 3);
     const dailyLossPenalty = Math.max(0, -dailyPnlPct * 5);
-    const regimePenalty =
-      metrics.regime === "volatile" ? 0.25 : metrics.regime === "trending" ? -0.05 : 0.05;
+    const regimePenalty = metrics.regime === "volatile" ? 0.25 : metrics.regime === "trending" ? -0.05 : 0.05;
     const stressPenalty = this.state.lastStressTest
       ? 1 - this.clamp01(this.state.lastStressTest.recommendedRiskMultiplier)
       : 0;
@@ -4178,7 +4203,9 @@ export class OwokxHarness extends DurableObject<Env> {
       return {
         approved: Boolean(payload.approved),
         adjustedConfidence:
-          typeof payload.adjustedConfidence === "number" ? this.clamp01(payload.adjustedConfidence) : this.clamp01(confidence),
+          typeof payload.adjustedConfidence === "number"
+            ? this.clamp01(payload.adjustedConfidence)
+            : this.clamp01(confidence),
         reasons: Array.isArray(payload.reasons) ? payload.reasons.map((reason) => String(reason)) : [],
       };
     } catch (error) {
@@ -4223,7 +4250,8 @@ export class OwokxHarness extends DurableObject<Env> {
       const mapped: Record<string, ResearchResult> = {};
       for (const [symbolKey, value] of Object.entries(payload.results ?? {})) {
         const symbol = (value.symbol || symbolKey).toUpperCase();
-        const verdict = value.verdict === "BUY" || value.verdict === "SKIP" || value.verdict === "WAIT" ? value.verdict : "WAIT";
+        const verdict =
+          value.verdict === "BUY" || value.verdict === "SKIP" || value.verdict === "WAIT" ? value.verdict : "WAIT";
         const confidence = this.clamp01(typeof value.confidence === "number" ? value.confidence : 0);
         const sentiment = sentimentBySymbol.get(symbol) ?? 0;
         mapped[symbol] = {
@@ -4456,7 +4484,13 @@ export class OwokxHarness extends DurableObject<Env> {
     const upperContent = objectCandidate.toUpperCase();
     const verdict =
       inferredVerdict ??
-      (/\bBUY\b/.test(upperContent) ? "BUY" : /\bSKIP\b/.test(upperContent) ? "SKIP" : /\bWAIT\b/.test(upperContent) ? "WAIT" : "WAIT");
+      (/\bBUY\b/.test(upperContent)
+        ? "BUY"
+        : /\bSKIP\b/.test(upperContent)
+          ? "SKIP"
+          : /\bWAIT\b/.test(upperContent)
+            ? "WAIT"
+            : "WAIT");
 
     const confidenceRaw =
       typeof parsed.confidence === "number"
@@ -4569,7 +4603,9 @@ export class OwokxHarness extends DurableObject<Env> {
         sentiment: matchingSignal?.sentiment ?? sentimentScore,
         freshness: matchingSignal?.freshness ?? 0.5,
         volume: matchingSignal?.volume ?? 1,
-        sourceDiversity: new Set(this.state.signalCache.filter((signal) => signal.symbol === symbol).map((signal) => signal.source)).size,
+        sourceDiversity: new Set(
+          this.state.signalCache.filter((signal) => signal.symbol === symbol).map((signal) => signal.source)
+        ).size,
       });
       const memorySummary = this.getRelevantMemoryEpisodes([symbol, "research", "risk"], 3)
         .map(
@@ -4867,7 +4903,9 @@ export class OwokxHarness extends DurableObject<Env> {
         });
         const recentResearch = this.state.signalResearch[entry.symbol];
         const recentlyResearched =
-          !!recentResearch && Number.isFinite(recentResearch.timestamp) && now - recentResearch.timestamp < 15 * 60 * 1000;
+          !!recentResearch &&
+          Number.isFinite(recentResearch.timestamp) &&
+          now - recentResearch.timestamp < 15 * 60 * 1000;
         const recentPenalty = recentlyResearched ? 0.2 : 0;
 
         const priority =
@@ -5108,7 +5146,9 @@ Provide a brief risk assessment and recommendation (HOLD, SELL, or ADD). JSON fo
       })
     );
     const memoryLessons = this.getRelevantMemoryEpisodes(["analyst", "risk", "trade"], 4)
-      .map((episode) => `- ${episode.context} (${episode.outcome}, importance ${(episode.importance * 100).toFixed(0)}%)`)
+      .map(
+        (episode) => `- ${episode.context} (${episode.outcome}, importance ${(episode.importance * 100).toFixed(0)}%)`
+      )
       .join("\n");
 
     const prompt = `Current Time: ${new Date().toISOString()}
@@ -5407,7 +5447,10 @@ Response format:
             finalConfidence = finalConfidence * 0.85;
           }
         }
-        finalConfidence = this.applyRegimeConfidenceAdjustment(finalConfidence, originalSignal?.sentiment || finalConfidence);
+        finalConfidence = this.applyRegimeConfidenceAdjustment(
+          finalConfidence,
+          originalSignal?.sentiment || finalConfidence
+        );
 
         if (finalConfidence < this.state.config.min_analyst_confidence) continue;
         if (stressFailed && finalConfidence < 0.85) {
@@ -5444,8 +5487,9 @@ Response format:
             sentiment: originalSignal?.sentiment ?? finalConfidence,
             freshness: originalSignal?.freshness ?? 0.5,
             volume: originalSignal?.volume ?? 1,
-            sourceDiversity: new Set(this.state.signalCache.filter((s) => s.symbol === research.symbol).map((s) => s.source))
-              .size,
+            sourceDiversity: new Set(
+              this.state.signalCache.filter((s) => s.symbol === research.symbol).map((s) => s.source)
+            ).size,
           });
           this.state.positionEntries[research.symbol] = {
             symbol: research.symbol,
@@ -5513,8 +5557,9 @@ Response format:
               sentiment: originalSignal?.sentiment ?? rec.confidence,
               freshness: originalSignal?.freshness ?? 0.5,
               volume: originalSignal?.volume ?? 1,
-              sourceDiversity: new Set(this.state.signalCache.filter((s) => s.symbol === rec.symbol).map((s) => s.source))
-                .size,
+              sourceDiversity: new Set(
+                this.state.signalCache.filter((s) => s.symbol === rec.symbol).map((s) => s.source)
+              ).size,
             });
             heldSymbols.add(rec.symbol);
             this.state.positionEntries[rec.symbol] = {
@@ -6280,7 +6325,13 @@ Response format:
   private normalizeLogSeverity(value: unknown): ActivitySeverity | null {
     if (typeof value !== "string") return null;
     const normalized = value.trim().toLowerCase();
-    if (normalized === "debug" || normalized === "info" || normalized === "warning" || normalized === "error" || normalized === "critical") {
+    if (
+      normalized === "debug" ||
+      normalized === "info" ||
+      normalized === "warning" ||
+      normalized === "error" ||
+      normalized === "critical"
+    ) {
       return normalized;
     }
     return null;
@@ -6455,11 +6506,21 @@ Response format:
       return "trade";
     }
 
-    if (actionKey.includes("swarm") || actionKey.includes("registry") || actionKey.includes("heartbeat") || agentKey.includes("swarm")) {
+    if (
+      actionKey.includes("swarm") ||
+      actionKey.includes("registry") ||
+      actionKey.includes("heartbeat") ||
+      agentKey.includes("swarm")
+    ) {
       return "swarm";
     }
 
-    if (actionKey.includes("risk") || actionKey.includes("stress") || actionKey.includes("kill_switch") || agentKey.includes("risk")) {
+    if (
+      actionKey.includes("risk") ||
+      actionKey.includes("stress") ||
+      actionKey.includes("kill_switch") ||
+      agentKey.includes("risk")
+    ) {
       return "risk";
     }
 
@@ -6500,9 +6561,15 @@ Response format:
     const actionKey = action.toLowerCase();
     const errorText = typeof details.error === "string" ? details.error.toLowerCase() : "";
     const messageText = typeof details.message === "string" ? details.message.toLowerCase() : "";
-    if (actionKey.includes("kill_switch") || errorText.includes("panic") || messageText.includes("panic")) return "critical";
+    if (actionKey.includes("kill_switch") || errorText.includes("panic") || messageText.includes("panic"))
+      return "critical";
     if (actionKey.includes("error") || actionKey.includes("failed") || errorText.length > 0) return "error";
-    if (actionKey.includes("warning") || actionKey.includes("skipped") || actionKey.includes("deferred") || actionKey.includes("blocked")) {
+    if (
+      actionKey.includes("warning") ||
+      actionKey.includes("skipped") ||
+      actionKey.includes("deferred") ||
+      actionKey.includes("blocked")
+    ) {
       return "warning";
     }
     if (actionKey.includes("debug")) return "debug";
@@ -6514,11 +6581,14 @@ Response format:
     if (explicit) return explicit;
 
     const actionKey = action.toLowerCase();
-    if (actionKey.includes("starting") || actionKey.endsWith("_start") || actionKey.includes("_start_")) return "started";
-    if (actionKey.includes("running") || actionKey.includes("processing") || actionKey.includes("dispatching")) return "in_progress";
+    if (actionKey.includes("starting") || actionKey.endsWith("_start") || actionKey.includes("_start_"))
+      return "started";
+    if (actionKey.includes("running") || actionKey.includes("processing") || actionKey.includes("dispatching"))
+      return "in_progress";
     if (actionKey.includes("failed") || actionKey.includes("error")) return "failed";
     if (actionKey.includes("warning")) return "warning";
-    if (actionKey.includes("skipped") || actionKey.includes("blocked") || actionKey.includes("deferred")) return "skipped";
+    if (actionKey.includes("skipped") || actionKey.includes("blocked") || actionKey.includes("deferred"))
+      return "skipped";
     if (
       actionKey.includes("complete") ||
       actionKey.includes("success") ||
@@ -6572,7 +6642,10 @@ Response format:
     const status = this.classifyLogStatus(action, metadata);
 
     return {
-      id: typeof details.id === "string" && details.id ? details.id : `${nowMs.toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+      id:
+        typeof details.id === "string" && details.id
+          ? details.id
+          : `${nowMs.toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
       timestamp,
       timestamp_ms: nowMs,
       agent,
@@ -6594,7 +6667,8 @@ Response format:
     const action = typeof raw.action === "string" && raw.action.trim().length > 0 ? raw.action : "event";
     const timestampValue = typeof raw.timestamp === "string" ? raw.timestamp : new Date().toISOString();
     const parsedMs = Date.parse(timestampValue);
-    const timestampMs = typeof raw.timestamp_ms === "number" && Number.isFinite(raw.timestamp_ms) ? raw.timestamp_ms : parsedMs;
+    const timestampMs =
+      typeof raw.timestamp_ms === "number" && Number.isFinite(raw.timestamp_ms) ? raw.timestamp_ms : parsedMs;
     const metadataFromRaw = this.isRecord(raw.metadata) ? raw.metadata : {};
     const metadata: Record<string, unknown> = { ...metadataFromRaw };
 
@@ -6618,7 +6692,8 @@ Response format:
 
     const sanitizedMetadata = this.sanitizeLogDetails(metadata);
     const summary = this.getLogSummaryFields(sanitizedMetadata);
-    const eventType = this.normalizeEventType(raw.event_type) ?? this.classifyEventType(agent, action, sanitizedMetadata);
+    const eventType =
+      this.normalizeEventType(raw.event_type) ?? this.classifyEventType(agent, action, sanitizedMetadata);
     const severity = this.normalizeLogSeverity(raw.severity) ?? this.classifyLogSeverity(action, sanitizedMetadata);
     const status = this.normalizeLogStatus(raw.status) ?? this.classifyLogStatus(action, sanitizedMetadata);
     const description =
@@ -6629,7 +6704,10 @@ Response format:
     const safeTimestampMs = Number.isFinite(timestampMs) ? timestampMs : nowMs;
 
     return {
-      id: typeof raw.id === "string" && raw.id.trim().length > 0 ? raw.id : `legacy-${safeTimestampMs.toString(36)}-${index}`,
+      id:
+        typeof raw.id === "string" && raw.id.trim().length > 0
+          ? raw.id
+          : `legacy-${safeTimestampMs.toString(36)}-${index}`,
       timestamp: Number.isFinite(parsedMs) ? timestampValue : new Date(safeTimestampMs).toISOString(),
       timestamp_ms: safeTimestampMs,
       agent,
@@ -6698,7 +6776,7 @@ Response format:
 
     const safeTokensIn = Number.isFinite(tokensIn) ? Math.max(0, tokensIn) : 0;
     const safeTokensOut = Number.isFinite(tokensOut) ? Math.max(0, tokensOut) : 0;
-    const normalizedModel = model.includes("/") ? model.split("/", 2)[1] ?? model : model;
+    const normalizedModel = model.includes("/") ? (model.split("/", 2)[1] ?? model) : model;
     const rates = pricing[normalizedModel] ?? pricing[model] ?? pricing["gpt-4o-mini"]!;
     const cost = (safeTokensIn * rates.input + safeTokensOut * rates.output) / 1_000_000;
 
@@ -6724,7 +6802,7 @@ Response format:
         .catch((error) => {
           clearTimeout(timeoutHandle);
           reject(error);
-      });
+        });
     });
   }
 
@@ -6740,9 +6818,7 @@ Response format:
     const entries = Object.entries(record);
     if (entries.length <= maxEntries) return record;
     return Object.fromEntries(
-      entries
-        .sort((a, b) => (b[1]?.timestamp ?? 0) - (a[1]?.timestamp ?? 0))
-        .slice(0, maxEntries)
+      entries.sort((a, b) => (b[1]?.timestamp ?? 0) - (a[1]?.timestamp ?? 0)).slice(0, maxEntries)
     );
   }
 
