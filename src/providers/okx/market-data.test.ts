@@ -23,4 +23,16 @@ describe("OKX Market Data Provider", () => {
     expect(bars[0]!.o).toBe(1);
     expect(bars[1]!.o).toBe(2);
   });
+
+  it("rejects non-crypto pair symbols before issuing OKX requests", async () => {
+    const requestMock = vi.fn();
+    const client = { request: requestMock } as unknown as OkxClient;
+
+    const provider = new OkxMarketDataProvider(client, "USDT");
+
+    await expect(provider.getBars("TLT", "1Min", { limit: 2 })).rejects.toThrow(
+      "requires an explicit crypto pair symbol"
+    );
+    expect(requestMock).not.toHaveBeenCalled();
+  });
 });

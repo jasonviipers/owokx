@@ -157,7 +157,15 @@ export abstract class AgentBase<TState extends AgentBaseState = AgentBaseState> 
   }
 
   protected log(level: "info" | "warn" | "error", message: string, data?: unknown): void {
-    console.log(`[${this.agentType}] ${level.toUpperCase()}: ${message}`, data ? JSON.stringify(data) : "");
+    const payload = {
+      provider: "agent",
+      agent: this.agentType,
+      level,
+      message,
+      timestamp: new Date().toISOString(),
+      ...(data && typeof data === "object" ? (data as Record<string, unknown>) : data ? { data } : {}),
+    };
+    console.log(JSON.stringify(payload));
   }
 
   protected async registerWithSwarm(): Promise<void> {

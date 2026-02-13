@@ -36,9 +36,16 @@ export interface Signal {
 }
 
 export interface LogEntry {
+  id?: string
   timestamp: string
+  timestamp_ms?: number
   agent: string
   action: string
+  event_type?: 'agent' | 'trade' | 'crypto' | 'research' | 'system' | 'swarm' | 'risk' | 'data' | 'api'
+  severity?: 'debug' | 'info' | 'warning' | 'error' | 'critical'
+  status?: 'info' | 'started' | 'in_progress' | 'success' | 'warning' | 'failed' | 'skipped'
+  description?: string
+  metadata?: Record<string, unknown>
   symbol?: string
   [key: string]: unknown
 }
@@ -97,6 +104,7 @@ export interface Config {
 
   // Custom ticker blacklist (insider trading restrictions, etc.)
   ticker_blacklist?: string[]
+  allow_unhealthy_swarm?: boolean
 }
 
 export interface SignalResearch {

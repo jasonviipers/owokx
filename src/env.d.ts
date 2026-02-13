@@ -53,6 +53,9 @@ export interface Env {
   KILL_SWITCH_ACTIVE?: string;
 
   ENVIRONMENT: string;
+  SWARM_ALLOW_UNHEALTHY?: string;
+  SWARM_ALLOW_DEGRADED?: string;
+  SWARM_HEALTH_BYPASS?: string;
   FEATURE_LLM_RESEARCH: string;
   FEATURE_OPTIONS: string;
 

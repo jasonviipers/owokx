@@ -47,6 +47,17 @@ type ProviderFactory =
   | ReturnType<typeof createXai>
   | ReturnType<typeof createDeepSeek>;
 
+function isAuthFailure(error: unknown): boolean {
+  const message = String(error).toLowerCase();
+  return (
+    message.includes("authentication fails") ||
+    message.includes("invalid api key") ||
+    message.includes("unauthorized") ||
+    message.includes("http 401") ||
+    message.includes("status 401")
+  );
+}
+
 /**
  * AI SDK Provider - Supports multiple AI providers via Vercel AI SDK
  *
@@ -97,6 +108,9 @@ export class AISDKProvider implements LLMProvider {
   }
 
   async complete(params: CompletionParams): Promise<CompletionResult> {
+    const startedAt = Date.now();
+    let providerNameForLog = "unknown";
+    let modelId = params.model ?? this.defaultModel;
     try {
       const modelSpec = params.model ?? this.defaultModel;
 
@@ -104,37 +118,128 @@ export class AISDKProvider implements LLMProvider {
       const separator = modelSpec.includes(":") ? ":" : "/";
       const parts = modelSpec.split(separator);
       const providerName = (parts[0] ?? "openai").toLowerCase() as SupportedProvider;
-      const modelId = parts.slice(1).join(separator) || modelSpec;
+      providerNameForLog = providerName;
+      modelId = parts.slice(1).join(separator) || modelSpec;
 
-      // Get provider instance
-      const provider = this.providers[providerName];
-      if (!provider) {
-        const available = this.getAvailableProviders().join(", ");
-        throw createError(
-          ErrorCode.INVALID_INPUT,
-          `Provider '${providerName}' not configured. Available: ${available}`
-        );
+      const runAttempt = async (
+        selectedProvider: SupportedProvider,
+        selectedModelId: string
+      ): Promise<{ completion: CompletionResult; provider: SupportedProvider; model: string }> => {
+        const provider = this.providers[selectedProvider];
+        if (!provider) {
+          const available = this.getAvailableProviders().join(", ");
+          throw createError(
+            ErrorCode.INVALID_INPUT,
+            `Provider '${selectedProvider}' not configured. Available: ${available}`
+          );
+        }
+
+        const result = await generateText({
+          model: provider(selectedModelId),
+          messages: params.messages.map((msg) => ({
+            role: msg.role,
+            content: msg.content,
+          })),
+          temperature: params.temperature ?? 0.7,
+          maxOutputTokens: params.max_tokens ?? 1024,
+        });
+
+        return {
+          provider: selectedProvider,
+          model: selectedModelId,
+          completion: {
+            content: result.text,
+            usage: {
+              prompt_tokens: result.usage?.inputTokens ?? 0,
+              completion_tokens: result.usage?.outputTokens ?? 0,
+              total_tokens: result.usage?.totalTokens ?? 0,
+            },
+            provider: selectedProvider,
+            model: `${selectedProvider}/${selectedModelId}`,
+          },
+        };
+      };
+
+      let selectedProvider = providerName;
+      let selectedModelId = modelId;
+      let attempt: { completion: CompletionResult; provider: SupportedProvider; model: string };
+      try {
+        attempt = await runAttempt(selectedProvider, selectedModelId);
+      } catch (error) {
+        if (!isAuthFailure(error)) {
+          throw error;
+        }
+
+        const fallbackProvider = this.getAvailableProviders().find((candidate) => candidate !== providerName);
+        if (!fallbackProvider) {
+          throw error;
+        }
+
+        const fallbackModel = PROVIDER_MODELS[fallbackProvider]?.[0] ?? selectedModelId;
+        providerNameForLog = fallbackProvider;
+        modelId = fallbackModel;
+        try {
+          console.warn(
+            JSON.stringify({
+              provider: "llm",
+              engine: "ai-sdk",
+              level: "warn",
+              event: "provider_fallback",
+              from_provider: providerName,
+              from_model: selectedModelId,
+              to_provider: fallbackProvider,
+              to_model: fallbackModel,
+              reason: String(error),
+              timestamp: new Date().toISOString(),
+            })
+          );
+        } catch {
+          // ignore logging errors
+        }
+
+        selectedProvider = fallbackProvider;
+        selectedModelId = fallbackModel;
+        attempt = await runAttempt(fallbackProvider, fallbackModel);
       }
 
-      const result = await generateText({
-        model: provider(modelId),
-        messages: params.messages.map((msg) => ({
-          role: msg.role,
-          content: msg.content,
-        })),
-        temperature: params.temperature ?? 0.7,
-        maxOutputTokens: params.max_tokens ?? 1024,
-      });
-
-      return {
-        content: result.text,
-        usage: {
-          prompt_tokens: result.usage?.inputTokens ?? 0,
-          completion_tokens: result.usage?.outputTokens ?? 0,
-          total_tokens: result.usage?.totalTokens ?? 0,
-        },
-      };
+      const latencyMs = Date.now() - startedAt;
+      const completion = attempt.completion;
+      try {
+        console.log(
+          JSON.stringify({
+            provider: "llm",
+            engine: "ai-sdk",
+            vendor: selectedProvider,
+            model: selectedModelId,
+            latency_ms: latencyMs,
+            tokens_in: completion.usage.prompt_tokens,
+            tokens_out: completion.usage.completion_tokens,
+            total_tokens: completion.usage.total_tokens,
+            timestamp: new Date().toISOString(),
+          })
+        );
+      } catch {
+        // ignore logging errors
+      }
+      return completion;
     } catch (error) {
+      const latencyMs = Date.now() - startedAt;
+      try {
+        console.error(
+          JSON.stringify({
+            provider: "llm",
+            engine: "ai-sdk",
+            level: "error",
+            vendor: providerNameForLog,
+            model: modelId,
+            latency_ms: latencyMs,
+            error: String(error),
+            timestamp: new Date().toISOString(),
+          })
+        );
+      } catch {
+        // ignore logging errors
+      }
       throw createError(ErrorCode.PROVIDER_ERROR, `AI SDK error: ${String(error)}`);
     }
   }

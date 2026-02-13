@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { normalizeOkxSymbol } from "./symbols";
+import { hasExplicitOkxQuote, normalizeOkxSymbol } from "./symbols";
 
 describe("OKX symbol normalization", () => {
   it("maps USD quote symbols to configured default quote", () => {
@@ -12,5 +12,14 @@ describe("OKX symbol normalization", () => {
     const info = normalizeOkxSymbol("ETH/USDC", "USDT");
     expect(info.instId).toBe("ETH-USDC");
     expect(info.normalizedSymbol).toBe("ETH/USDC");
+  });
+
+  it("validates explicit OKX quote symbols", () => {
+    expect(hasExplicitOkxQuote("BTC/USDT")).toBe(true);
+    expect(hasExplicitOkxQuote("ETH-USDC")).toBe(true);
+    expect(hasExplicitOkxQuote("SOLUSDT")).toBe(true);
+
+    expect(hasExplicitOkxQuote("TLT")).toBe(false);
+    expect(hasExplicitOkxQuote("MON.X")).toBe(false);
   });
 });

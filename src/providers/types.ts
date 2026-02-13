@@ -316,6 +316,8 @@ export interface CompletionResult {
     completion_tokens: number;
     total_tokens: number;
   };
+  provider?: string;
+  model?: string;
 }
 
 export interface LLMProvider {

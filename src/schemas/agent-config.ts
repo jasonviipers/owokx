@@ -46,6 +46,7 @@ export const AgentConfigSchema = z
     crypto_stop_loss_pct: z.number().min(1).max(50),
 
     ticker_blacklist: z.array(z.string()),
+    allow_unhealthy_swarm: z.boolean().optional(),
   })
   .refine((data) => data.options_min_delta < data.options_max_delta, {
     message: "options_min_delta must be less than options_max_delta",

@@ -1,7 +1,7 @@
 import { createError, ErrorCode } from "../../lib/errors";
 import type { Bar, BarsParams, MarketDataProvider, Quote, Snapshot } from "../types";
 import type { OkxClient } from "./client";
-import { normalizeOkxSymbol } from "./symbols";
+import { hasExplicitOkxQuote, normalizeOkxSymbol } from "./symbols";
 
 interface OkxTicker {
   instId: string;
@@ -54,6 +54,17 @@ function candleToBar(c: OkxCandle): Bar {
   };
 }
 
+function assertOkxMarketSymbol(symbol: string): void {
+  if (hasExplicitOkxQuote(symbol)) {
+    return;
+  }
+
+  throw createError(
+    ErrorCode.INVALID_INPUT,
+    `OKX market data requires an explicit crypto pair symbol (for example BTC/USDT). Received: ${symbol}`
+  );
+}
+
 export class OkxMarketDataProvider implements MarketDataProvider {
   constructor(
     private client: OkxClient,
@@ -61,6 +72,7 @@ export class OkxMarketDataProvider implements MarketDataProvider {
   ) {}
 
   async getBars(symbol: string, timeframe: string, params?: BarsParams): Promise<Bar[]> {
+    assertOkxMarketSymbol(symbol);
     const info = normalizeOkxSymbol(symbol, this.defaultQuote);
     const bar = mapTimeframe(timeframe);
     const limit = params?.limit ?? 100;
@@ -92,6 +104,7 @@ export class OkxMarketDataProvider implements MarketDataProvider {
   }
 
   async getQuote(symbol: string): Promise<Quote> {
+    assertOkxMarketSymbol(symbol);
     const info = normalizeOkxSymbol(symbol, this.defaultQuote);
     const res = await this.client.request<OkxTicker>(
       "GET",
@@ -128,6 +141,7 @@ export class OkxMarketDataProvider implements MarketDataProvider {
   }
 
   async getCryptoSnapshot(symbol: string): Promise<Snapshot> {
+    assertOkxMarketSymbol(symbol);
     const info = normalizeOkxSymbol(symbol, this.defaultQuote);
 
     const [tickerRes, tradeRes, minuteBars, dailyBars] = await Promise.all([

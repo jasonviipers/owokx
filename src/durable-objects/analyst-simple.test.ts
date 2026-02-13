@@ -202,4 +202,33 @@ describe("AnalystSimple Phase 4", () => {
 
     expect(completeMock).toHaveBeenCalledTimes(3);
   });
+
+  it("uses provider default model without hardcoded override", async () => {
+    completeMock.mockResolvedValue({
+      content: JSON.stringify([
+        {
+          symbol: "AAPL",
+          action: "BUY",
+          confidence: 0.81,
+          reasoning: "Momentum confirmed",
+          urgency: "high",
+        },
+      ]),
+    });
+
+    const { ctx, waitForInit } = createContext("analyst-test-4");
+    const analyst = new AnalystSimple(ctx, createAnalystEnv());
+    await waitForInit();
+
+    await doFetch(analyst, "http://analyst/analyze", {
+      method: "POST",
+      body: JSON.stringify({
+        signals: [{ symbol: "AAPL", sentiment: 0.8, volume: 150, sources: ["stocktwits"] }],
+      }),
+    });
+
+    expect(completeMock).toHaveBeenCalledTimes(1);
+    const params = completeMock.mock.calls[0]?.[0] as { model?: string } | undefined;
+    expect(params?.model).toBeUndefined();
+  });
 });

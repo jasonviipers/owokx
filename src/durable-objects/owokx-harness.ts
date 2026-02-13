@@ -118,6 +118,9 @@ interface AgentConfig {
 
   // Allowed exchanges - only trade stocks listed on these exchanges (avoids OTC data issues)
   allowed_exchanges: string[];
+
+  // Dev escape hatch - lets local runs continue when swarm quorum is degraded.
+  allow_unhealthy_swarm?: boolean;
 }
 
 // [CUSTOMIZABLE] Add fields here when you add new data sources
@@ -164,10 +167,21 @@ interface SocialHistoryEntry {
   sentiment: number;
 }
 
+type ActivityEventType = "agent" | "trade" | "crypto" | "research" | "system" | "swarm" | "risk" | "data" | "api";
+type ActivitySeverity = "debug" | "info" | "warning" | "error" | "critical";
+type ActivityStatus = "info" | "started" | "in_progress" | "success" | "warning" | "failed" | "skipped";
+
 interface LogEntry {
+  id: string;
   timestamp: string;
+  timestamp_ms: number;
   agent: string;
   action: string;
+  event_type: ActivityEventType;
+  severity: ActivitySeverity;
+  status: ActivityStatus;
+  description: string;
+  metadata: Record<string, unknown>;
   [key: string]: unknown;
 }
 
@@ -187,6 +201,15 @@ interface ResearchResult {
   red_flags: string[];
   catalysts: string[];
   timestamp: number;
+}
+
+interface ResearchLLMAnalysis {
+  verdict: "BUY" | "SKIP" | "WAIT";
+  confidence: number;
+  entry_quality: "excellent" | "good" | "fair" | "poor";
+  reasoning: string;
+  red_flags: string[];
+  catalysts: string[];
 }
 
 interface TwitterConfirmation {
@@ -444,6 +467,7 @@ const DEFAULT_CONFIG: AgentConfig = {
   crypto_stop_loss_pct: 5,
   ticker_blacklist: [],
   allowed_exchanges: ["NYSE", "NASDAQ", "ARCA", "AMEX", "BATS"],
+  allow_unhealthy_swarm: false,
 };
 
 type GathererSource = "stocktwits" | "reddit" | "crypto" | "sec" | "scout";
@@ -472,6 +496,8 @@ const MEMORY_MIN_IMPORTANCE_TO_KEEP = 0.15;
 const SWARM_ROLE_SYNC_INTERVAL_MS = 120_000;
 const STRESS_TEST_INTERVAL_MS = 300_000;
 const OPTIMIZATION_INTERVAL_MS = 180_000;
+const LOG_RETENTION_MAX = 5_000;
+const LOG_FLUSH_INTERVAL_MS = 2_000;
 
 const TWITTER_DAILY_READ_LIMIT = 200;
 const TWITTER_BUCKET_CAPACITY = 20;
@@ -1057,15 +1083,36 @@ function detectSentiment(text: string): number {
 export class OwokxHarness extends DurableObject<Env> {
   private state: AgentState = { ...DEFAULT_STATE };
   private _llm: LLMProvider | null = null;
+  private lastLogPersistAt = 0;
+  private logPersistTimerArmed = false;
+  private lastSwarmBypassLogAt = 0;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
 
     this._llm = createLLMProvider(env);
     if (this._llm) {
-      console.log(`[OwokxHarness] LLM Provider initialized: ${env.LLM_PROVIDER || "openai-raw"}`);
+      console.log(
+        JSON.stringify({
+          provider: "agent",
+          agent: "OwokxHarness",
+          event: "llm_initialized",
+          llm_provider: env.LLM_PROVIDER || "openai-raw",
+          llm_model: env.LLM_MODEL || "gpt-4o-mini",
+          timestamp: new Date().toISOString(),
+        })
+      );
     } else {
-      console.log("[OwokxHarness] WARNING: No valid LLM provider configured - research disabled");
+      console.log(
+        JSON.stringify({
+          provider: "agent",
+          agent: "OwokxHarness",
+          event: "llm_unconfigured",
+          severity: "warning",
+          message: "No valid LLM provider configured - research disabled",
+          timestamp: new Date().toISOString(),
+        })
+      );
     }
 
     this.ctx.blockConcurrencyWhile(async () => {
@@ -1096,6 +1143,14 @@ export class OwokxHarness extends DurableObject<Env> {
           ...DEFAULT_OPTIMIZATION_STATE,
           ...(this.state.optimization ?? {}),
         };
+        if (!Array.isArray(this.state.logs)) {
+          this.state.logs = [];
+        } else {
+          this.state.logs = this.state.logs
+            .map((entry, index) => this.normalizeLogEntry(entry, index))
+            .filter((entry): entry is LogEntry => entry !== null)
+            .slice(-LOG_RETENTION_MAX);
+        }
         this.pruneMemoryEpisodes();
 
         // AUTO-CORRECTION: Fix corrupted crypto_symbols in persisted state
@@ -1113,6 +1168,9 @@ export class OwokxHarness extends DurableObject<Env> {
             await this.persist();
           }
         }
+      }
+      if (this.enforceProductionSwarmGuard()) {
+        await this.persist();
       }
       this.initializeLLM();
 
@@ -1140,9 +1198,27 @@ export class OwokxHarness extends DurableObject<Env> {
 
     this._llm = createLLMProvider(effectiveEnv);
     if (this._llm) {
-      console.log(`[OwokxHarness] LLM Provider initialized: ${provider} (${model})`);
+      console.log(
+        JSON.stringify({
+          provider: "agent",
+          agent: "OwokxHarness",
+          event: "llm_initialized",
+          llm_provider: provider,
+          llm_model: model,
+          timestamp: new Date().toISOString(),
+        })
+      );
     } else {
-      console.log("[OwokxHarness] WARNING: No valid LLM provider configured");
+      console.log(
+        JSON.stringify({
+          provider: "agent",
+          agent: "OwokxHarness",
+          event: "llm_unconfigured",
+          severity: "warning",
+          message: "No valid LLM provider configured",
+          timestamp: new Date().toISOString(),
+        })
+      );
     }
   }
 
@@ -1214,10 +1290,95 @@ export class OwokxHarness extends DurableObject<Env> {
     }
   }
 
+  private isProductionEnvironment(): boolean {
+    return this.env.ENVIRONMENT.toLowerCase() === "production";
+  }
+
+  private enforceProductionSwarmGuard(): boolean {
+    if (!this.isProductionEnvironment()) {
+      return false;
+    }
+
+    if (this.state.config.allow_unhealthy_swarm !== true) {
+      return false;
+    }
+
+    this.state.config.allow_unhealthy_swarm = false;
+    this.log("System", "config_guard_enforced", {
+      field: "allow_unhealthy_swarm",
+      reason: "allow_unhealthy_swarm cannot be true in production",
+      severity: "warning",
+      status: "warning",
+      event_type: "api",
+    });
+    return true;
+  }
+
+  private isSwarmHealthBypassEnabled(): boolean {
+    if (this.isProductionEnvironment()) {
+      return false;
+    }
+
+    if (this.state.config.allow_unhealthy_swarm === true) {
+      return true;
+    }
+
+    const envBypass =
+      this.env.SWARM_ALLOW_UNHEALTHY === "true" ||
+      this.env.SWARM_ALLOW_DEGRADED === "true" ||
+      this.env.SWARM_HEALTH_BYPASS === "true";
+    if (!envBypass) {
+      return false;
+    }
+
+    return true;
+  }
+
+  private getConfiguredCryptoSymbolsNormalized(): Set<string> {
+    return new Set((this.state.config.crypto_symbols || []).map((symbol) => normalizeCryptoSymbol(symbol)));
+  }
+
+  private normalizeResearchSymbolForBroker(symbol: string, broker: BrokerProviders["broker"]): string | null {
+    const trimmed = symbol.trim();
+    if (trimmed.length === 0) return null;
+
+    if (broker !== "okx") {
+      return trimmed;
+    }
+
+    const configured = this.getConfiguredCryptoSymbolsNormalized();
+    if (configured.size === 0) {
+      return null;
+    }
+
+    const upper = trimmed.toUpperCase();
+    const slashCandidate = normalizeCryptoSymbol(upper.replace("-", "/"));
+    if (configured.has(slashCandidate)) {
+      return slashCandidate;
+    }
+
+    // StockTwits/Reddit crypto tickers are frequently emitted as BTC.X/ETH.X etc.
+    const suffixMatch = upper.match(/^([A-Z0-9]{2,10})(?:[.\-_]?X)$/);
+    const bareMatch = upper.match(/^([A-Z0-9]{2,10})$/);
+    const inferredBase = suffixMatch?.[1] ?? bareMatch?.[1];
+    if (!inferredBase) {
+      return null;
+    }
+
+    for (const configuredSymbol of configured) {
+      if (configuredSymbol.startsWith(`${inferredBase}/`)) {
+        return configuredSymbol;
+      }
+    }
+
+    return null;
+  }
+
   private validateMarketData(snapshot: Snapshot | null): boolean {
     if (!snapshot) return false;
-    // Task 4: Market data integrity
-    const MAX_AGE_MS = 10_000; // 10 seconds
+    const isCrypto = isCryptoSymbol(snapshot.symbol, this.state.config.crypto_symbols || []);
+    // Equities should be near-real-time. Crypto on OKX demo/public feeds can be slightly delayed.
+    const MAX_AGE_MS = isCrypto ? 10 * 60_000 : 10_000;
     const dataTimestamp = snapshot.latest_trade?.timestamp
       ? new Date(snapshot.latest_trade.timestamp).getTime()
       : Date.now();
@@ -1255,8 +1416,20 @@ export class OwokxHarness extends DurableObject<Env> {
       // 2. Check Swarm Health (Task 1)
       const isSwarmHealthy = await this.checkSwarmHealth();
       if (!isSwarmHealthy) {
-        this.log("System", "alarm_skipped", { reason: "Swarm unhealthy (quorum not met)" });
-        return;
+        if (this.isSwarmHealthBypassEnabled()) {
+          const nowMs = Date.now();
+          if (nowMs - this.lastSwarmBypassLogAt >= 300_000) {
+            this.log("System", "swarm_health_bypass_active", {
+              reason: "Swarm unhealthy (quorum not met)",
+              status: "warning",
+              event_type: "swarm",
+            });
+            this.lastSwarmBypassLogAt = nowMs;
+          }
+        } else {
+          this.log("System", "alarm_skipped", { reason: "Swarm unhealthy (quorum not met)" });
+          return;
+        }
       }
 
       if (now - this.state.lastSwarmRoleSyncAt >= SWARM_ROLE_SYNC_INTERVAL_MS) {
@@ -1525,6 +1698,12 @@ export class OwokxHarness extends DurableObject<Env> {
         enabled: this.state.enabled,
         environment: this.env.ENVIRONMENT,
         costs: this.state.costTracker,
+        llm: {
+          configured: !!this._llm,
+          provider: this.state.config.llm_provider,
+          model: this.state.config.llm_model,
+          last_auth_error: this.state.lastLLMAuthError ?? null,
+        },
         signals,
         position_entries: positionEntries,
         logs_total: this.state.logs.length,
@@ -1601,8 +1780,14 @@ export class OwokxHarness extends DurableObject<Env> {
           clock: null,
           config: this.state.config,
           signals: this.state.signalCache,
-          logs: this.state.logs.slice(-100),
+          logs: this.state.logs.slice(-300),
           costs: this.state.costTracker,
+          llm: {
+            configured: !!this._llm,
+            provider: this.state.config.llm_provider,
+            model: this.state.config.llm_model,
+            last_auth_error: this.state.lastLLMAuthError ?? null,
+          },
           lastAnalystRun: this.state.lastAnalystRun,
           lastResearchRun: this.state.lastResearchRun,
           signalResearch: this.state.signalResearch,
@@ -1637,8 +1822,14 @@ export class OwokxHarness extends DurableObject<Env> {
           clock,
           config: this.state.config,
           signals: this.state.signalCache,
-          logs: this.state.logs.slice(-100),
+          logs: this.state.logs.slice(-300),
           costs: this.state.costTracker,
+          llm: {
+            configured: !!this._llm,
+            provider: this.state.config.llm_provider,
+            model: this.state.config.llm_model,
+            last_auth_error: this.state.lastLLMAuthError ?? null,
+          },
           lastAnalystRun: this.state.lastAnalystRun,
           lastResearchRun: this.state.lastResearchRun,
           signalResearch: this.state.signalResearch,
@@ -1712,8 +1903,14 @@ export class OwokxHarness extends DurableObject<Env> {
         clock,
         config: this.state.config,
         signals: this.state.signalCache,
-        logs: this.state.logs.slice(-100),
+        logs: this.state.logs.slice(-300),
         costs: this.state.costTracker,
+        llm: {
+          configured: !!this._llm,
+          provider: this.state.config.llm_provider,
+          model: this.state.config.llm_model,
+          last_auth_error: this.state.lastLLMAuthError ?? null,
+        },
         lastAnalystRun: this.state.lastAnalystRun,
         lastResearchRun: this.state.lastResearchRun,
         signalResearch: this.state.signalResearch,
@@ -1736,10 +1933,69 @@ export class OwokxHarness extends DurableObject<Env> {
   }
 
   private async handleUpdateConfig(request: Request): Promise<Response> {
-    const body = (await request.json()) as Partial<AgentConfig>;
+    let body: Partial<AgentConfig>;
+    try {
+      body = (await request.json()) as Partial<AgentConfig>;
+    } catch (error) {
+      this.log("System", "config_update_invalid_json", {
+        error: String(error),
+        status: "failed",
+        event_type: "api",
+      });
+      return new Response(
+        JSON.stringify(
+          {
+            ok: false,
+            error: "Invalid JSON payload for /agent/config",
+          },
+          null,
+          2
+        ),
+        {
+          status: 400,
+          headers: { "Content-Type": "application/json" },
+        }
+      );
+    }
+    const changedKeys = Object.keys(body);
+
+    if (this.isProductionEnvironment() && body.allow_unhealthy_swarm === true) {
+      this.log("System", "config_update_rejected", {
+        field: "allow_unhealthy_swarm",
+        reason: "allow_unhealthy_swarm cannot be true in production",
+        attempted_value: true,
+        changed_keys: changedKeys,
+        severity: "error",
+        status: "failed",
+        event_type: "api",
+      });
+      await this.persist();
+      return new Response(
+        JSON.stringify(
+          {
+            ok: false,
+            error: "allow_unhealthy_swarm cannot be enabled in production",
+          },
+          null,
+          2
+        ),
+        {
+          status: 400,
+          headers: { "Content-Type": "application/json" },
+        }
+      );
+    }
+
     this.state.config = { ...this.state.config, ...body };
+    this.enforceProductionSwarmGuard();
     this.state.optimization.adaptiveDataPollIntervalMs = this.state.config.data_poll_interval_ms;
     this.state.optimization.adaptiveAnalystIntervalMs = this.state.config.analyst_interval_ms;
+    this.log("System", "config_updated", {
+      changed_keys: changedKeys,
+      change_count: changedKeys.length,
+      status: "success",
+      event_type: "api",
+    });
     this.initializeLLM();
     await this.persist();
     return this.jsonResponse({ ok: true, config: this.state.config });
@@ -1773,9 +2029,66 @@ export class OwokxHarness extends DurableObject<Env> {
   }
 
   private handleGetLogs(url: URL): Response {
-    const limit = parseInt(url.searchParams.get("limit") || "100", 10);
-    const logs = this.state.logs.slice(-limit);
-    return this.jsonResponse({ logs });
+    const parseSet = (key: string): Set<string> => {
+      const values = url.searchParams
+        .getAll(key)
+        .flatMap((value) => value.split(","))
+        .map((value) => value.trim().toLowerCase())
+        .filter((value) => value.length > 0);
+      return new Set(values);
+    };
+
+    const limitRaw = Number.parseInt(url.searchParams.get("limit") || "200", 10);
+    const limit = Number.isFinite(limitRaw) ? Math.max(1, Math.min(limitRaw, 2_000)) : 200;
+
+    const sinceRaw = Number.parseInt(url.searchParams.get("since") || "", 10);
+    const untilRaw = Number.parseInt(url.searchParams.get("until") || "", 10);
+    const since = Number.isFinite(sinceRaw) ? sinceRaw : null;
+    const until = Number.isFinite(untilRaw) ? untilRaw : null;
+
+    const eventTypes = parseSet("event_type");
+    const severities = parseSet("severity");
+    const statuses = parseSet("status");
+    const agents = parseSet("agent");
+    const search = (url.searchParams.get("search") || "").trim().toLowerCase();
+
+    let filtered = [...this.state.logs];
+    if (since !== null) {
+      filtered = filtered.filter((entry) => entry.timestamp_ms >= since);
+    }
+    if (until !== null) {
+      filtered = filtered.filter((entry) => entry.timestamp_ms <= until);
+    }
+    if (eventTypes.size > 0) {
+      filtered = filtered.filter((entry) => eventTypes.has(entry.event_type));
+    }
+    if (severities.size > 0) {
+      filtered = filtered.filter((entry) => severities.has(entry.severity));
+    }
+    if (statuses.size > 0) {
+      filtered = filtered.filter((entry) => statuses.has(entry.status));
+    }
+    if (agents.size > 0) {
+      filtered = filtered.filter((entry) => agents.has(entry.agent.toLowerCase()));
+    }
+    if (search.length > 0) {
+      filtered = filtered.filter((entry) => {
+        const haystack = `${entry.agent} ${entry.action} ${entry.description} ${JSON.stringify(entry.metadata)}`.toLowerCase();
+        return haystack.includes(search);
+      });
+    }
+
+    const logs = filtered.sort((a, b) => b.timestamp_ms - a.timestamp_ms).slice(0, limit);
+    return this.jsonResponse({
+      ok: true,
+      logs,
+      total: this.state.logs.length,
+      filtered: filtered.length,
+      limit,
+      available_event_types: ["agent", "trade", "crypto", "research", "system", "swarm", "risk", "data", "api"],
+      available_severities: ["debug", "info", "warning", "error", "critical"],
+      available_statuses: ["info", "started", "in_progress", "success", "warning", "failed", "skipped"],
+    });
   }
 
   private async handleGetHistory(url: URL): Promise<Response> {
@@ -2761,7 +3074,7 @@ export class OwokxHarness extends DurableObject<Env> {
 
       const usage = response.usage;
       if (usage) {
-        this.trackLLMCost(this.state.config.llm_model, usage.prompt_tokens, usage.completion_tokens);
+        this.trackLLMCost(response.model || this.state.config.llm_model, usage.prompt_tokens, usage.completion_tokens);
       }
 
       const content = response.content || "{}";
@@ -3916,6 +4229,154 @@ export class OwokxHarness extends DurableObject<Env> {
       .slice(0, MEMORY_MAX_EPISODES);
   }
 
+  private normalizeResearchVerdict(value: unknown): "BUY" | "SKIP" | "WAIT" | null {
+    if (typeof value !== "string") return null;
+    const normalized = value.trim().toUpperCase();
+    if (normalized === "BUY" || normalized === "SKIP" || normalized === "WAIT") {
+      return normalized;
+    }
+    return null;
+  }
+
+  private normalizeResearchEntryQuality(value: unknown): "excellent" | "good" | "fair" | "poor" | null {
+    if (typeof value !== "string") return null;
+    const normalized = value.trim().toLowerCase();
+    if (normalized === "excellent" || normalized === "good" || normalized === "fair" || normalized === "poor") {
+      return normalized;
+    }
+    return null;
+  }
+
+  private normalizeResearchStringArray(value: unknown): string[] {
+    if (Array.isArray(value)) {
+      return value
+        .filter((item): item is string => typeof item === "string")
+        .map((item) => item.trim())
+        .filter((item) => item.length > 0)
+        .slice(0, 12);
+    }
+
+    if (typeof value === "string") {
+      return value
+        .split(/[;,]/)
+        .map((item) => item.trim())
+        .filter((item) => item.length > 0)
+        .slice(0, 12);
+    }
+
+    return [];
+  }
+
+  private parseResearchAnalysis(
+    rawContent: string,
+    symbol: string
+  ): { analysis: ResearchLLMAnalysis; repaired: boolean; parseError?: string; responsePreview: string } {
+    const sanitized = rawContent
+      .replace(/```json\s*/gi, "")
+      .replace(/```/g, "")
+      .replace(/\u201c|\u201d/g, '"')
+      .replace(/\u2018|\u2019/g, "'")
+      .trim();
+    const firstBrace = sanitized.indexOf("{");
+    const lastBrace = sanitized.lastIndexOf("}");
+    const objectCandidate =
+      firstBrace >= 0 && lastBrace > firstBrace ? sanitized.slice(firstBrace, lastBrace + 1).trim() : sanitized;
+    const responsePreview = objectCandidate.slice(0, 320);
+
+    const parseCandidates = [
+      objectCandidate,
+      objectCandidate.replace(/,\s*([}\]])/g, "$1"),
+      objectCandidate.replace(/\r?\n/g, " "),
+      objectCandidate.replace(/\r?\n/g, " ").replace(/,\s*([}\]])/g, "$1"),
+      sanitized,
+      sanitized.replace(/\r?\n/g, " "),
+    ].filter((candidate) => candidate.length > 0);
+
+    let parsed: Record<string, unknown> | null = null;
+    let parseError: string | undefined;
+    let usedCandidateIndex = -1;
+    const seen = new Set<string>();
+
+    for (let i = 0; i < parseCandidates.length; i++) {
+      const candidate = parseCandidates[i]!;
+      if (seen.has(candidate)) continue;
+      seen.add(candidate);
+      try {
+        const value = JSON.parse(candidate) as unknown;
+        if (this.isRecord(value)) {
+          parsed = value;
+          usedCandidateIndex = i;
+          break;
+        }
+      } catch (error) {
+        parseError = String(error);
+      }
+    }
+
+    if (!parsed) {
+      return {
+        analysis: {
+          verdict: "WAIT",
+          confidence: 0.35,
+          entry_quality: "fair",
+          reasoning: `LLM response for ${symbol} was not valid JSON. Applied conservative WAIT fallback.`,
+          red_flags: ["LLM response parse failure"],
+          catalysts: [],
+        },
+        repaired: true,
+        parseError,
+        responsePreview,
+      };
+    }
+
+    const inferredVerdict = this.normalizeResearchVerdict(parsed.verdict);
+    const upperContent = objectCandidate.toUpperCase();
+    const verdict =
+      inferredVerdict ??
+      (/\bBUY\b/.test(upperContent) ? "BUY" : /\bSKIP\b/.test(upperContent) ? "SKIP" : /\bWAIT\b/.test(upperContent) ? "WAIT" : "WAIT");
+
+    const confidenceRaw =
+      typeof parsed.confidence === "number"
+        ? parsed.confidence
+        : typeof parsed.confidence === "string"
+          ? Number(parsed.confidence)
+          : Number.NaN;
+    const confidence = Number.isFinite(confidenceRaw) ? this.clamp01(confidenceRaw) : 0.35;
+
+    const entryQuality = this.normalizeResearchEntryQuality(parsed.entry_quality) ?? "fair";
+
+    const reasoning =
+      typeof parsed.reasoning === "string" && parsed.reasoning.trim().length > 0
+        ? parsed.reasoning.trim()
+        : `LLM response for ${symbol} did not include valid structured reasoning.`;
+
+    const redFlags = this.normalizeResearchStringArray(parsed.red_flags);
+    const catalysts = this.normalizeResearchStringArray(parsed.catalysts);
+    const repaired =
+      usedCandidateIndex > 0 ||
+      inferredVerdict === null ||
+      this.normalizeResearchEntryQuality(parsed.entry_quality) === null ||
+      !(typeof parsed.reasoning === "string" && parsed.reasoning.trim().length > 0);
+
+    if (repaired && !redFlags.includes("Recovered from malformed LLM JSON response")) {
+      redFlags.push("Recovered from malformed LLM JSON response");
+    }
+
+    return {
+      analysis: {
+        verdict,
+        confidence,
+        entry_quality: entryQuality,
+        reasoning,
+        red_flags: redFlags,
+        catalysts,
+      },
+      repaired,
+      parseError,
+      responsePreview,
+    };
+  }
+
   private async researchSignal(
     symbol: string,
     sentimentScore: number,
@@ -3942,11 +4403,33 @@ export class OwokxHarness extends DurableObject<Env> {
       let price = 0;
       if (isCrypto) {
         const normalized = normalizeCryptoSymbol(symbol);
-        const snapshot = await broker.marketData.getCryptoSnapshot(normalized).catch(() => null);
+        const snapshot = await broker.marketData.getCryptoSnapshot(normalized).catch((error) => {
+          this.log("SignalResearch", "snapshot_fetch_failed", {
+            symbol: normalized,
+            broker: broker.broker,
+            error: String(error),
+          });
+          return null;
+        });
+        if (!snapshot) {
+          this.log("SignalResearch", "snapshot_unavailable", { symbol: normalized, broker: broker.broker });
+          return null;
+        }
         price =
           snapshot?.latest_trade?.price || snapshot?.latest_quote?.ask_price || snapshot?.latest_quote?.bid_price || 0;
       } else {
-        const snapshot = await broker.marketData.getSnapshot(symbol).catch(() => null);
+        const snapshot = await broker.marketData.getSnapshot(symbol).catch((error) => {
+          this.log("SignalResearch", "snapshot_fetch_failed", {
+            symbol,
+            broker: broker.broker,
+            error: String(error),
+          });
+          return null;
+        });
+        if (!snapshot) {
+          this.log("SignalResearch", "snapshot_unavailable", { symbol, broker: broker.broker });
+          return null;
+        }
         if (!this.validateMarketData(snapshot)) {
           this.log("SignalResearch", "stale_data", { symbol });
           return null;
@@ -4022,24 +4505,35 @@ export class OwokxHarness extends DurableObject<Env> {
           { role: "user", content: prompt },
         ],
         max_tokens: 250,
-        temperature: 0.3,
+        temperature: 0,
         response_format: { type: "json_object" },
       });
 
       const usage = response.usage;
       if (usage) {
-        this.trackLLMCost(this.state.config.llm_model, usage.prompt_tokens, usage.completion_tokens);
+        this.trackLLMCost(response.model || this.state.config.llm_model, usage.prompt_tokens, usage.completion_tokens);
+        this.log("SignalResearch", "llm_usage", {
+          symbol,
+          model: response.model || this.state.config.llm_model,
+          prompt_tokens: usage.prompt_tokens,
+          completion_tokens: usage.completion_tokens,
+          total_tokens: usage.total_tokens,
+          event_type: "api",
+        });
       }
 
-      const content = response.content || "{}";
-      const analysis = JSON.parse(content.replace(/```json\n?|```/g, "").trim()) as {
-        verdict: "BUY" | "SKIP" | "WAIT";
-        confidence: number;
-        entry_quality: "excellent" | "good" | "fair" | "poor";
-        reasoning: string;
-        red_flags: string[];
-        catalysts: string[];
-      };
+      const parsedAnalysis = this.parseResearchAnalysis(response.content || "{}", symbol);
+      if (parsedAnalysis.repaired) {
+        this.log("SignalResearch", "invalid_llm_json", {
+          symbol,
+          message: "LLM returned malformed JSON; applied recovery parser",
+          parse_error: parsedAnalysis.parseError,
+          response_preview: parsedAnalysis.responsePreview,
+          severity: "warning",
+          status: "warning",
+        });
+      }
+      const analysis = parsedAnalysis.analysis;
 
       const confidenceWithPrediction = this.clamp01(analysis.confidence * 0.75 + predictiveScore * 0.25);
       const adjustedConfidence = this.clamp01(
@@ -4130,6 +4624,7 @@ export class OwokxHarness extends DurableObject<Env> {
 
   private async researchTopSignals(limit = 5): Promise<ResearchResult[]> {
     const startedAt = Date.now();
+    const llmCallsBefore = this.state.costTracker.calls;
     if (this.state.lastLLMAuthError && Date.now() - this.state.lastLLMAuthError.at < 300_000) {
       this.log("SignalResearch", "research_skipped_circuit_breaker", {
         reason: "Recent auth error",
@@ -4148,13 +4643,52 @@ export class OwokxHarness extends DurableObject<Env> {
 
     const allSignals = this.state.signalCache;
     const notHeld = allSignals.filter((s) => !heldSymbols.has(s.symbol));
+    const brokerCandidates = notHeld
+      .map((signal) => {
+        const normalizedSymbol = this.normalizeResearchSymbolForBroker(signal.symbol, broker.broker);
+        if (!normalizedSymbol) return null;
+        if (normalizedSymbol === signal.symbol) return signal;
+        return {
+          ...signal,
+          symbol: normalizedSymbol,
+        };
+      })
+      .filter((signal): signal is Signal => signal !== null);
+
+    const brokerFilteredOut = Math.max(0, notHeld.length - brokerCandidates.length);
+    if (brokerFilteredOut > 0) {
+      this.log("SignalResearch", "candidates_filtered_by_broker", {
+        broker: broker.broker,
+        filtered_out: brokerFilteredOut,
+        candidate_count: brokerCandidates.length,
+      });
+    }
+
     // Use raw_sentiment for threshold (before weighting), weighted sentiment for sorting
-    const aboveThreshold = notHeld.filter((s) => s.raw_sentiment >= this.state.config.min_sentiment_score);
-    if (aboveThreshold.length === 0) {
-      this.log("SignalResearch", "no_candidates", {
+    let eligibleSignals = brokerCandidates.filter((s) => s.raw_sentiment >= this.state.config.min_sentiment_score);
+
+    if (eligibleSignals.length === 0 && broker.broker === "okx") {
+      // OKX research should still progress even during low-momentum periods.
+      eligibleSignals = brokerCandidates
+        .filter((signal) => isCryptoSymbol(signal.symbol, this.state.config.crypto_symbols || []))
+        .sort((a, b) => Math.abs(b.sentiment) - Math.abs(a.sentiment))
+        .slice(0, Math.max(limit, 3));
+
+      if (eligibleSignals.length > 0) {
+        this.log("SignalResearch", "threshold_relaxed_for_okx", {
+          broker: broker.broker,
+          count: eligibleSignals.length,
+          min_sentiment: this.state.config.min_sentiment_score,
+        });
+      }
+    }
+
+    if (eligibleSignals.length === 0) {
+      this.log("SignalResearch", "no_candidates_for_broker", {
+        broker: broker.broker,
         total_signals: allSignals.length,
         not_held: notHeld.length,
-        above_threshold: aboveThreshold.length,
+        broker_candidates: brokerCandidates.length,
         min_sentiment: this.state.config.min_sentiment_score,
       });
       this.recordPerformanceSample("research", Date.now() - startedAt, false);
@@ -4173,7 +4707,7 @@ export class OwokxHarness extends DurableObject<Env> {
       }
     >();
 
-    for (const signal of aboveThreshold) {
+    for (const signal of eligibleSignals) {
       if (!aggregated.has(signal.symbol)) {
         aggregated.set(signal.symbol, {
           symbol: signal.symbol,
@@ -4237,7 +4771,7 @@ export class OwokxHarness extends DurableObject<Env> {
       this.log("SignalResearch", "no_candidates", {
         total_signals: allSignals.length,
         not_held: notHeld.length,
-        above_threshold: aboveThreshold.length,
+        above_threshold: eligibleSignals.length,
         min_sentiment: this.state.config.min_sentiment_score,
       });
       this.recordPerformanceSample("research", Date.now() - startedAt, false);
@@ -4301,6 +4835,14 @@ export class OwokxHarness extends DurableObject<Env> {
       }
     }
 
+    const llmCallsDelta = Math.max(0, this.state.costTracker.calls - llmCallsBefore);
+    this.log("SignalResearch", "research_cycle_completed", {
+      broker: broker.broker,
+      queued: queued.length,
+      resolved: results.length,
+      llm_calls_delta: llmCallsDelta,
+      tracked_research: Object.keys(this.state.signalResearch).length,
+    });
     this.recordPerformanceSample("research", Date.now() - startedAt, false);
     return results;
   }
@@ -4349,7 +4891,7 @@ Provide a brief risk assessment and recommendation (HOLD, SELL, or ADD). JSON fo
 
       const usage = response.usage;
       if (usage) {
-        this.trackLLMCost(this.state.config.llm_model, usage.prompt_tokens, usage.completion_tokens);
+        this.trackLLMCost(response.model || this.state.config.llm_model, usage.prompt_tokens, usage.completion_tokens);
       }
 
       const content = response.content || "{}";
@@ -4542,7 +5084,11 @@ Response format:
 
       const usage = response.usage;
       if (usage) {
-        this.trackLLMCost(this.state.config.llm_analyst_model, usage.prompt_tokens, usage.completion_tokens);
+        this.trackLLMCost(
+          response.model || this.state.config.llm_analyst_model,
+          usage.prompt_tokens,
+          usage.completion_tokens
+        );
       }
 
       const content = response.content || "{}";
@@ -5607,37 +6153,350 @@ Response format:
   // Generally don't need to modify unless adding new notification channels.
   // ============================================================================
 
-  private log(agent: string, action: string, details: Record<string, unknown>): void {
-    const entry: LogEntry = {
-      timestamp: new Date().toISOString(),
+  private normalizeLogSeverity(value: unknown): ActivitySeverity | null {
+    if (typeof value !== "string") return null;
+    const normalized = value.trim().toLowerCase();
+    if (normalized === "debug" || normalized === "info" || normalized === "warning" || normalized === "error" || normalized === "critical") {
+      return normalized;
+    }
+    return null;
+  }
+
+  private normalizeLogStatus(value: unknown): ActivityStatus | null {
+    if (typeof value !== "string") return null;
+    const normalized = value.trim().toLowerCase();
+    if (
+      normalized === "info" ||
+      normalized === "started" ||
+      normalized === "in_progress" ||
+      normalized === "success" ||
+      normalized === "warning" ||
+      normalized === "failed" ||
+      normalized === "skipped"
+    ) {
+      return normalized;
+    }
+    return null;
+  }
+
+  private normalizeEventType(value: unknown): ActivityEventType | null {
+    if (typeof value !== "string") return null;
+    const normalized = value.trim().toLowerCase();
+    if (
+      normalized === "agent" ||
+      normalized === "trade" ||
+      normalized === "crypto" ||
+      normalized === "research" ||
+      normalized === "system" ||
+      normalized === "swarm" ||
+      normalized === "risk" ||
+      normalized === "data" ||
+      normalized === "api"
+    ) {
+      return normalized;
+    }
+    return null;
+  }
+
+  private humanizeAction(action: string): string {
+    return action
+      .replace(/_/g, " ")
+      .replace(/\s+/g, " ")
+      .trim()
+      .replace(/\b\w/g, (char) => char.toUpperCase());
+  }
+
+  private isRecord(value: unknown): value is Record<string, unknown> {
+    return typeof value === "object" && value !== null && !Array.isArray(value);
+  }
+
+  private classifyEventType(agent: string, action: string, details: Record<string, unknown>): ActivityEventType {
+    const actionKey = action.toLowerCase();
+    const agentKey = agent.toLowerCase();
+    const symbol = typeof details.symbol === "string" ? details.symbol : "";
+
+    if (
+      actionKey.includes("research") ||
+      actionKey.includes("catalyst") ||
+      actionKey.includes("verification") ||
+      agentKey.includes("research") ||
+      agentKey === "analyst"
+    ) {
+      return "research";
+    }
+
+    if (
+      agentKey === "crypto" ||
+      actionKey.includes("crypto") ||
+      actionKey.includes("wallet") ||
+      actionKey.includes("price_monitor") ||
+      actionKey.includes("market_data") ||
+      (symbol.length > 0 && isCryptoSymbol(symbol, this.state.config.crypto_symbols || []))
+    ) {
+      return "crypto";
+    }
+
+    if (
+      actionKey.includes("buy") ||
+      actionKey.includes("sell") ||
+      actionKey.includes("order") ||
+      actionKey.includes("position") ||
+      actionKey.includes("execution") ||
+      agentKey === "executor" ||
+      agentKey === "trader" ||
+      agentKey === "options"
+    ) {
+      return "trade";
+    }
+
+    if (actionKey.includes("swarm") || actionKey.includes("registry") || actionKey.includes("heartbeat") || agentKey.includes("swarm")) {
+      return "swarm";
+    }
+
+    if (actionKey.includes("risk") || actionKey.includes("stress") || actionKey.includes("kill_switch") || agentKey.includes("risk")) {
+      return "risk";
+    }
+
+    if (
+      actionKey.includes("gather") ||
+      actionKey.includes("signals") ||
+      actionKey.includes("source_") ||
+      agentKey === "stocktwits" ||
+      agentKey === "reddit" ||
+      agentKey === "sec" ||
+      agentKey === "x" ||
+      agentKey === "scout"
+    ) {
+      return "data";
+    }
+
+    if (
+      actionKey.includes("api") ||
+      actionKey.includes("auth") ||
+      actionKey.includes("config") ||
+      actionKey.includes("setup") ||
+      actionKey.includes("history")
+    ) {
+      return "api";
+    }
+
+    if (agentKey === "system") {
+      return "system";
+    }
+
+    return "agent";
+  }
+
+  private classifyLogSeverity(action: string, details: Record<string, unknown>): ActivitySeverity {
+    const explicit = this.normalizeLogSeverity(details.severity);
+    if (explicit) return explicit;
+
+    const actionKey = action.toLowerCase();
+    const errorText = typeof details.error === "string" ? details.error.toLowerCase() : "";
+    const messageText = typeof details.message === "string" ? details.message.toLowerCase() : "";
+    if (actionKey.includes("kill_switch") || errorText.includes("panic") || messageText.includes("panic")) return "critical";
+    if (actionKey.includes("error") || actionKey.includes("failed") || errorText.length > 0) return "error";
+    if (actionKey.includes("warning") || actionKey.includes("skipped") || actionKey.includes("deferred") || actionKey.includes("blocked")) {
+      return "warning";
+    }
+    if (actionKey.includes("debug")) return "debug";
+    return "info";
+  }
+
+  private classifyLogStatus(action: string, details: Record<string, unknown>): ActivityStatus {
+    const explicit = this.normalizeLogStatus(details.status);
+    if (explicit) return explicit;
+
+    const actionKey = action.toLowerCase();
+    if (actionKey.includes("starting") || actionKey.endsWith("_start") || actionKey.includes("_start_")) return "started";
+    if (actionKey.includes("running") || actionKey.includes("processing") || actionKey.includes("dispatching")) return "in_progress";
+    if (actionKey.includes("failed") || actionKey.includes("error")) return "failed";
+    if (actionKey.includes("warning")) return "warning";
+    if (actionKey.includes("skipped") || actionKey.includes("blocked") || actionKey.includes("deferred")) return "skipped";
+    if (
+      actionKey.includes("complete") ||
+      actionKey.includes("success") ||
+      actionKey.includes("executed") ||
+      actionKey.includes("enabled") ||
+      actionKey.includes("disabled") ||
+      actionKey.includes("updated")
+    ) {
+      return "success";
+    }
+    return "info";
+  }
+
+  private summarizeLogDetails(action: string, details: Record<string, unknown>): string {
+    const directDescription = typeof details.description === "string" ? details.description.trim() : "";
+    if (directDescription.length > 0) return directDescription;
+
+    const reason =
+      typeof details.reason === "string"
+        ? details.reason.trim()
+        : typeof details.message === "string"
+          ? details.message.trim()
+          : typeof details.error === "string"
+            ? details.error.trim()
+            : "";
+    if (reason.length > 0) return reason;
+
+    const symbol = typeof details.symbol === "string" ? details.symbol.trim() : "";
+    const count = typeof details.count === "number" && Number.isFinite(details.count) ? details.count : null;
+    const source = typeof details.source === "string" ? details.source.trim() : "";
+
+    const fragments: string[] = [];
+    if (symbol) fragments.push(symbol);
+    if (source) fragments.push(`source ${source}`);
+    if (count !== null) fragments.push(`count ${count}`);
+
+    if (fragments.length > 0) {
+      return `${this.humanizeAction(action)} (${fragments.join(", ")})`;
+    }
+
+    return this.humanizeAction(action);
+  }
+
+  private buildLogEntry(agent: string, action: string, details: Record<string, unknown>): LogEntry {
+    const nowMs = Date.now();
+    const timestamp = new Date(nowMs).toISOString();
+    const metadata = { ...details };
+    const eventType = this.normalizeEventType(details.event_type) ?? this.classifyEventType(agent, action, metadata);
+    const severity = this.classifyLogSeverity(action, metadata);
+    const status = this.classifyLogStatus(action, metadata);
+
+    return {
+      id: typeof details.id === "string" && details.id ? details.id : `${nowMs.toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+      timestamp,
+      timestamp_ms: nowMs,
       agent,
       action,
       ...details,
+      event_type: eventType,
+      severity,
+      status,
+      description: this.summarizeLogDetails(action, metadata),
+      metadata,
     };
-    this.state.logs.push(entry);
+  }
 
-    // Keep last 500 logs
-    if (this.state.logs.length > 500) {
-      this.state.logs = this.state.logs.slice(-500);
+  private normalizeLogEntry(rawEntry: LogEntry, index: number): LogEntry | null {
+    const raw = this.isRecord(rawEntry) ? rawEntry : null;
+    if (!raw) return null;
+
+    const agent = typeof raw.agent === "string" && raw.agent.trim().length > 0 ? raw.agent : "System";
+    const action = typeof raw.action === "string" && raw.action.trim().length > 0 ? raw.action : "event";
+    const timestampValue = typeof raw.timestamp === "string" ? raw.timestamp : new Date().toISOString();
+    const parsedMs = Date.parse(timestampValue);
+    const timestampMs = typeof raw.timestamp_ms === "number" && Number.isFinite(raw.timestamp_ms) ? raw.timestamp_ms : parsedMs;
+    const metadataFromRaw = this.isRecord(raw.metadata) ? raw.metadata : {};
+    const metadata: Record<string, unknown> = { ...metadataFromRaw };
+
+    for (const [key, value] of Object.entries(raw)) {
+      if (
+        key === "id" ||
+        key === "timestamp" ||
+        key === "timestamp_ms" ||
+        key === "agent" ||
+        key === "action" ||
+        key === "event_type" ||
+        key === "severity" ||
+        key === "status" ||
+        key === "description" ||
+        key === "metadata"
+      ) {
+        continue;
+      }
+      metadata[key] = value;
     }
 
-    // Log to console for wrangler tail
-    console.log(`[${entry.timestamp}] [${agent}] ${action}`, JSON.stringify(details));
+    const eventType = this.normalizeEventType(raw.event_type) ?? this.classifyEventType(agent, action, metadata);
+    const severity = this.normalizeLogSeverity(raw.severity) ?? this.classifyLogSeverity(action, metadata);
+    const status = this.normalizeLogStatus(raw.status) ?? this.classifyLogStatus(action, metadata);
+    const description =
+      typeof raw.description === "string" && raw.description.trim().length > 0
+        ? raw.description.trim()
+        : this.summarizeLogDetails(action, metadata);
+    const nowMs = Date.now();
+    const safeTimestampMs = Number.isFinite(timestampMs) ? timestampMs : nowMs;
+
+    return {
+      id: typeof raw.id === "string" && raw.id.trim().length > 0 ? raw.id : `legacy-${safeTimestampMs.toString(36)}-${index}`,
+      timestamp: Number.isFinite(parsedMs) ? timestampValue : new Date(safeTimestampMs).toISOString(),
+      timestamp_ms: safeTimestampMs,
+      agent,
+      action,
+      event_type: eventType,
+      severity,
+      status,
+      description,
+      metadata,
+      ...metadata,
+    };
+  }
+
+  private queueLogPersistence(force = false): void {
+    const now = Date.now();
+    if (force || now - this.lastLogPersistAt >= LOG_FLUSH_INTERVAL_MS) {
+      this.lastLogPersistAt = now;
+      this.ctx.waitUntil(
+        this.persist().catch((error) => {
+          console.error("[OwokxHarness] log_persist_failed", String(error));
+        })
+      );
+      return;
+    }
+
+    if (this.logPersistTimerArmed) return;
+    this.logPersistTimerArmed = true;
+    const waitMs = Math.max(0, LOG_FLUSH_INTERVAL_MS - (now - this.lastLogPersistAt));
+    this.ctx.waitUntil(
+      this.sleep(waitMs)
+        .then(async () => {
+          this.lastLogPersistAt = Date.now();
+          await this.persist();
+        })
+        .catch((error) => {
+          console.error("[OwokxHarness] deferred_log_persist_failed", String(error));
+        })
+        .finally(() => {
+          this.logPersistTimerArmed = false;
+        })
+    );
+  }
+
+  private log(agent: string, action: string, details: Record<string, unknown>): void {
+    const entry = this.buildLogEntry(agent, action, details);
+    this.state.logs.push(entry);
+
+    if (this.state.logs.length > LOG_RETENTION_MAX) {
+      this.state.logs = this.state.logs.slice(-LOG_RETENTION_MAX);
+    }
+
+    const mustFlush = entry.severity === "error" || entry.severity === "critical" || entry.status === "failed";
+    this.queueLogPersistence(mustFlush);
+
+    // Log NDJSON for wrangler tail / file redirection
+    console.log(JSON.stringify(entry));
   }
 
   public trackLLMCost(model: string, tokensIn: number, tokensOut: number): number {
     const pricing: Record<string, { input: number; output: number }> = {
       "gpt-4o": { input: 2.5, output: 10 },
       "gpt-4o-mini": { input: 0.15, output: 0.6 },
+      "deepseek-chat": { input: 0.27, output: 1.1 },
+      "deepseek-reasoner": { input: 0.55, output: 2.19 },
     };
 
-    const rates = pricing[model] ?? pricing["gpt-4o"]!;
-    const cost = (tokensIn * rates.input + tokensOut * rates.output) / 1_000_000;
+    const safeTokensIn = Number.isFinite(tokensIn) ? Math.max(0, tokensIn) : 0;
+    const safeTokensOut = Number.isFinite(tokensOut) ? Math.max(0, tokensOut) : 0;
+    const normalizedModel = model.includes("/") ? model.split("/", 2)[1] ?? model : model;
+    const rates = pricing[normalizedModel] ?? pricing[model] ?? pricing["gpt-4o-mini"]!;
+    const cost = (safeTokensIn * rates.input + safeTokensOut * rates.output) / 1_000_000;
 
     this.state.costTracker.total_usd += cost;
     this.state.costTracker.calls++;
-    this.state.costTracker.tokens_in += tokensIn;
-    this.state.costTracker.tokens_out += tokensOut;
+    this.state.costTracker.tokens_in += safeTokensIn;
+    this.state.costTracker.tokens_out += safeTokensOut;
 
     return cost;
   }

@@ -247,6 +247,25 @@ export function SettingsModal({ config, onSave, onClose, onReset }: SettingsModa
             </div>
           </div>
 
+          {/* Swarm Health Gate */}
+          <div>
+            <h3 className="hud-label mb-3 text-hud-primary">Swarm Health Gate</h3>
+            <label className="flex items-start gap-2 text-sm">
+              <input
+                type="checkbox"
+                className="mt-1"
+                checked={localConfig.allow_unhealthy_swarm === true}
+                onChange={e => handleChange('allow_unhealthy_swarm', e.target.checked)}
+              />
+              <span className="text-hud-text">
+                Allow trading loop when swarm is unhealthy (dev override)
+                <span className="block text-[10px] text-hud-warning mt-1">
+                  Use only for local testing. Keep disabled in production.
+                </span>
+              </span>
+            </label>
+          </div>
+
           {/* LLM Config */}
           <div>
             <h3 className="hud-label mb-3 text-hud-primary">LLM Configuration</h3>

@@ -53,6 +53,7 @@ function mapOkxError(code: string, httpStatus: number): ErrorCode {
   if (httpStatus === 429) return ErrorCode.RATE_LIMITED;
 
   if (code === "51000") return ErrorCode.INVALID_INPUT;
+  if (code === "51001") return ErrorCode.NOT_FOUND;
   if (code === "51008") return ErrorCode.INSUFFICIENT_BUYING_POWER;
   if (code === "51009") return ErrorCode.NOT_FOUND;
   if (code === "50011" || code === "50013") return ErrorCode.RATE_LIMITED;

@@ -76,6 +76,13 @@ function getAgentColor(agent: string): string {
 }
 
 const NOISY_SYSTEM_ACTIONS = new Set(['alarm_skipped', 'agent_reset'])
+const ACTIVITY_EVENT_TYPES = ['all', 'agent', 'trade', 'crypto', 'research', 'system', 'swarm', 'risk', 'data', 'api'] as const
+const ACTIVITY_SEVERITIES = ['all', 'debug', 'info', 'warning', 'error', 'critical'] as const
+const ACTIVITY_TIME_RANGES = ['15m', '1h', '6h', '24h', '7d', 'all'] as const
+
+type ActivityEventTypeFilter = typeof ACTIVITY_EVENT_TYPES[number]
+type ActivitySeverityFilter = typeof ACTIVITY_SEVERITIES[number]
+type ActivityTimeRange = typeof ACTIVITY_TIME_RANGES[number]
 
 function isNoisySystemLog(log: LogEntry): boolean {
   return log.agent === 'System' && NOISY_SYSTEM_ACTIONS.has(log.action)
@@ -108,11 +115,12 @@ function getLogNumber(log: LogEntry, key: string): number | null {
 
 function truncate(value: string, maxChars: number = 120): string {
   if (value.length <= maxChars) return value
-  return `${value.slice(0, maxChars - 1)}…`
+  return `${value.slice(0, maxChars - 3)}...`
 }
 
 function formatActivityDetails(log: LogEntry): string {
-  const summary = getLogString(log, 'reason')
+  const summary = (typeof log.description === 'string' && log.description.trim().length > 0 ? log.description.trim() : null)
+    ?? getLogString(log, 'reason')
     ?? getLogString(log, 'message')
     ?? getLogString(log, 'error')
     ?? getLogString(log, 'contract')
@@ -142,6 +150,140 @@ function formatActivityDetails(log: LogEntry): string {
   if (primary && secondary) return `${primary} · ${secondary}`
   if (primary) return primary
   return secondary
+}
+
+function getActivityTimestampMs(log: LogEntry): number {
+  if (typeof log.timestamp_ms === 'number' && Number.isFinite(log.timestamp_ms)) return log.timestamp_ms
+  const parsed = Date.parse(log.timestamp)
+  return Number.isFinite(parsed) ? parsed : Date.now()
+}
+
+function getActivityType(log: LogEntry): ActivityEventTypeFilter {
+  const eventType = typeof log.event_type === 'string' ? log.event_type.toLowerCase() : ''
+  return ACTIVITY_EVENT_TYPES.includes(eventType as ActivityEventTypeFilter)
+    ? eventType as ActivityEventTypeFilter
+    : 'agent'
+}
+
+function getActivitySeverity(log: LogEntry): ActivitySeverityFilter {
+  const severity = typeof log.severity === 'string' ? log.severity.toLowerCase() : ''
+  return ACTIVITY_SEVERITIES.includes(severity as ActivitySeverityFilter)
+    ? severity as ActivitySeverityFilter
+    : 'info'
+}
+
+function getActivityStatus(log: LogEntry): string {
+  return typeof log.status === 'string' && log.status.trim().length > 0 ? log.status.trim().toUpperCase() : 'INFO'
+}
+
+function getActivityDescription(log: LogEntry): string {
+  const details = formatActivityDetails(log)
+  if (details.length > 0) return details
+  return titleCaseAction(log.action)
+}
+
+function getActivityMetadata(log: LogEntry): Record<string, unknown> {
+  if (log.metadata && typeof log.metadata === 'object' && !Array.isArray(log.metadata)) {
+    return log.metadata
+  }
+
+  const metadata: Record<string, unknown> = {}
+  for (const [key, value] of Object.entries(log)) {
+    if (
+      key === 'id' ||
+      key === 'timestamp' ||
+      key === 'timestamp_ms' ||
+      key === 'agent' ||
+      key === 'action' ||
+      key === 'event_type' ||
+      key === 'severity' ||
+      key === 'status' ||
+      key === 'description' ||
+      key === 'metadata'
+    ) {
+      continue
+    }
+    metadata[key] = value
+  }
+  return metadata
+}
+
+function getActivityTypeBadge(eventType: ActivityEventTypeFilter): string {
+  const labels: Record<ActivityEventTypeFilter, string> = {
+    all: 'ALL',
+    agent: 'AGENT',
+    trade: 'TRADE',
+    crypto: 'CRYPTO',
+    research: 'RESEARCH',
+    system: 'SYSTEM',
+    swarm: 'SWARM',
+    risk: 'RISK',
+    data: 'DATA',
+    api: 'API',
+  }
+  return labels[eventType]
+}
+
+function getActivityTypeIcon(eventType: ActivityEventTypeFilter): string {
+  const icons: Record<ActivityEventTypeFilter, string> = {
+    all: '[*]',
+    agent: '[A]',
+    trade: '[$]',
+    crypto: '[C]',
+    research: '[R]',
+    system: '[S]',
+    swarm: '[W]',
+    risk: '[!]',
+    data: '[D]',
+    api: '[P]',
+  }
+  return icons[eventType]
+}
+
+function getActivityTypeClass(eventType: ActivityEventTypeFilter): string {
+  const map: Record<ActivityEventTypeFilter, string> = {
+    all: 'text-hud-text',
+    agent: 'text-hud-primary',
+    trade: 'text-hud-cyan',
+    crypto: 'text-hud-warning',
+    research: 'text-hud-purple',
+    system: 'text-hud-text-dim',
+    swarm: 'text-hud-success',
+    risk: 'text-hud-error',
+    data: 'text-hud-primary',
+    api: 'text-hud-text',
+  }
+  return map[eventType]
+}
+
+function getSeverityClass(severity: ActivitySeverityFilter): string {
+  const map: Record<ActivitySeverityFilter, string> = {
+    all: 'text-hud-text',
+    debug: 'text-hud-text-dim',
+    info: 'text-hud-primary',
+    warning: 'text-hud-warning',
+    error: 'text-hud-error',
+    critical: 'text-hud-error',
+  }
+  return map[severity]
+}
+
+function getStatusClass(status: string): string {
+  const normalized = status.toLowerCase()
+  if (normalized === 'success') return 'text-hud-success'
+  if (normalized === 'failed') return 'text-hud-error'
+  if (normalized === 'warning' || normalized === 'skipped') return 'text-hud-warning'
+  if (normalized === 'started' || normalized === 'in_progress') return 'text-hud-primary'
+  return 'text-hud-text-dim'
+}
+
+function timeRangeToMs(range: ActivityTimeRange): number | null {
+  if (range === '15m') return 15 * 60 * 1000
+  if (range === '1h') return 60 * 60 * 1000
+  if (range === '6h') return 6 * 60 * 60 * 1000
+  if (range === '24h') return 24 * 60 * 60 * 1000
+  if (range === '7d') return 7 * 24 * 60 * 60 * 1000
+  return null
 }
 
 function isCryptoSymbol(symbol: string, cryptoSymbols: string[] = []): boolean {
@@ -212,6 +354,12 @@ export default function App() {
   const [portfolioPeriod, setPortfolioPeriod] = useState<'1D' | '1W' | '1M'>('1D')
   const [agentBusy, setAgentBusy] = useState(false)
   const [agentMessage, setAgentMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
+  const [activityFeed, setActivityFeed] = useState<LogEntry[]>([])
+  const [activityFeedReady, setActivityFeedReady] = useState(false)
+  const [activityEventTypeFilter, setActivityEventTypeFilter] = useState<ActivityEventTypeFilter>('all')
+  const [activitySeverityFilter, setActivitySeverityFilter] = useState<ActivitySeverityFilter>('all')
+  const [activityTimeRangeFilter, setActivityTimeRangeFilter] = useState<ActivityTimeRange>('24h')
+  const [activityExpandedRows, setActivityExpandedRows] = useState<Record<string, boolean>>({})
   
   // Toast for Orchestrator connection
   useEffect(() => {
@@ -283,6 +431,46 @@ export default function App() {
     }
   }, [setupChecked, showSetup, fetchStatus])
 
+  const fetchActivityFeed = useCallback(async () => {
+    if (!setupChecked || showSetup) return
+
+    try {
+      const params = new URLSearchParams()
+      params.set('limit', activityTimeRangeFilter === 'all' ? '2000' : '600')
+      if (activityEventTypeFilter !== 'all') {
+        params.set('event_type', activityEventTypeFilter)
+      }
+      if (activitySeverityFilter !== 'all') {
+        params.set('severity', activitySeverityFilter)
+      }
+
+      const windowMs = timeRangeToMs(activityTimeRangeFilter)
+      if (windowMs !== null) {
+        params.set('since', String(Date.now() - windowMs))
+      }
+
+      const res = await authFetch(`${API_BASE}/logs?${params.toString()}`)
+      const data = await res.json()
+      const logs = Array.isArray(data?.logs) ? data.logs as LogEntry[] : []
+      const sorted = [...logs].sort((a, b) => getActivityTimestampMs(b) - getActivityTimestampMs(a))
+      setActivityFeed(sorted)
+      setActivityFeedReady(true)
+    } catch {
+      // Fallback stays on status payload logs when dedicated feed fetch fails.
+    }
+  }, [setupChecked, showSetup, activityEventTypeFilter, activitySeverityFilter, activityTimeRangeFilter])
+
+  useEffect(() => {
+    if (!setupChecked || showSetup) return
+    fetchActivityFeed()
+    const interval = setInterval(fetchActivityFeed, 2000)
+    return () => clearInterval(interval)
+  }, [setupChecked, showSetup, fetchActivityFeed])
+
+  useEffect(() => {
+    setActivityExpandedRows({})
+  }, [activityEventTypeFilter, activitySeverityFilter, activityTimeRangeFilter])
+
   useEffect(() => {
     if (!agentMessage) return
     const timeout = setTimeout(() => setAgentMessage(null), 4000)
@@ -340,19 +528,75 @@ export default function App() {
   const account = status?.account
   const positions = status?.positions || []
   const signals = status?.signals || []
-  const logs = status?.logs || []
+  const logsFromStatus = status?.logs || []
   const agentEnabled = status?.enabled ?? null
 
   const activityLogs = useMemo(() => {
-    return logs.filter((log) => !isNoisySystemLog(log)).slice(-50).reverse()
-  }, [logs])
+    const source = activityFeedReady ? activityFeed : logsFromStatus
+    const rangeWindowMs = timeRangeToMs(activityTimeRangeFilter)
+    const rangeStart = rangeWindowMs !== null ? Date.now() - rangeWindowMs : null
+    return source
+      .filter((log) => !isNoisySystemLog(log))
+      .filter((log) => activityEventTypeFilter === 'all' || getActivityType(log) === activityEventTypeFilter)
+      .filter((log) => activitySeverityFilter === 'all' || getActivitySeverity(log) === activitySeverityFilter)
+      .filter((log) => rangeStart === null || getActivityTimestampMs(log) >= rangeStart)
+      .sort((a, b) => getActivityTimestampMs(b) - getActivityTimestampMs(a))
+      .slice(0, 500)
+  }, [activityFeedReady, activityFeed, logsFromStatus, activityEventTypeFilter, activitySeverityFilter, activityTimeRangeFilter])
 
   const activityEmptyText = useMemo(() => {
     if (agentEnabled === false) return 'Agent paused. Enable it to start research and execution activity.'
     if (status?.swarm?.healthy === false) return 'Swarm unhealthy. Activity will resume once quorum is restored.'
-    if (logs.length > 0) return 'No research or trade events yet. Waiting for the next agent cycle.'
+    if (activityFeedReady) return 'No activity events match your current filters.'
+    if (logsFromStatus.length > 0) return 'No research or trade events yet. Waiting for the next agent cycle.'
     return 'Waiting for research and execution activity...'
-  }, [agentEnabled, status?.swarm?.healthy, logs.length])
+  }, [agentEnabled, status?.swarm?.healthy, activityFeedReady, logsFromStatus.length])
+
+  const signalResearchEmptyText = useMemo(() => {
+    if (status?.enabled === false) return 'Agent paused.'
+    if (status?.swarm?.healthy === false) return 'Swarm unhealthy.'
+
+    const recentResearchLogs = activityLogs
+      .filter((log) => getActivityType(log) === 'research' || log.agent === 'SignalResearch')
+      .slice(0, 80)
+
+    const authOrCircuit = recentResearchLogs.find((log) =>
+      ['auth_error', 'research_skipped_circuit_breaker'].includes(log.action)
+    )
+    if (authOrCircuit) {
+      return getActivityDescription(authOrCircuit)
+    }
+
+    const malformedOrFailed = recentResearchLogs.find((log) =>
+      ['invalid_llm_json', 'research_failed', 'error'].includes(log.action)
+    )
+    if (malformedOrFailed) {
+      return getActivityDescription(malformedOrFailed)
+    }
+
+    const noCandidates = recentResearchLogs.find((log) =>
+      ['no_candidates', 'no_candidates_for_broker'].includes(log.action)
+    )
+    if (noCandidates) {
+      return getActivityDescription(noCandidates)
+    }
+
+    const filteredForBroker = recentResearchLogs.find((log) => log.action === 'candidates_filtered_by_broker')
+    if (filteredForBroker) {
+      return getActivityDescription(filteredForBroker)
+    }
+
+    const staleCount = recentResearchLogs.filter((log) => log.action === 'stale_data').length
+    if (staleCount > 0) {
+      return `Candidates rejected by market-data checks (${staleCount}).`
+    }
+
+    return 'Researching candidates...'
+  }, [status?.enabled, status?.swarm?.healthy, activityLogs])
+
+  const toggleActivityRow = useCallback((rowId: string) => {
+    setActivityExpandedRows((prev) => ({ ...prev, [rowId]: !prev[rowId] }))
+  }, [])
 
   const costs = status?.costs || { total_usd: 0, calls: 0, tokens_in: 0, tokens_out: 0 }
   const config = status?.config
@@ -874,39 +1118,124 @@ export default function App() {
           </div>
 
           <div className="col-span-4 md:col-span-4 lg:col-span-4">
-            <Panel title="ACTIVITY FEED" titleRight="LIVE" className="h-80">
-              <div className="overflow-y-auto h-full font-mono text-xs space-y-1">
-                {activityLogs.length === 0 ? (
-                  <div className="text-hud-text-dim py-4 text-center">{activityEmptyText}</div>
-                ) : (
-                  activityLogs.map((log: LogEntry, i: number) => {
-                    const details = formatActivityDetails(log)
-                    return (
-                      <motion.div
-                        key={`${log.timestamp}-${i}`}
-                        initial={{ opacity: 0 }}
-                        animate={{ opacity: 1 }}
-                        className="flex items-start gap-2 py-1 border-b border-hud-line/10"
-                      >
-                        <span className="text-hud-text-dim shrink-0 hidden sm:inline w-[52px]">
-                          {new Date(log.timestamp).toLocaleTimeString('en-US', { hour12: false })}
-                        </span>
-                        <span className={clsx('shrink-0 w-[92px] text-right', getAgentColor(log.agent))}>
-                          {log.agent}
-                        </span>
-                        <div className="text-hud-text flex-1 min-w-0">
-                          <div className="break-words">{titleCaseAction(log.action)}</div>
-                          {details && (
-                            <div className="text-hud-text-dim break-words mt-0.5">
-                              {details}
+            <Panel
+              title="ACTIVITY FEED"
+              titleRight={
+                <div className="flex items-center gap-2">
+                  <span className="hud-label text-hud-success">LIVE</span>
+                  <span className="hud-label text-hud-text-dim">{activityLogs.length} events</span>
+                </div>
+              }
+              className="h-80"
+            >
+              <div className="h-full flex flex-col gap-2">
+                <div className="grid grid-cols-3 gap-2">
+                  <select
+                    className="hud-input h-8 text-xs"
+                    value={activityEventTypeFilter}
+                    onChange={(e) => setActivityEventTypeFilter(e.target.value as ActivityEventTypeFilter)}
+                  >
+                    {ACTIVITY_EVENT_TYPES.map((eventType) => (
+                      <option key={eventType} value={eventType}>
+                        {eventType === 'all' ? 'All types' : getActivityTypeBadge(eventType)}
+                      </option>
+                    ))}
+                  </select>
+                  <select
+                    className="hud-input h-8 text-xs"
+                    value={activitySeverityFilter}
+                    onChange={(e) => setActivitySeverityFilter(e.target.value as ActivitySeverityFilter)}
+                  >
+                    {ACTIVITY_SEVERITIES.map((severity) => (
+                      <option key={severity} value={severity}>
+                        {severity === 'all' ? 'All severities' : severity.toUpperCase()}
+                      </option>
+                    ))}
+                  </select>
+                  <select
+                    className="hud-input h-8 text-xs"
+                    value={activityTimeRangeFilter}
+                    onChange={(e) => setActivityTimeRangeFilter(e.target.value as ActivityTimeRange)}
+                  >
+                    {ACTIVITY_TIME_RANGES.map((range) => (
+                      <option key={range} value={range}>
+                        {range === 'all' ? 'All history' : range}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                <div className="overflow-y-auto flex-1 font-mono text-xs space-y-1 pr-1">
+                  {activityLogs.length === 0 ? (
+                    <div className="text-hud-text-dim py-4 text-center">{activityEmptyText}</div>
+                  ) : (
+                    activityLogs.map((log: LogEntry, i: number) => {
+                      const rowId = log.id || `${log.timestamp}-${log.agent}-${log.action}-${i}`
+                      const eventType = getActivityType(log)
+                      const severity = getActivitySeverity(log)
+                      const statusLabel = getActivityStatus(log)
+                      const details = getActivityDescription(log)
+                      const metadata = getActivityMetadata(log)
+                      const hasMetadata = Object.keys(metadata).length > 0
+                      const expanded = !!activityExpandedRows[rowId]
+
+                      return (
+                        <motion.div
+                          key={rowId}
+                          initial={{ opacity: 0 }}
+                          animate={{ opacity: 1 }}
+                          className={clsx(
+                            'py-2 px-2 border rounded border-hud-line/20 bg-hud-panel/30 hover:bg-hud-panel/50 transition-colors',
+                            severity === 'error' || severity === 'critical' ? 'border-hud-error/30' : ''
+                          )}
+                        >
+                          <div className="flex items-start gap-2">
+                            <span className="text-hud-text-dim shrink-0 hidden sm:inline w-[56px]">
+                              {new Date(getActivityTimestampMs(log)).toLocaleTimeString('en-US', { hour12: false })}
+                            </span>
+                            <span className={clsx('shrink-0 w-[40px] text-right hud-label', getActivityTypeClass(eventType))}>
+                              {getActivityTypeIcon(eventType)}
+                            </span>
+                            <span className={clsx('shrink-0 w-[68px] text-right hud-label', getActivityTypeClass(eventType))}>
+                              {getActivityTypeBadge(eventType)}
+                            </span>
+                            <span className={clsx('shrink-0 w-[90px] text-right', getAgentColor(log.agent))}>
+                              {log.agent}
+                            </span>
+                            <div className="text-hud-text flex-1 min-w-0">
+                              <div className="flex items-center gap-2 flex-wrap mb-1">
+                                <span className="break-words">{titleCaseAction(log.action)}</span>
+                                <span className={clsx('hud-label', getSeverityClass(severity))}>{severity.toUpperCase()}</span>
+                                <span className={clsx('hud-label', getStatusClass(statusLabel))}>{statusLabel}</span>
+                              </div>
+                              {details && (
+                                <div className="text-hud-text-dim break-words mt-0.5">
+                                  {details}
+                                </div>
+                              )}
+                            </div>
+                          </div>
+
+                          {hasMetadata && (
+                            <div className="mt-2 pl-[56px] sm:pl-[260px]">
+                              <button
+                                className="hud-label text-hud-primary hover:text-hud-cyan"
+                                onClick={() => toggleActivityRow(rowId)}
+                              >
+                                {expanded ? '[HIDE DETAILS]' : '[SHOW DETAILS]'}
+                              </button>
+                              {expanded && (
+                                <pre className="mt-2 text-[11px] leading-relaxed bg-hud-bg/70 border border-hud-line/20 rounded p-2 text-hud-text-dim overflow-x-auto">
+                                  {JSON.stringify(metadata, null, 2)}
+                                </pre>
+                              )}
                             </div>
                           )}
-                        </div>
-                      </motion.div>
-                    )
-                  })
-                )}
-
+                        </motion.div>
+                      )
+                    })
+                  )}
+                </div>
               </div>
             </Panel>
           </div>
@@ -916,13 +1245,7 @@ export default function App() {
               <div className="overflow-y-auto h-full space-y-2">
                 {Object.entries(status?.signalResearch || {}).length === 0 ? (
                   <div className="text-hud-text-dim text-sm py-4 text-center">
-                    {status?.enabled === false ? (
-                      <span className="text-hud-warning">Agent paused.</span>
-                    ) : status?.swarm?.healthy === false ? (
-                      <span className="text-hud-error">Swarm unhealthy.</span>
-                    ) : (
-                      "Researching candidates..."
-                    )}
+                    {signalResearchEmptyText}
                   </div>
                 ) : (
                   Object.entries(status?.signalResearch || {})

@@ -368,7 +368,6 @@ Output JSON array of recommendations:
     const recommendations = await this.runLlmWithResilience<any[]>(
       async () => {
         const response = await this._llm.complete({
-          model: "gpt-4o-mini",
           messages: [
             {
               role: "system",
@@ -472,7 +471,6 @@ Return JSON array:
       >(
         async () => {
           const response = await this._llm.complete({
-            model: "gpt-4o-mini",
             messages: [
               {
                 role: "system",

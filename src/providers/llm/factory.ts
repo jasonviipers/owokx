@@ -65,7 +65,9 @@ export function createLLMProvider(env: Env): LLMProvider | null {
         return null;
       }
 
-      return createAISDKProvider({ model, apiKeys, openaiBaseUrl });
+      // Normalize unqualified model to OpenAI default for AI SDK
+      const effectiveModel = model.includes("/") ? model : `openai/${model}`;
+      return createAISDKProvider({ model: effectiveModel, apiKeys, openaiBaseUrl });
     }
     default:
       // Backward compatible: use existing OpenAI provider
