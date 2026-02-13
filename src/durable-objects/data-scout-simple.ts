@@ -4,10 +4,10 @@
  * Follows the same pattern as OwokxHarness for consistency.
  */
 
-import { AgentBase, type AgentBaseState } from "../lib/agents/base";
 import type { Env } from "../env.d";
+import { AgentBase, type AgentBaseState } from "../lib/agents/base";
 import type { AgentMessage, AgentType } from "../lib/agents/protocol";
-import { extractTickers, DEFAULT_TICKER_BLACKLIST } from "../lib/ticker";
+import { DEFAULT_TICKER_BLACKLIST, extractTickers } from "../lib/ticker";
 
 type SourceName = "stocktwits" | "reddit" | "alphavantage";
 
@@ -453,7 +453,10 @@ export class DataScoutSimple extends AgentBase<DataScoutState> {
   }
 
   private stripHtml(value: string): string {
-    return value.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+    return value
+      .replace(/<[^>]+>/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
   }
 
   private async runSourceWithCircuitBreaker(

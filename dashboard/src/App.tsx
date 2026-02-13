@@ -15,6 +15,20 @@ import type { Status, Config, LogEntry, Signal, Position, SignalResearch, Portfo
 import { MobileNav } from './components/Mobilenav'
 
 const API_BASE = '/api'
+declare const __OWOKX_API_URL__: string | undefined
+
+interface SetupStatusData {
+  configured?: boolean
+  api_origin?: string
+  auth?: {
+    token_env_var?: string
+  }
+  commands?: {
+    enable?: {
+      curl?: string
+    }
+  }
+}
 
 function getApiToken(): string {
   return localStorage.getItem('OWOKX_API_TOKEN') || (window as unknown as { VITE_OWOKX_API_TOKEN?: string }).VITE_OWOKX_API_TOKEN || ''
@@ -30,6 +44,39 @@ function authFetch(url: string, options: RequestInit = {}): Promise<Response> {
     headers.set('Content-Type', 'application/json')
   }
   return fetch(url, { ...options, headers })
+}
+
+function resolveConfiguredApiOrigin(): string | null {
+  const candidate = typeof __OWOKX_API_URL__ === 'string' ? __OWOKX_API_URL__.trim() : ''
+  if (!candidate) return null
+  try {
+    return new URL(candidate).origin
+  } catch {
+    return null
+  }
+}
+
+function resolveDashboardApiOrigin(): string {
+  const configuredOrigin = resolveConfiguredApiOrigin()
+  if (configuredOrigin) return configuredOrigin
+  if (typeof window === 'undefined') return 'http://localhost:8787'
+  const { protocol, hostname, host, port } = window.location
+  const isLocalHost = hostname === 'localhost' || hostname === '127.0.0.1'
+  if (isLocalHost && port !== '8787') {
+    return 'http://localhost:8787'
+  }
+  return `${protocol}//${host}`
+}
+
+function normalizeTokenEnvVar(value: unknown): string {
+  if (typeof value !== 'string') return 'OWOKX_TOKEN'
+  const trimmed = value.trim()
+  if (!trimmed) return 'OWOKX_TOKEN'
+  return /^[A-Za-z_][A-Za-z0-9_]*$/.test(trimmed) ? trimmed : 'OWOKX_TOKEN'
+}
+
+function buildEnableCurlCommand(apiOrigin: string, tokenEnvVar: string): string {
+  return `curl -H "Authorization: Bearer $${tokenEnvVar}" ${apiOrigin}/agent/enable`
 }
 
 function formatCurrency(amount: number): string {
@@ -348,6 +395,9 @@ export default function App() {
   const [error, setError] = useState<string | null>(null)
   const [showSettings, setShowSettings] = useState(false)
   const [showSetup, setShowSetup] = useState(false)
+  const [enableCommandHint, setEnableCommandHint] = useState(() =>
+    buildEnableCurlCommand(resolveDashboardApiOrigin(), 'OWOKX_TOKEN')
+  )
   const [setupChecked, setSetupChecked] = useState(false)
   const [time, setTime] = useState(new Date())
   const [portfolioHistory, setPortfolioHistory] = useState<PortfolioSnapshot[]>([])
@@ -375,7 +425,18 @@ export default function App() {
     try {
       const res = await authFetch(`${API_BASE}/setup/status`)
       const data = await res.json()
-      if (data.ok && !data.data.configured) {
+      const setupData = (data?.data ?? {}) as SetupStatusData
+      const backendEnableCommand = setupData.commands?.enable?.curl
+      if (typeof backendEnableCommand === 'string' && backendEnableCommand.trim().length > 0) {
+        setEnableCommandHint(backendEnableCommand.trim())
+      } else {
+        const apiOrigin = typeof setupData.api_origin === 'string' && setupData.api_origin.trim().length > 0
+          ? setupData.api_origin.trim()
+          : resolveDashboardApiOrigin()
+        const tokenEnvVar = normalizeTokenEnvVar(setupData.auth?.token_env_var)
+        setEnableCommandHint(buildEnableCurlCommand(apiOrigin, tokenEnvVar))
+      }
+      if (data.ok && setupData.configured === false) {
         setShowSetup(true)
       }
       setSetupChecked(true)
@@ -742,7 +803,7 @@ export default function App() {
               </div>
             ) : (
               <p className="text-hud-text-dim text-xs">
-                Enable the agent: <code className="text-hud-primary">curl -H "Authorization: Bearer $TOKEN" localhost:8787/agent/enable</code>
+                Enable the agent: <code className="text-hud-primary break-all">{enableCommandHint}</code>
               </p>
             )}
           </div>

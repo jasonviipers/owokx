@@ -4,10 +4,10 @@
  * Follows the same pattern as OwokxHarness for consistency.
  */
 
-import { AgentBase, type AgentBaseState } from "../lib/agents/base";
 import type { Env } from "../env.d";
-import type { AgentMessage, AgentType } from "../lib/agents/protocol";
 import { executeOrder } from "../execution/execute-order";
+import { AgentBase, type AgentBaseState } from "../lib/agents/base";
+import type { AgentMessage, AgentType } from "../lib/agents/protocol";
 import { createBrokerProviders } from "../providers/broker-factory";
 import { createD1Client } from "../storage/d1/client";
 

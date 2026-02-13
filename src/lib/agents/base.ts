@@ -1,10 +1,10 @@
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "../../env.d";
 import {
-  createMessageId,
   type AgentMessage,
   type AgentStatus,
   type AgentType,
+  createMessageId,
   type MessagePriority,
   type MessageType,
 } from "./protocol";

@@ -6,13 +6,13 @@ import { OwokxMcpAgent } from "./mcp/agent";
 
 export { SessionDO } from "./durable-objects/session";
 export { OwokxMcpAgent, OwokxMcpAgent as owokxMcpAgent };
-export { OwokxHarness, OwokxHarness as owokxHarness } from "./durable-objects/owokx-harness";
-export { DataScoutSimple as DataScout } from "./durable-objects/data-scout-simple";
 export { AnalystSimple as Analyst } from "./durable-objects/analyst-simple";
-export { TraderSimple as Trader } from "./durable-objects/trader-simple";
-export { SwarmRegistry } from "./durable-objects/swarm-registry";
-export { RiskManager } from "./durable-objects/risk-manager";
+export { DataScoutSimple as DataScout } from "./durable-objects/data-scout-simple";
 export { LearningAgent } from "./durable-objects/learning-agent";
+export { OwokxHarness, OwokxHarness as owokxHarness } from "./durable-objects/owokx-harness";
+export { RiskManager } from "./durable-objects/risk-manager";
+export { SwarmRegistry } from "./durable-objects/swarm-registry";
+export { TraderSimple as Trader } from "./durable-objects/trader-simple";
 
 function unauthorizedResponse(): Response {
   return new Response(JSON.stringify({ error: "Unauthorized. Requires: Authorization: Bearer <token>" }), {
@@ -86,10 +86,12 @@ export default {
       const agentPath = url.pathname.replace("/agent", "") || "/status";
       const agentUrl = new URL(agentPath, "http://harness");
       agentUrl.search = url.search;
+      const headers = new Headers(request.headers);
+      headers.set("x-owokx-public-origin", url.origin);
       return stub.fetch(
         new Request(agentUrl.toString(), {
           method: request.method,
-          headers: request.headers,
+          headers,
           body: request.body,
         })
       );
