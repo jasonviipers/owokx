@@ -1,353 +1,276 @@
-⚠️ **Warning:** This software is provided for educational and informational purposes only. Nothing in this repository constitutes financial, investment, legal, or tax advice.
+WARNING: This software is provided for educational and informational purposes only. Nothing in this repository constitutes financial, investment, legal, or tax advice.
 
-# Okx Trading Agent
+# owokx Trading Agent
 
-An autonomous, LLM-powered trading agent that runs 24/7 on Cloudflare Workers.
+An autonomous, LLM-powered trading agent that runs on Cloudflare Workers using Durable Objects.
 
 [![Discord](https://img.shields.io/discord/1467592472158015553?color=7289da&label=Discord&logo=discord&logoColor=white)](https://discord.gg/vMFnHe2YBh)
 
-Okx monitors social sentiment from StockTwits and Reddit, uses AI (OpenAI, Anthropic, Google, xAI, DeepSeek via AI SDK) to analyze signals, and executes trades through a configurable broker provider (Alpaca or OKX). It runs as a Cloudflare Durable Object with persistent state, automatic restarts, and 24/7 crypto trading support.
+The system gathers market/social signals, runs LLM-based research, and executes trades through a configurable broker (Alpaca or OKX).
 
 <img width="1278" height="957" alt="dashboard" src="https://github.com/user-attachments/assets/56473ab6-e2c6-45fc-9e32-cf85e69f1a2d" />
 
 ## Features
 
-- **24/7 Operation** — Runs on Cloudflare Workers, no local machine required
-- **Multi-Source Signals** - StockTwits, Reddit RSS (4 subreddits), Alpha Vantage sentiment, Twitter confirmation
-- **Multi-Provider LLM** — OpenAI, Anthropic, Google, xAI, DeepSeek via AI SDK or Cloudflare AI Gateway
-- **Multi-Broker Trading** — Switch between Alpaca and OKX via config
-- **Crypto Trading** — Trade BTC, ETH, SOL around the clock
-- **Options Support** — High-conviction options plays
-- **Staleness Detection** — Auto-exit positions that lose momentum
-- **Pre-Market Analysis** — Prepare trading plans before market open
-- **Discord Notifications** — Get alerts on BUY signals
-- **Fully Customizable** — Well-documented with `[TUNE]` and `[CUSTOMIZABLE]` markers
+- 24/7 worker runtime on Cloudflare
+- Multi-source signals: StockTwits, Reddit public feeds, SEC filings, crypto market data
+- DataScout source extensions: Reddit RSS backup + Alpha Vantage sentiment
+- Multi-provider LLM support: OpenAI, Anthropic, Google, xAI, DeepSeek (via AI SDK)
+- Broker abstraction: Alpaca or OKX
+- Activity logging with event typing, severity, status, filtering, and history
+- Swarm-aware execution with production safety guardrails
+- Discord notifications and configurable risk/position rules
 
 ## Requirements
 
 - Node.js 18+
-- Cloudflare account (free tier works)
-- Alpaca account (free, paper trading supported) or OKX account (API key + passphrase)
-- LLM API key (OpenAI, Anthropic, Google, xAI, DeepSeek) or Cloudflare AI Gateway credentials
+- Cloudflare account
+- Broker account:
+  - Alpaca (paper trading recommended first), or
+  - OKX (API key, secret, passphrase)
+- LLM provider credentials (or Cloudflare AI Gateway credentials)
 
 ## Quick Start
 
 ### 1. Clone and install
 
 ```bash
-git clone https://github.com/ygwyg/Okx.git
-cd Okx
+git clone https://github.com/jasonviipers/owokx.git
+cd owokx
 npm install
 ```
 
-### 2. Create Cloudflare resourcesy
+### 2. Create Cloudflare resources
 
 ```bash
-# Create D1 database
+# D1
 npx wrangler d1 create Okx-db
-# Copy the database_id to wrangler.jsonc
 
-# Create KV namespace
+# KV
 npx wrangler kv namespace create CACHE
-# Copy the id to wrangler.jsonc
 
-# Run migrations
+# Apply migrations
 npx wrangler d1 migrations apply Okx-db
 ```
 
-### 3. Set secrets
+### 3. Configure secrets
 
 ```bash
-# Required
+# Required auth
 npx wrangler secret put OWOKX_API_TOKEN
-npx wrangler secret put KILL_SWITCH_SECRET   # Emergency kill switch (separate from API token)
+npx wrangler secret put KILL_SWITCH_SECRET
 
-# Broker selection (default: alpaca)
-npx wrangler secret put BROKER_PROVIDER      # "alpaca" or "okx"
+# Broker selection
+npx wrangler secret put BROKER_PROVIDER    # "alpaca" or "okx"
 
-# Alpaca (required when BROKER_PROVIDER=alpaca)
+# Alpaca (when BROKER_PROVIDER=alpaca)
 npx wrangler secret put ALPACA_API_KEY
 npx wrangler secret put ALPACA_API_SECRET
-npx wrangler secret put ALPACA_PAPER         # "true" for paper trading (recommended)
+npx wrangler secret put ALPACA_PAPER        # "true" recommended
 
-# OKX (required when BROKER_PROVIDER=okx)
+# OKX (when BROKER_PROVIDER=okx)
 npx wrangler secret put OKX_API_KEY
 npx wrangler secret put OKX_SECRET
 npx wrangler secret put OKX_PASSPHRASE
-# npx wrangler secret put OKX_SIMULATED_TRADING   # "true" to enable demo/sandbox trading
-# npx wrangler secret put OKX_DEFAULT_QUOTE_CCY   # default: "USDT"
+# optional:
+# npx wrangler secret put OKX_SIMULATED_TRADING
+# npx wrangler secret put OKX_DEFAULT_QUOTE_CCY
 
-# LLM Provider (choose one mode)
-npx wrangler secret put LLM_PROVIDER  # "openai-raw" (default), "ai-sdk", or "cloudflare-gateway"
-npx wrangler secret put LLM_MODEL     # e.g. "gpt-4o-mini" or "anthropic/claude-sonnet-4"
+# LLM mode
+npx wrangler secret put LLM_PROVIDER         # "openai-raw" | "ai-sdk" | "cloudflare-gateway"
+npx wrangler secret put LLM_MODEL
 
-# LLM API Keys (based on provider mode)
-npx wrangler secret put OPENAI_API_KEY         # For openai-raw or ai-sdk with OpenAI
-npx wrangler secret put OPENAI_BASE_URL        # Optional: override OpenAI base URL for openai-raw and ai-sdk (OpenAI models)
-# npx wrangler secret put ANTHROPIC_API_KEY    # For ai-sdk with Anthropic
-# npx wrangler secret put GOOGLE_GENERATIVE_AI_API_KEY  # For ai-sdk with Google
-# npx wrangler secret put XAI_API_KEY          # For ai-sdk with xAI/Grok
-# npx wrangler secret put DEEPSEEK_API_KEY     # For ai-sdk with DeepSeek
-# npx wrangler secret put CLOUDFLARE_AI_GATEWAY_ACCOUNT_ID  # For cloudflare-gateway
-# npx wrangler secret put CLOUDFLARE_AI_GATEWAY_ID          # For cloudflare-gateway
-# npx wrangler secret put CLOUDFLARE_AI_GATEWAY_TOKEN       # For cloudflare-gateway
+# Provider keys (based on chosen mode)
+npx wrangler secret put OPENAI_API_KEY
+# optional:
+# npx wrangler secret put OPENAI_BASE_URL
+# npx wrangler secret put ANTHROPIC_API_KEY
+# npx wrangler secret put GOOGLE_GENERATIVE_AI_API_KEY
+# npx wrangler secret put XAI_API_KEY
+# npx wrangler secret put DEEPSEEK_API_KEY
+# npx wrangler secret put CLOUDFLARE_AI_GATEWAY_ACCOUNT_ID
+# npx wrangler secret put CLOUDFLARE_AI_GATEWAY_ID
+# npx wrangler secret put CLOUDFLARE_AI_GATEWAY_TOKEN
 
-# Optional
+# Optional data/alert integrations
 npx wrangler secret put TWITTER_BEARER_TOKEN
 npx wrangler secret put DISCORD_WEBHOOK_URL
 npx wrangler secret put ALPHA_VANTAGE_API_KEY
 ```
 
-### 4. Deploy
+### 4. Run locally
 
 ```bash
-npx wrangler deploy
-```
+# Terminal 1
+npx wrangler dev
 
-### 5. Enable the agent
-
-All API endpoints require authentication via Bearer token:
-
-```bash
-# Set your API token as an env var for convenience
-export Okx_TOKEN="your-api-token"
-
-# Enable the agent
-curl -H "Authorization: Bearer $Okx_TOKEN" \
-   http://127.0.0.1:8787/agent/enable
-```
-
-### 6. Monitor
-
-```bash
-# Check status
-curl -H "Authorization: Bearer $Okx_TOKEN" \
-  http://127.0.0.1:8787/agent/status
-
-# View logs
-curl -H "Authorization: Bearer $Okx_TOKEN" \
-  http://127.0.0.1:8787/agent/logs
-
-# Emergency kill switch (uses separate KILL_SWITCH_SECRET)
-curl -H "Authorization: Bearer $KILL_SWITCH_SECRET" \
-  http://127.0.0.1:8787/agent/kill
-
-# Run dashboard locally
+# Terminal 2
 cd dashboard && npm install && npm run dev
 ```
 
-## Local Development
+Set a token in your shell:
 
 ```bash
-# Terminal 1 - Start wrangler
-npx wrangler dev
+# bash/zsh
+export OWOKX_TOKEN="<your token>"
 
-# Terminal 2 - Start dashboard  
-cd dashboard && npm run dev
-
-# Terminal 3 - Enable the agent
-curl -H "Authorization: Bearer $Okx_TOKEN" \
-  http://localhost:8787/agent/enable
+# PowerShell
+$env:OWOKX_TOKEN="<your token>"
 ```
 
-## Customizing the Harness
-
-The main trading logic is in `src/durable-objects/Okx-harness.ts`. It's documented with markers to help you find what to modify:
-
-| Marker | Meaning |
-|--------|---------|
-| `[TUNE]` | Numeric values you can adjust |
-| `[TOGGLE]` | Features you can enable/disable |
-| `[CUSTOMIZABLE]` | Sections with code you might want to modify |
-
-### Adding a New Data Source
-
-1. Create a new `gather*()` method that returns `Signal[]`
-2. Add it to `runDataGatherers()` Promise.all
-3. Add source weight to `SOURCE_CONFIG.weights`
-
-See `docs/harness.html` for detailed customization guide.
-
-## Configuration
-
-| Setting | Default | Description |
-|---------|---------|-------------|
-| `max_positions` | 5 | Maximum concurrent positions |
-| `max_position_value` | 5000 | Maximum $ per position |
-| `take_profit_pct` | 10 | Take profit percentage |
-| `stop_loss_pct` | 5 | Stop loss percentage |
-| `min_sentiment_score` | 0.3 | Minimum sentiment to consider |
-| `min_analyst_confidence` | 0.6 | Minimum LLM confidence to trade |
-| `options_enabled` | false | Enable options trading |
-| `crypto_enabled` | false | Enable 24/7 crypto trading |
-| `llm_model` | gpt-4o-mini | Research model (cheap, for bulk analysis) |
-| `llm_analyst_model` | gpt-4o | Analyst model (smart, for trading decisions) |
-
-### Broker Configuration
-
-Okx supports multiple broker providers:
-
-- **Alpaca** (`broker=alpaca`) — US equities + crypto + options (if enabled)
-- **OKX** (`broker=okx`) — Crypto spot trading (24/7)
-
-You can select the broker in two places:
-
-- **Dashboard / agent config**: set the `broker` field via `/agent/config`
-- **Worker env**: set `BROKER_PROVIDER` (used by cron + MCP tools; dashboard config takes precedence inside the harness)
-
-**OKX setup**
-
-1. Create an OKX API key + passphrase (enable trading permissions as needed).
-2. Configure secrets:
-   - `OKX_API_KEY`, `OKX_SECRET`, `OKX_PASSPHRASE`
-   - Optional: `OKX_SIMULATED_TRADING=true` for demo/sandbox trading (requires demo-enabled API key)
-   - Optional: `OKX_DEFAULT_QUOTE_CCY=USDT` (default)
-3. Use crypto pairs like `BTC/USDT`, `ETH/USDT`, `SOL/USDT` in `crypto_symbols`.
-
-### LLM Provider Configuration
-
-Okx supports multiple LLM providers via three modes:
-
-| Mode | Description | Required Env Vars |
-|------|-------------|-------------------|
-| `openai-raw` | Direct OpenAI API (default) | `OPENAI_API_KEY` |
-| `ai-sdk` | Vercel AI SDK with 5 providers | One or more provider keys |
-| `cloudflare-gateway` | Cloudflare AI Gateway (/compat) | `CLOUDFLARE_AI_GATEWAY_ACCOUNT_ID`, `CLOUDFLARE_AI_GATEWAY_ID`, `CLOUDFLARE_AI_GATEWAY_TOKEN` |
-
-**Optional OpenAI Base URL Override:**
-
-- `OPENAI_BASE_URL` — Override the base URL used for OpenAI requests. Applies to `LLM_PROVIDER=openai-raw` and OpenAI models in `LLM_PROVIDER=ai-sdk` (models starting with `openai/`). Default: `https://api.openai.com/v1`.
-
-**Cloudflare AI Gateway Notes:**
-
-- This integration calls Cloudflare's OpenAI-compatible `/compat/chat/completions` endpoint and always sends `cf-aig-authorization`.
-- It is intended for BYOK/Unified Billing setups where upstream provider keys are configured in Cloudflare (so your worker does not send provider API keys).
-- Models use the `{provider}/{model}` format (e.g. `openai/gpt-5-mini`, `google-ai-studio/gemini-2.5-flash`, `anthropic/claude-sonnet-4-5`).
-
-**AI SDK Supported Providers:**
-
-| Provider | Env Var | Example Models |
-|----------|---------|----------------|
-| OpenAI | `OPENAI_API_KEY` | `openai/gpt-4o`, `openai/o1` |
-| Anthropic | `ANTHROPIC_API_KEY` | `anthropic/claude-sonnet-4`, `anthropic/claude-opus-4` |
-| Google | `GOOGLE_GENERATIVE_AI_API_KEY` | `google/gemini-2.5-pro`, `google/gemini-2.5-flash` |
-| xAI (Grok) | `XAI_API_KEY` | `xai/grok-4`, `xai/grok-3` |
-| DeepSeek | `DEEPSEEK_API_KEY` | `deepseek/deepseek-chat`, `deepseek/deepseek-reasoner` |
-
-**Example: Using Claude with AI SDK:**
+Enable the agent:
 
 ```bash
-npx wrangler secret put LLM_PROVIDER      # Set to "ai-sdk"
-npx wrangler secret put LLM_MODEL         # Set to "anthropic/claude-sonnet-4"
-npx wrangler secret put ANTHROPIC_API_KEY # Your Anthropic API key
+curl -H "Authorization: Bearer $OWOKX_TOKEN" http://127.0.0.1:8787/agent/enable
 ```
 
 ## API Endpoints
 
 | Endpoint | Description |
-|----------|-------------|
-| `/agent/status` | Full status (account, positions, signals) |
-| `/agent/enable` | Enable the agent |
-| `/agent/disable` | Disable the agent |
-| `/agent/config` | Get or update configuration |
-| `/agent/logs` | Get recent logs |
-| `/agent/trigger` | Manually trigger (for testing) |
-| `/agent/kill` | Emergency kill switch (uses `KILL_SWITCH_SECRET`) |
-| `/mcp` | MCP server for tool access |
+|---|---|
+| `/agent/status` | Full runtime status |
+| `/agent/config` | Read/update config |
+| `/agent/enable` | Enable scheduler |
+| `/agent/disable` | Disable scheduler |
+| `/agent/trigger` | Trigger one alarm cycle |
+| `/agent/logs` | Query activity logs with filters |
+| `/agent/history` | Portfolio history |
+| `/agent/metrics` | Runtime metrics |
+| `/agent/costs` | LLM usage/cost totals |
+| `/agent/reset` | Reset durable state |
+| `/agent/kill` | Emergency kill switch (`KILL_SWITCH_SECRET`) |
+| `/swarm/*` | Swarm health/metrics/queue endpoints |
+| `/mcp` | MCP server endpoint |
 
-## Security
+## Activity Logs
 
-### API Authentication (Required)
+`/agent/logs` supports server-side filtering and search.
 
-All `/agent/*` endpoints require Bearer token authentication using `OWOKX_API_TOKEN`:
+### Query parameters
 
-```bash
-curl -H "Authorization: Bearer $Okx_TOKEN" https://Okx.bernardoalmeida2004.workers.dev/agent/status
-```
+- `event_type`: `agent,trade,crypto,research,system,swarm,risk,data,api`
+- `severity`: `debug,info,warning,error,critical`
+- `status`: `info,started,in_progress,success,warning,failed,skipped`
+- `agent`: agent name (`Analyst`, `SignalResearch`, etc.)
+- `search`: full-text search over agent/action/description/metadata
+- `since`, `until`: epoch milliseconds
+- `limit`: max rows (1-2000, default 200)
 
-Generate a secure token: `openssl rand -base64 48`
-
-### Emergency Kill Switch
-
-The `/agent/kill` endpoint uses a separate `KILL_SWITCH_SECRET` for emergency shutdown:
-
-```bash
-curl -H "Authorization: Bearer $KILL_SWITCH_SECRET" https://Okx.bernardoalmeida2004.workers.dev/agent/kill
-```
-
-This immediately disables the agent, cancels all alarms, and clears the signal cache.
-
-### Cloudflare Access (Recommended)
-
-For additional security with SSO/email verification, set up Cloudflare Access:
+### Examples
 
 ```bash
-# 1. Create a Cloudflare API token with Access:Edit permissions
-#    https://dash.cloudflare.com/profile/api-tokens
+# Latest logs
+curl -H "Authorization: Bearer $OWOKX_TOKEN" "http://127.0.0.1:8787/agent/logs?limit=50"
 
-# 2. Run the setup script
-CLOUDFLARE_API_TOKEN=your-token \
-CLOUDFLARE_ACCOUNT_ID=your-account-id \
-Okx_WORKER_URL=https://Okx.your-subdomain.workers.dev \
-Okx_ALLOWED_EMAILS=you@example.com \
-npm run setup:access
+# Research errors in the last hour
+NOW_MS=$(date +%s000)
+ONE_HOUR_AGO=$((NOW_MS - 3600000))
+curl -H "Authorization: Bearer $OWOKX_TOKEN" "http://127.0.0.1:8787/agent/logs?event_type=research&severity=error&since=$ONE_HOUR_AGO"
+
+# System warnings for swarm gating
+curl -H "Authorization: Bearer $OWOKX_TOKEN" "http://127.0.0.1:8787/agent/logs?event_type=system&search=alarm_skipped"
 ```
 
-This creates a Cloudflare Access Application with email verification or One-Time PIN.
+## Swarm Health and Dev Override
 
-## Project Structure
+By default, alarm cycles can be skipped when swarm quorum is not met. In development you can temporarily override:
 
-```
-Okx/
-├── wrangler.jsonc              # Cloudflare Workers config
-├── src/
-│   ├── index.ts                # Entry point
-│   ├── durable-objects/
-│   │   ├── Okx-harness.ts # THE HARNESS - customize this!
-│   │   └── session.ts
-│   ├── mcp/                    # MCP server & tools
-│   ├── policy/                 # Trade validation
-│   └── providers/              # Alpaca, OpenAI clients
-├── dashboard/                  # React dashboard
-├── docs/                       # Documentation
-└── migrations/                 # D1 database migrations
+```bash
+curl -X POST -H "Authorization: Bearer $OWOKX_TOKEN" -H "Content-Type: application/json" \
+  -d '{"allow_unhealthy_swarm":true}' \
+  http://127.0.0.1:8787/agent/config
 ```
 
-## Safety Features
+Production guardrail:
 
-| Feature | Description |
-|---------|-------------|
-| Paper Trading | Start with `ALPACA_PAPER=true` |
-| Kill Switch | Emergency halt via secret |
-| Position Limits | Max positions and $ per position |
-| Daily Loss Limit | Stops trading after 2% daily loss |
-| Staleness Detection | Auto-exit stale positions |
-| No Margin | Cash-only trading |
-| No Shorting | Long positions only |
+- If `ENVIRONMENT=production`, setting `allow_unhealthy_swarm=true` is rejected with HTTP 400.
+- The harness also auto-corrects persisted production config so this flag cannot remain enabled.
+
+## LLM Provider Modes
+
+| Mode | Description |
+|---|---|
+| `openai-raw` | Direct OpenAI-compatible API calls |
+| `ai-sdk` | Vercel AI SDK provider routing |
+| `cloudflare-gateway` | Cloudflare AI Gateway OpenAI-compat flow |
+
+Model format:
+
+- `openai-raw`: `gpt-4o-mini` style
+- `ai-sdk` and `cloudflare-gateway`: `provider/model` style (example: `deepseek/deepseek-chat`)
+
+## Troubleshooting
+
+### Signal research stuck at "Researching candidates..."
+
+- Check `/agent/logs` for `action=alarm_skipped` with `Swarm unhealthy (quorum not met)`.
+- If seen, either register/start required swarm agents, or use `allow_unhealthy_swarm=true` only in local dev.
+
+### Sentiment shows `-` in Signal Research cards
+
+- The UI prints `-` when `research.sentiment` is missing/non-numeric.
+- New backend writes sentiment into every `signalResearch` record and backfills legacy entries.
+- If you still see `-`, trigger a fresh cycle:
+
+```bash
+curl -X POST -H "Authorization: Bearer $OWOKX_TOKEN" http://127.0.0.1:8787/agent/trigger
+```
+
+### LLM usage remains at 0 calls / 0 tokens
+
+- This usually means research never ran (often due to swarm health gating), not necessarily provider failure.
+- Confirm with `/agent/logs` and `/agent/status` before debugging provider keys.
+
+## Key Files
+
+```text
+owokx/
+|- wrangler.jsonc
+|- src/
+|  |- index.ts
+|  |- durable-objects/
+|  |  |- owokx-harness.ts
+|  |  |- data-scout-simple.ts
+|  |  |- analyst-simple.ts
+|  |  |- trader-simple.ts
+|  |  |- swarm-registry.ts
+|  |  |- risk-manager.ts
+|  |  |- learning-agent.ts
+|  |- providers/
+|- dashboard/
+|- docs/
+`- migrations/
+```
+
+## Safety
+
+- Start with paper trading (`ALPACA_PAPER=true`)
+- Use tight risk limits (`max_positions`, `max_position_value`, stop loss)
+- Keep kill switch secret separate from API token
+- Review logs before enabling live trading
 
 ## Community
 
-Join our Discord for help and discussion:
+Join the Discord:
 
-**[Discord Server](https://discord.gg/vMFnHe2YBh)**
+- https://discord.gg/vMFnHe2YBh
 
 ## Disclaimer
 
-**⚠️ IMPORTANT: READ BEFORE USING**
+IMPORTANT: READ BEFORE USING
 
-This software is provided for **educational and informational purposes only**. Nothing in this repository constitutes financial, investment, legal, or tax advice.
+This software is provided for educational and informational purposes only. Nothing in this repository constitutes financial, investment, legal, or tax advice.
 
-**By using this software, you acknowledge and agree that:**
+By using this software, you acknowledge and agree that:
 
-- All trading and investment decisions are made **at your own risk**
-- Markets are volatile and **you can lose some or all of your capital**
-- No guarantees of performance, profits, or outcomes are made
-- The authors and contributors are **not responsible** for any financial losses
-- This software may contain bugs or behave unexpectedly
-- Past performance does not guarantee future results
+- Trading decisions are made at your own risk
+- Markets are volatile and you can lose some or all capital
+- No guarantees of profit or performance are made
+- Authors/contributors are not responsible for losses
+- Software may contain bugs or unexpected behavior
 
-**Always start with paper trading and never risk money you cannot afford to lose.**
+Always start with paper trading and never risk money you cannot afford to lose.
 
 ## License
 
-MIT License - Free for personal and commercial use. See [LICENSE](LICENSE) for full terms.
+MIT. See `LICENSE`.

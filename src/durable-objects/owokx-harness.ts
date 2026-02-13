@@ -196,6 +196,7 @@ interface ResearchResult {
   symbol: string;
   verdict: "BUY" | "SKIP" | "WAIT";
   confidence: number;
+  sentiment: number;
   entry_quality: "excellent" | "good" | "fair" | "poor";
   reasoning: string;
   red_flags: string[];
@@ -1155,6 +1156,7 @@ export class OwokxHarness extends DurableObject<Env> {
             .filter((entry): entry is LogEntry => entry !== null)
             .slice(-LOG_RETENTION_MAX);
         }
+        this.ensureSignalResearchSentiment();
         this.pruneMemoryEpisodes();
 
         // AUTO-CORRECTION: Fix corrupted crypto_symbols in persisted state
@@ -3106,6 +3108,7 @@ export class OwokxHarness extends DurableObject<Env> {
         symbol,
         verdict: analysis.verdict,
         confidence: analysis.confidence,
+        sentiment: this.clampSentiment(sentiment),
         entry_quality: analysis.entry_quality,
         reasoning: analysis.reasoning,
         red_flags: analysis.red_flags || [],
@@ -3531,6 +3534,37 @@ export class OwokxHarness extends DurableObject<Env> {
   private clamp01(value: number): number {
     if (!Number.isFinite(value)) return 0;
     return Math.max(0, Math.min(1, value));
+  }
+
+  private clampSentiment(value: number): number {
+    if (!Number.isFinite(value)) return 0;
+    return Math.max(-1, Math.min(1, value));
+  }
+
+  private ensureSignalResearchSentiment(): void {
+    if (!this.state.signalResearch || typeof this.state.signalResearch !== "object") {
+      this.state.signalResearch = {};
+      return;
+    }
+
+    const signalSentimentBySymbol = new Map(
+      this.state.signalCache
+        .filter((signal) => typeof signal?.symbol === "string")
+        .map((signal) => [signal.symbol.toUpperCase(), this.clampSentiment(signal.sentiment)])
+    );
+
+    for (const [symbol, research] of Object.entries(this.state.signalResearch)) {
+      if (!research || typeof research !== "object") continue;
+
+      const rawSentiment = (research as { sentiment?: unknown }).sentiment;
+      const parsedSentiment = typeof rawSentiment === "number" ? rawSentiment : Number(rawSentiment);
+      if (Number.isFinite(parsedSentiment)) {
+        research.sentiment = this.clampSentiment(parsedSentiment);
+        continue;
+      }
+
+      research.sentiment = signalSentimentBySymbol.get(symbol.toUpperCase()) ?? 0;
+    }
   }
 
   private sigmoid(value: number): number {
@@ -4114,15 +4148,20 @@ export class OwokxHarness extends DurableObject<Env> {
           }
         >;
       };
+      const sentimentBySymbol = new Map(
+        signals.map((signal) => [signal.symbol.toUpperCase(), this.clampSentiment(signal.sentiment)])
+      );
       const mapped: Record<string, ResearchResult> = {};
       for (const [symbolKey, value] of Object.entries(payload.results ?? {})) {
         const symbol = (value.symbol || symbolKey).toUpperCase();
         const verdict = value.verdict === "BUY" || value.verdict === "SKIP" || value.verdict === "WAIT" ? value.verdict : "WAIT";
         const confidence = this.clamp01(typeof value.confidence === "number" ? value.confidence : 0);
+        const sentiment = sentimentBySymbol.get(symbol) ?? 0;
         mapped[symbol] = {
           symbol,
           verdict,
           confidence,
+          sentiment,
           entry_quality: this.mapEntryQualityFromConfidence(confidence),
           reasoning: value.reasoning || "Swarm analyst recommendation",
           red_flags: verdict === "BUY" ? [] : ["Swarm analyst not fully confident"],
@@ -4570,6 +4609,7 @@ export class OwokxHarness extends DurableObject<Env> {
         symbol,
         verdict: adjustedVerdict,
         confidence: adjustedConfidence,
+        sentiment: this.clampSentiment(sentimentScore),
         entry_quality: analysis.entry_quality,
         reasoning: analysis.reasoning,
         red_flags: mergedRedFlags,
