@@ -5,6 +5,9 @@ import tailwindcss from '@tailwindcss/vite'
 const apiTarget = process.env.OWOKX_API_URL || `http://localhost:${process.env.WRANGLER_PORT || '8787'}` 
 
 export default defineConfig({
+  define: {
+    __OWOKX_API_URL__: JSON.stringify(apiTarget),
+  },
   plugins: [react(), tailwindcss()],
   server: {
     port: 3000,

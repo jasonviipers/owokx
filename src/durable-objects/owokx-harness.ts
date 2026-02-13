@@ -1583,7 +1583,6 @@ export class OwokxHarness extends DurableObject<Env> {
       "costs",
       "signals",
       "history",
-      "setup/status",
       "metrics",
       "regime",
       "prediction",
@@ -1612,7 +1611,7 @@ export class OwokxHarness extends DurableObject<Env> {
           return this.handleStatus();
 
         case "setup/status":
-          return this.jsonResponse({ ok: true, data: { configured: true } });
+          return this.handleSetupStatus(request);
 
         case "config":
           if (request.method === "POST") {
@@ -1684,6 +1683,76 @@ export class OwokxHarness extends DurableObject<Env> {
         headers: { "Content-Type": "application/json" },
       });
     }
+  }
+
+  private resolvePublicApiOrigin(request: Request): string {
+    const fromProxy = request.headers.get("x-owokx-public-origin");
+    if (fromProxy) {
+      try {
+        return new URL(fromProxy).origin;
+      } catch {
+        // fall through
+      }
+    }
+
+    const forwardedHost = request.headers.get("x-forwarded-host");
+    const forwardedProto = request.headers.get("x-forwarded-proto") || "https";
+    if (forwardedHost) {
+      try {
+        return new URL(`${forwardedProto}://${forwardedHost}`).origin;
+      } catch {
+        // fall through
+      }
+    }
+
+    const host = request.headers.get("host");
+    if (host && host !== "harness") {
+      const local = host.includes("localhost") || host.startsWith("127.") || host.startsWith("0.0.0.0");
+      try {
+        return new URL(`${local ? "http" : "https"}://${host}`).origin;
+      } catch {
+        // fall through
+      }
+    }
+
+    return "http://127.0.0.1:8787";
+  }
+
+  private handleSetupStatus(request: Request): Response {
+    const apiOrigin = this.resolvePublicApiOrigin(request);
+    const tokenEnvVar = "OWOKX_TOKEN";
+    const tokenSecretName = "OWOKX_API_TOKEN";
+
+    return this.jsonResponse({
+      ok: true,
+      data: {
+        configured: true,
+        api_origin: apiOrigin,
+        auth: {
+          header: "Authorization",
+          scheme: "Bearer",
+          token_env_var: tokenEnvVar,
+          token_secret_name: tokenSecretName,
+        },
+        commands: {
+          enable: {
+            method: "GET",
+            path: "/agent/enable",
+            curl: `curl -H "Authorization: Bearer $${tokenEnvVar}" ${apiOrigin}/agent/enable`,
+          },
+          disable: {
+            method: "GET",
+            path: "/agent/disable",
+            curl: `curl -H "Authorization: Bearer $${tokenEnvVar}" ${apiOrigin}/agent/disable`,
+          },
+          trigger: {
+            method: "POST",
+            path: "/agent/trigger",
+            curl: `curl -X POST -H "Authorization: Bearer $${tokenEnvVar}" ${apiOrigin}/agent/trigger`,
+          },
+        },
+      },
+    });
   }
 
   private handleMetrics(): Response {

@@ -86,10 +86,12 @@ export default {
       const agentPath = url.pathname.replace("/agent", "") || "/status";
       const agentUrl = new URL(agentPath, "http://harness");
       agentUrl.search = url.search;
+      const headers = new Headers(request.headers);
+      headers.set("x-owokx-public-origin", url.origin);
       return stub.fetch(
         new Request(agentUrl.toString(), {
           method: request.method,
-          headers: request.headers,
+          headers,
           body: request.body,
         })
       );
