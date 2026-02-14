@@ -225,7 +225,7 @@ describe("LLM Provider Factory", () => {
         expect(provider).toBeNull();
       });
 
-      it("returns null when model requires missing API key", async () => {
+      it("falls back to configured provider when model provider API key is missing", async () => {
         const createOpenAIMock = vi.fn(
           () => ((modelId: string) => ({ modelId })) as unknown as ReturnType<typeof vi.fn>
         );
@@ -239,7 +239,7 @@ describe("LLM Provider Factory", () => {
         } as unknown as Env;
 
         const provider = createLLMProvider(env);
-        expect(provider).toBeNull();
+        expect(provider).not.toBeNull();
       });
 
       it("passes OPENAI_BASE_URL to @ai-sdk/openai createOpenAI", async () => {
@@ -386,6 +386,23 @@ describe("LLM Provider Factory", () => {
 
         await provider!.complete({ messages: [{ role: "user", content: "hi" }] });
         expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining("api.openai.com"), expect.any(Object));
+      });
+
+      it("falls back from openai-raw to ai-sdk when OpenAI key is missing but other provider key exists", async () => {
+        const createAnthropicMock = vi.fn(
+          () => ((modelId: string) => ({ modelId })) as unknown as ReturnType<typeof vi.fn>
+        );
+        vi.doMock("@ai-sdk/anthropic", () => ({ createAnthropic: createAnthropicMock }));
+
+        const { createLLMProvider } = await import("./factory");
+        const env = {
+          ANTHROPIC_API_KEY: "sk-ant-test",
+          LLM_PROVIDER: "openai-raw",
+          LLM_MODEL: "anthropic/claude-sonnet-4",
+        } as unknown as Env;
+
+        const provider = createLLMProvider(env);
+        expect(provider).not.toBeNull();
       });
     });
   });

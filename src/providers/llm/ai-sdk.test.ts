@@ -303,7 +303,7 @@ describe("AI SDK Provider", () => {
       );
     });
 
-    it("throws PROVIDER_ERROR when provider not configured", async () => {
+    it("falls back when requested provider is not configured", async () => {
       const provider = createAISDKProvider({
         model: "openai/gpt-4o",
         apiKeys: { openai: "sk-test" },
@@ -314,9 +314,8 @@ describe("AI SDK Provider", () => {
           model: "anthropic/claude-sonnet-4",
           messages: [{ role: "user", content: "Test" }],
         })
-      ).rejects.toMatchObject({
-        code: ErrorCode.PROVIDER_ERROR,
-        message: expect.stringContaining("not configured"),
+      ).resolves.toMatchObject({
+        content: "Test response",
       });
     });
 
@@ -376,21 +375,22 @@ describe("AI SDK Provider", () => {
       );
     });
 
-    it("fails when model has no provider prefix (uses model as provider name)", async () => {
+    it("defaults unqualified model names to OpenAI provider", async () => {
       const provider = createAISDKProvider({
         model: "openai/gpt-4o",
         apiKeys: { openai: "sk-test" },
       });
 
-      await expect(
-        provider.complete({
-          model: "gpt-4o",
-          messages: [{ role: "user", content: "Test" }],
-        })
-      ).rejects.toMatchObject({
-        code: ErrorCode.PROVIDER_ERROR,
-        message: expect.stringContaining("gpt-4o"),
+      await provider.complete({
+        model: "gpt-4o",
+        messages: [{ role: "user", content: "Test" }],
       });
+
+      expect(mockGenerateText).toHaveBeenCalledWith(
+        expect.objectContaining({
+          model: expect.objectContaining({ provider: "openai", model: "gpt-4o" }),
+        })
+      );
     });
 
     it("works with Anthropic provider", async () => {

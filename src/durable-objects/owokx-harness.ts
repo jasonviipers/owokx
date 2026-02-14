@@ -213,6 +213,16 @@ interface ResearchLLMAnalysis {
   catalysts: string[];
 }
 
+interface ModelParseFailure {
+  stage: "research_signal" | "research_crypto";
+  symbol: string;
+  parser: "json" | "json-recovery";
+  parseError: string | null;
+  responsePreview: string;
+  recoveryApplied: boolean;
+  fallbackVerdict: "BUY" | "SKIP" | "WAIT";
+}
+
 interface TwitterConfirmation {
   symbol: string;
   tweet_count: number;
@@ -263,6 +273,42 @@ interface MarketRegime {
   characteristics: Record<string, number>;
   detectedAt: number;
   since: number;
+}
+
+interface PortfolioRiskDashboard {
+  timestamp: number;
+  regime: "trending" | "ranging" | "volatile";
+  realizedVolatility: number;
+  maxDrawdownPct: number;
+  sharpeLike: number;
+  valueAtRisk95Pct: number;
+  expectedShortfall95Pct: number;
+  grossExposureUsd: number;
+  netExposureUsd: number;
+  leverage: number;
+  largestPositionPct: number;
+  concentrationTop3Pct: number;
+}
+
+interface SignalQualityMetrics {
+  timestamp: number;
+  totalSignals: number;
+  uniqueSymbols: number;
+  outlierCount: number;
+  averageCorrelation: number;
+  maxCorrelation: number;
+  highCorrelationPairs: Array<{ left: string; right: string; correlation: number }>;
+  filteredSymbols: string[];
+}
+
+interface SignalPerformanceAttribution {
+  timestamp: number;
+  totalSamples: number;
+  hitRate: number;
+  avgReturnPct: number;
+  topSymbols: Array<{ symbol: string; samples: number; winRate: number; avgReturnPct: number }>;
+  laggingSymbols: Array<{ symbol: string; samples: number; winRate: number; avgReturnPct: number }>;
+  factorAttribution: Array<{ factor: string; contribution: number }>;
 }
 
 interface PredictiveModelState {
@@ -1348,7 +1394,11 @@ export class OwokxHarness extends DurableObject<Env> {
     const trimmed = symbol.trim();
     if (trimmed.length === 0) return null;
 
-    if (broker !== "okx") {
+    if (broker === "alpaca") {
+      // Social feeds often emit crypto aliases like BTC.X/ETH.X that are not Alpaca equities.
+      if (/[.\-_]X$/i.test(trimmed)) {
+        return null;
+      }
       return trimmed;
     }
 
@@ -1842,6 +1892,10 @@ export class OwokxHarness extends DurableObject<Env> {
   }
 
   private async handleStatus(): Promise<Response> {
+    const heldSymbolsFromState = new Set(Object.keys(this.state.positionEntries || {}));
+    const signalQualityFromState = this.buildSignalQualityMetrics(heldSymbolsFromState);
+    const signalPerformance = this.buildSignalPerformanceAttribution();
+
     let broker: BrokerProviders;
     try {
       broker = createBrokerProviders(this.env, this.state.config.broker);
@@ -1880,6 +1934,9 @@ export class OwokxHarness extends DurableObject<Env> {
           lastStressTest: this.state.lastStressTest,
           optimization: this.state.optimization,
           swarmRoleHealth: this.state.swarmRoleHealth,
+          portfolioRisk: null,
+          signalQuality: signalQualityFromState,
+          signalPerformance,
         },
       });
     }
@@ -1922,6 +1979,9 @@ export class OwokxHarness extends DurableObject<Env> {
           lastStressTest: this.state.lastStressTest,
           optimization: this.state.optimization,
           swarmRoleHealth: this.state.swarmRoleHealth,
+          portfolioRisk: null,
+          signalQuality: signalQualityFromState,
+          signalPerformance,
           broker_error: cachedAuthError.message,
         },
       });
@@ -1971,6 +2031,10 @@ export class OwokxHarness extends DurableObject<Env> {
       }
     }
 
+    const heldSymbols = new Set(positions.map((position) => position.symbol));
+    const signalQuality = this.buildSignalQualityMetrics(heldSymbols);
+    const portfolioRisk = this.buildPortfolioRiskDashboard(account, positions);
+
     return this.jsonResponse({
       ok: true,
       data: {
@@ -2004,13 +2068,16 @@ export class OwokxHarness extends DurableObject<Env> {
         lastStressTest: this.state.lastStressTest,
         optimization: this.state.optimization,
         swarmRoleHealth: this.state.swarmRoleHealth,
+        portfolioRisk,
+        signalQuality,
+        signalPerformance,
         swarm,
       },
     });
   }
 
   private async handleUpdateConfig(request: Request): Promise<Response> {
-    let body: Partial<AgentConfig>;
+    let body: Partial<AgentConfig> & { broker?: string };
     try {
       body = (await request.json()) as Partial<AgentConfig>;
     } catch (error) {
@@ -2035,6 +2102,36 @@ export class OwokxHarness extends DurableObject<Env> {
       );
     }
     const changedKeys = Object.keys(body);
+
+    if (typeof body.broker === "string") {
+      const normalizedBroker = body.broker.trim().toLowerCase();
+      if (normalizedBroker !== "alpaca" && normalizedBroker !== "okx") {
+        this.log("System", "config_update_rejected", {
+          field: "broker",
+          reason: "broker must be 'alpaca' or 'okx'",
+          attempted_value: body.broker,
+          changed_keys: changedKeys,
+          severity: "error",
+          status: "failed",
+          event_type: "api",
+        });
+        return new Response(
+          JSON.stringify(
+            {
+              ok: false,
+              error: "broker must be one of: alpaca, okx",
+            },
+            null,
+            2
+          ),
+          {
+            status: 400,
+            headers: { "Content-Type": "application/json" },
+          }
+        );
+      }
+      body.broker = normalizedBroker;
+    }
 
     if (this.isProductionEnvironment() && body.allow_unhealthy_swarm === true) {
       this.log("System", "config_update_rejected", {
@@ -3170,15 +3267,11 @@ export class OwokxHarness extends DurableObject<Env> {
         this.trackLLMCost(response.model || this.state.config.llm_model, usage.prompt_tokens, usage.completion_tokens);
       }
 
-      const content = response.content || "{}";
-      const analysis = JSON.parse(content.replace(/```json\n?|```/g, "").trim()) as {
-        verdict: "BUY" | "SKIP" | "WAIT";
-        confidence: number;
-        entry_quality: "excellent" | "good" | "fair" | "poor";
-        reasoning: string;
-        red_flags: string[];
-        catalysts: string[];
-      };
+      const parsedAnalysis = this.parseResearchAnalysis(response.content || "{}", symbol, "research_crypto");
+      if (parsedAnalysis.parseFailure) {
+        this.logParseFailure(parsedAnalysis.parseFailure);
+      }
+      const analysis = parsedAnalysis.analysis;
 
       const result: ResearchResult = {
         symbol,
@@ -3203,11 +3296,7 @@ export class OwokxHarness extends DurableObject<Env> {
       return result;
     } catch (error) {
       const errorMsg = String(error);
-      if (
-        errorMsg.includes("Authentication Fails") ||
-        errorMsg.includes("401") ||
-        errorMsg.includes("invalid api key")
-      ) {
+      if (this.isLlmAuthFailure(errorMsg)) {
         this.state.lastLLMAuthError = { at: Date.now(), message: errorMsg };
         this.log("Crypto", "auth_error", {
           symbol,
@@ -3659,6 +3748,350 @@ export class OwokxHarness extends DurableObject<Env> {
     const mean = values.reduce((sum, value) => sum + value, 0) / values.length;
     const variance = values.reduce((sum, value) => sum + (value - mean) ** 2, 0) / values.length;
     return Math.sqrt(Math.max(variance, 0));
+  }
+
+  private computeStdDev(values: number[]): number {
+    if (values.length < 2) return 0;
+    const mean = values.reduce((sum, value) => sum + value, 0) / values.length;
+    const variance = values.reduce((sum, value) => sum + (value - mean) ** 2, 0) / values.length;
+    return Math.sqrt(Math.max(variance, 0));
+  }
+
+  private computeSignalCorrelation(
+    left: { sentiment: number; mentions: number; freshness: number; sources: Set<string> },
+    right: { sentiment: number; mentions: number; freshness: number; sources: Set<string> }
+  ): number {
+    const sharedSources = new Set([...left.sources].filter((source) => right.sources.has(source))).size;
+    const sourceUnion = new Set([...left.sources, ...right.sources]).size;
+    const sourceOverlap = sourceUnion > 0 ? sharedSources / sourceUnion : 0;
+    const sentimentAlignment = 1 - Math.min(2, Math.abs(left.sentiment - right.sentiment)) / 2;
+    const freshnessAlignment = 1 - Math.min(1, Math.abs(left.freshness - right.freshness));
+    const volumeRatio =
+      Math.min(Math.max(left.mentions, 1), Math.max(right.mentions, 1)) /
+      Math.max(Math.max(left.mentions, 1), Math.max(right.mentions, 1));
+
+    return this.clamp01(
+      sourceOverlap * 0.45 + sentimentAlignment * 0.3 + freshnessAlignment * 0.15 + volumeRatio * 0.1
+    );
+  }
+
+  private computeCandidateOutlierScores(
+    candidates: Array<{ symbol: string; sentiment: number; mentions: number; freshness: number; sourceCount: number }>
+  ): Record<string, number> {
+    if (candidates.length < 5) return {};
+
+    const absSentiments = candidates.map((candidate) => Math.abs(candidate.sentiment));
+    const logMentions = candidates.map((candidate) => Math.log10(Math.max(1, candidate.mentions)));
+    const freshness = candidates.map((candidate) => this.clamp01(candidate.freshness));
+    const sourceDiversity = candidates.map((candidate) => this.clamp01(candidate.sourceCount / 4));
+
+    const meanSentiment = absSentiments.reduce((sum, value) => sum + value, 0) / absSentiments.length;
+    const meanMentions = logMentions.reduce((sum, value) => sum + value, 0) / logMentions.length;
+    const meanFreshness = freshness.reduce((sum, value) => sum + value, 0) / freshness.length;
+    const meanSourceDiversity = sourceDiversity.reduce((sum, value) => sum + value, 0) / sourceDiversity.length;
+
+    const stdevSentiment = this.computeStdDev(absSentiments);
+    const stdevMentions = this.computeStdDev(logMentions);
+    const stdevFreshness = this.computeStdDev(freshness);
+    const stdevSourceDiversity = this.computeStdDev(sourceDiversity);
+
+    const scores: Record<string, number> = {};
+    for (const candidate of candidates) {
+      const zSentiment =
+        stdevSentiment > 0 ? Math.abs(Math.abs(candidate.sentiment) - meanSentiment) / stdevSentiment : 0;
+      const zMentions =
+        stdevMentions > 0 ? Math.abs(Math.log10(Math.max(1, candidate.mentions)) - meanMentions) / stdevMentions : 0;
+      const zFreshness = stdevFreshness > 0 ? Math.abs(candidate.freshness - meanFreshness) / stdevFreshness : 0;
+      const zSource =
+        stdevSourceDiversity > 0
+          ? Math.abs(this.clamp01(candidate.sourceCount / 4) - meanSourceDiversity) / stdevSourceDiversity
+          : 0;
+
+      scores[candidate.symbol] = zSentiment * 0.5 + zMentions * 0.25 + zFreshness * 0.15 + zSource * 0.1;
+    }
+    return scores;
+  }
+
+  private computeDynamicPositionScale(
+    volatility: number,
+    confidence: number,
+    riskMultiplier: number,
+    regime: "trending" | "ranging" | "volatile"
+  ): number {
+    const normalizedVol = this.clamp01((volatility - 0.01) / 0.04);
+    const volatilityScale = 1 - normalizedVol * 0.55;
+    const confidenceScale = 0.75 + this.clamp01(confidence) * 0.5;
+    const regimeScale = regime === "volatile" ? 0.82 : regime === "trending" ? 1.08 : 0.96;
+    return Math.max(0.35, Math.min(1.25, volatilityScale * confidenceScale * riskMultiplier * regimeScale));
+  }
+
+  private async estimateSymbolVolatility(broker: BrokerProviders, symbol: string, isCrypto: boolean): Promise<number> {
+    try {
+      const instrument = isCrypto ? normalizeCryptoSymbol(symbol) : symbol;
+      const bars = await broker.marketData.getBars(instrument, "1Day", { limit: 40 });
+      if (!bars || bars.length < 8) return 0.02;
+
+      const closes = bars.map((bar) => bar.c).filter((price) => Number.isFinite(price) && price > 0);
+      if (closes.length < 8) return 0.02;
+
+      const returns: number[] = [];
+      for (let i = 1; i < closes.length; i += 1) {
+        const prev = closes[i - 1] ?? 0;
+        const next = closes[i] ?? prev;
+        if (prev > 0) returns.push((next - prev) / prev);
+      }
+      return Math.max(0.005, this.computeStdDev(returns));
+    } catch {
+      return 0.02;
+    }
+  }
+
+  private estimatePositionPnLPct(position: Position, entry: PositionEntry | undefined): number {
+    if (entry?.entry_price && entry.entry_price > 0) {
+      return ((position.current_price - entry.entry_price) / entry.entry_price) * 100;
+    }
+    const denominator = position.market_value - position.unrealized_pl;
+    if (!Number.isFinite(denominator) || denominator <= 0) return 0;
+    return (position.unrealized_pl / denominator) * 100;
+  }
+
+  private computeAdaptiveExitThresholds(
+    riskProfile: DynamicRiskProfile,
+    position: Position,
+    entry: PositionEntry | undefined
+  ): {
+    takeProfitPct: number;
+    stopLossPct: number;
+    trailingStopPct: number;
+    peakDrawdownPct: number;
+  } {
+    const regime = riskProfile.marketRegime;
+    const volPressure = this.clamp01((riskProfile.realizedVolatility - 0.01) / 0.04);
+    const drawdownPressure = this.clamp01(riskProfile.maxDrawdownPct / 0.15);
+    const baseTake = this.state.config.take_profit_pct;
+    const baseStop = this.state.config.stop_loss_pct;
+
+    const regimeTakeMult = regime === "trending" ? 1.12 : regime === "volatile" ? 0.9 : 1;
+    const regimeStopMult = regime === "volatile" ? 0.78 : regime === "trending" ? 1.08 : 0.95;
+    const riskTightenMult = 1 - drawdownPressure * 0.2;
+
+    const takeProfitPct = Math.max(2.5, baseTake * regimeTakeMult * (1 - volPressure * 0.12));
+    const stopLossPct = Math.max(1.5, baseStop * regimeStopMult * riskTightenMult);
+
+    const peakPrice = entry?.peak_price ?? 0;
+    const peakDrawdownPct =
+      peakPrice > 0 && Number.isFinite(position.current_price)
+        ? ((position.current_price - peakPrice) / peakPrice) * 100
+        : 0;
+    const trailingStopPct = Math.max(1.8, Math.min(stopLossPct, stopLossPct * 0.7));
+
+    return { takeProfitPct, stopLossPct, trailingStopPct, peakDrawdownPct };
+  }
+
+  private buildPortfolioRiskDashboard(account: Account | null, positions: Position[]): PortfolioRiskDashboard | null {
+    if (!account) return null;
+
+    const metrics = this.computePortfolioRiskMetrics();
+    const totalLong = positions.reduce((sum, position) => sum + Math.max(0, position.market_value), 0);
+    const totalShort = positions
+      .filter((position) => position.side === "short")
+      .reduce((sum, position) => sum + Math.abs(position.market_value), 0);
+    const grossExposureUsd = totalLong + totalShort;
+    const netExposureUsd = totalLong - totalShort;
+    const leverage = account.equity > 0 ? grossExposureUsd / account.equity : 0;
+
+    const sortedBySize = [...positions].sort(
+      (left, right) => Math.abs(right.market_value) - Math.abs(left.market_value)
+    );
+    const largestPositionPct =
+      account.equity > 0 && sortedBySize.length > 0
+        ? Math.abs((sortedBySize[0]?.market_value ?? 0) / account.equity)
+        : 0;
+    const concentrationTop3Usd = sortedBySize
+      .slice(0, 3)
+      .reduce((sum, position) => sum + Math.abs(position.market_value), 0);
+    const concentrationTop3Pct = account.equity > 0 ? concentrationTop3Usd / account.equity : 0;
+
+    const points = this.state.portfolioEquityHistory.slice(-320);
+    const returns: number[] = [];
+    for (let i = 1; i < points.length; i += 1) {
+      const prev = points[i - 1]?.equity ?? 0;
+      const next = points[i]?.equity ?? prev;
+      if (prev > 0 && Number.isFinite(prev) && Number.isFinite(next)) {
+        returns.push((next - prev) / prev);
+      }
+    }
+    const negatives = returns.filter((value) => value < 0).sort((a, b) => a - b);
+    const varIndex = Math.max(0, Math.floor(negatives.length * 0.05) - 1);
+    const valueAtRisk95Pct =
+      negatives.length > 0 ? Math.abs(negatives[varIndex] ?? 0) : metrics.realizedVolatility * 1.65;
+    const tail = negatives.slice(0, Math.max(1, Math.floor(negatives.length * 0.05)));
+    const expectedShortfall95Pct =
+      tail.length > 0 ? Math.abs(tail.reduce((sum, value) => sum + value, 0) / tail.length) : valueAtRisk95Pct;
+
+    return {
+      timestamp: Date.now(),
+      regime: metrics.regime,
+      realizedVolatility: metrics.realizedVolatility,
+      maxDrawdownPct: metrics.maxDrawdownPct,
+      sharpeLike: metrics.sharpeLike,
+      valueAtRisk95Pct,
+      expectedShortfall95Pct,
+      grossExposureUsd,
+      netExposureUsd,
+      leverage,
+      largestPositionPct,
+      concentrationTop3Pct,
+    };
+  }
+
+  private buildSignalQualityMetrics(heldSymbols: Set<string>): SignalQualityMetrics {
+    const recentSignals = this.state.signalCache
+      .filter((signal) => Number.isFinite(signal.timestamp) && Date.now() - signal.timestamp <= 3 * 60 * 60 * 1000)
+      .slice(0, 200);
+
+    const aggregated = new Map<
+      string,
+      { symbol: string; sentiment: number; mentions: number; freshness: number; sources: Set<string> }
+    >();
+
+    for (const signal of recentSignals) {
+      const symbol = signal.symbol.toUpperCase();
+      if (!aggregated.has(symbol)) {
+        aggregated.set(symbol, { symbol, sentiment: 0, mentions: 0, freshness: 0, sources: new Set<string>() });
+      }
+      const entry = aggregated.get(symbol)!;
+      entry.sentiment += signal.sentiment;
+      entry.mentions += 1;
+      entry.freshness = Math.max(entry.freshness, this.clamp01(signal.freshness));
+      entry.sources.add(signal.source);
+    }
+
+    const candidates = Array.from(aggregated.values()).map((entry) => ({
+      ...entry,
+      sentiment: entry.mentions > 0 ? entry.sentiment / entry.mentions : 0,
+    }));
+    const outlierScores = this.computeCandidateOutlierScores(
+      candidates.map((candidate) => ({
+        symbol: candidate.symbol,
+        sentiment: candidate.sentiment,
+        mentions: candidate.mentions,
+        freshness: candidate.freshness,
+        sourceCount: candidate.sources.size,
+      }))
+    );
+    const filteredSymbols = candidates
+      .filter((candidate) => (outlierScores[candidate.symbol] ?? 0) >= 2.4)
+      .map((candidate) => candidate.symbol);
+
+    const pairScores: Array<{ left: string; right: string; correlation: number }> = [];
+    let totalCorrelation = 0;
+    let pairCount = 0;
+    let maxCorrelation = 0;
+    for (let i = 0; i < candidates.length; i += 1) {
+      for (let j = i + 1; j < candidates.length; j += 1) {
+        const left = candidates[i]!;
+        const right = candidates[j]!;
+        const correlation = this.computeSignalCorrelation(left, right);
+        totalCorrelation += correlation;
+        pairCount += 1;
+        maxCorrelation = Math.max(maxCorrelation, correlation);
+        if (correlation >= 0.8) {
+          pairScores.push({ left: left.symbol, right: right.symbol, correlation });
+        }
+      }
+    }
+    pairScores.sort((left, right) => right.correlation - left.correlation);
+
+    return {
+      timestamp: Date.now(),
+      totalSignals: recentSignals.length,
+      uniqueSymbols: candidates.length,
+      outlierCount: filteredSymbols.length,
+      averageCorrelation: pairCount > 0 ? totalCorrelation / pairCount : 0,
+      maxCorrelation: pairCount > 0 ? maxCorrelation : 0,
+      highCorrelationPairs: pairScores.slice(0, 8),
+      filteredSymbols: filteredSymbols.filter((symbol) => !heldSymbols.has(symbol)).slice(0, 8),
+    };
+  }
+
+  private buildSignalPerformanceAttribution(): SignalPerformanceAttribution {
+    const perSymbol = Object.entries(this.state.predictiveModel.perSymbol || {})
+      .map(([symbol, stats]) => {
+        const samples = Math.max(0, stats.samples || 0);
+        const wins = Math.max(0, stats.wins || 0);
+        const winRate = samples > 0 ? wins / samples : 0;
+        return {
+          symbol,
+          samples,
+          winRate,
+          avgReturnPct: Number(stats.avgReturnPct || 0),
+        };
+      })
+      .filter((row) => row.samples > 0);
+
+    const totalSamples = perSymbol.reduce((sum, row) => sum + row.samples, 0);
+    const weightedAvgReturn =
+      totalSamples > 0 ? perSymbol.reduce((sum, row) => sum + row.avgReturnPct * row.samples, 0) / totalSamples : 0;
+
+    const weights = this.state.predictiveModel.weights;
+    const absTotal =
+      Math.abs(weights.sentiment) +
+        Math.abs(weights.freshness) +
+        Math.abs(weights.sourceDiversity) +
+        Math.abs(weights.logVolume) +
+        Math.abs(weights.regimeAlignment) || 1;
+    const factorAttribution = [
+      { factor: "sentiment", contribution: Math.abs(weights.sentiment) / absTotal },
+      { factor: "freshness", contribution: Math.abs(weights.freshness) / absTotal },
+      { factor: "sourceDiversity", contribution: Math.abs(weights.sourceDiversity) / absTotal },
+      { factor: "volume", contribution: Math.abs(weights.logVolume) / absTotal },
+      { factor: "regimeAlignment", contribution: Math.abs(weights.regimeAlignment) / absTotal },
+    ].sort((left, right) => right.contribution - left.contribution);
+
+    return {
+      timestamp: Date.now(),
+      totalSamples,
+      hitRate: this.clamp01(this.state.predictiveModel.hitRate),
+      avgReturnPct: weightedAvgReturn,
+      topSymbols: [...perSymbol].sort((left, right) => right.avgReturnPct - left.avgReturnPct).slice(0, 5),
+      laggingSymbols: [...perSymbol].sort((left, right) => left.avgReturnPct - right.avgReturnPct).slice(0, 5),
+      factorAttribution,
+    };
+  }
+
+  private shouldBlockCorrelatedTrade(
+    candidateSymbol: string,
+    heldSymbols: Set<string>
+  ): { blocked: boolean; maxCorrelation: number; peer: string | null } {
+    const buildProfile = (symbol: string) => {
+      const samples = this.state.signalCache.filter((signal) => signal.symbol === symbol);
+      if (samples.length === 0) return null;
+      const mentions = samples.length;
+      return {
+        sentiment: samples.reduce((sum, signal) => sum + signal.sentiment, 0) / mentions,
+        mentions,
+        freshness: samples.reduce((max, signal) => Math.max(max, this.clamp01(signal.freshness || 0)), 0),
+        sources: new Set(samples.map((signal) => signal.source)),
+      };
+    };
+
+    const candidate = buildProfile(candidateSymbol);
+    if (!candidate) return { blocked: false, maxCorrelation: 0, peer: null };
+
+    let maxCorrelation = 0;
+    let maxPeer: string | null = null;
+    for (const heldSymbol of heldSymbols) {
+      const peer = buildProfile(heldSymbol);
+      if (!peer) continue;
+      const correlation = this.computeSignalCorrelation(candidate, peer);
+      if (correlation > maxCorrelation) {
+        maxCorrelation = correlation;
+        maxPeer = heldSymbol;
+      }
+    }
+
+    return { blocked: maxCorrelation >= 0.84, maxCorrelation, peer: maxPeer };
   }
 
   private computeRegimeAlignment(signalSentiment: number, regime: "trending" | "ranging" | "volatile"): number {
@@ -4418,10 +4851,43 @@ export class OwokxHarness extends DurableObject<Env> {
     return [];
   }
 
+  private isLlmAuthFailure(error: unknown): boolean {
+    const message = String(error).toLowerCase();
+    return (
+      message.includes("authentication fails") ||
+      message.includes("invalid api key") ||
+      message.includes("unauthorized") ||
+      message.includes("401")
+    );
+  }
+
+  private logParseFailure(failure: ModelParseFailure): void {
+    this.log("SignalResearch", "invalid_llm_json", {
+      symbol: failure.symbol,
+      stage: failure.stage,
+      parser: failure.parser,
+      parse_error: failure.parseError,
+      response_preview: failure.responsePreview,
+      recovery_applied: failure.recoveryApplied,
+      fallback_verdict: failure.fallbackVerdict,
+      message: "LLM returned malformed JSON; recovery parser applied.",
+      severity: "warning",
+      status: "warning",
+      event_type: "api",
+    });
+  }
+
   private parseResearchAnalysis(
     rawContent: string,
-    symbol: string
-  ): { analysis: ResearchLLMAnalysis; repaired: boolean; parseError?: string; responsePreview: string } {
+    symbol: string,
+    stage: "research_signal" | "research_crypto" = "research_signal"
+  ): {
+    analysis: ResearchLLMAnalysis;
+    repaired: boolean;
+    parseError?: string;
+    responsePreview: string;
+    parseFailure?: ModelParseFailure;
+  } {
     const sanitized = rawContent
       .replace(/```json\s*/gi, "")
       .replace(/```/g, "")
@@ -4465,9 +4931,10 @@ export class OwokxHarness extends DurableObject<Env> {
     }
 
     if (!parsed) {
+      const fallbackVerdict: "WAIT" = "WAIT";
       return {
         analysis: {
-          verdict: "WAIT",
+          verdict: fallbackVerdict,
           confidence: 0.35,
           entry_quality: "fair",
           reasoning: `LLM response for ${symbol} was not valid JSON. Applied conservative WAIT fallback.`,
@@ -4477,6 +4944,15 @@ export class OwokxHarness extends DurableObject<Env> {
         repaired: true,
         parseError,
         responsePreview,
+        parseFailure: {
+          stage,
+          symbol,
+          parser: "json-recovery",
+          parseError: parseError ?? null,
+          responsePreview,
+          recoveryApplied: true,
+          fallbackVerdict,
+        },
       };
     }
 
@@ -4531,6 +5007,17 @@ export class OwokxHarness extends DurableObject<Env> {
       repaired,
       parseError,
       responsePreview,
+      parseFailure: repaired
+        ? {
+            stage,
+            symbol,
+            parser: "json-recovery",
+            parseError: parseError ?? null,
+            responsePreview,
+            recoveryApplied: true,
+            fallbackVerdict: verdict,
+          }
+        : undefined,
     };
   }
 
@@ -4556,10 +5043,16 @@ export class OwokxHarness extends DurableObject<Env> {
 
     try {
       const broker = createBrokerProviders(this.env, this.state.config.broker);
-      const isCrypto = isCryptoSymbol(symbol, this.state.config.crypto_symbols || []);
+      const brokerSymbol = this.normalizeResearchSymbolForBroker(symbol, broker.broker);
+      if (!brokerSymbol) {
+        this.log("SignalResearch", "symbol_skipped_for_broker", { symbol, broker: broker.broker });
+        return null;
+      }
+
+      const isCrypto = isCryptoSymbol(brokerSymbol, this.state.config.crypto_symbols || []);
       let price = 0;
       if (isCrypto) {
-        const normalized = normalizeCryptoSymbol(symbol);
+        const normalized = normalizeCryptoSymbol(brokerSymbol);
         const snapshot = await broker.marketData.getCryptoSnapshot(normalized).catch((error) => {
           this.log("SignalResearch", "snapshot_fetch_failed", {
             symbol: normalized,
@@ -4575,36 +5068,40 @@ export class OwokxHarness extends DurableObject<Env> {
         price =
           snapshot?.latest_trade?.price || snapshot?.latest_quote?.ask_price || snapshot?.latest_quote?.bid_price || 0;
       } else {
-        const snapshot = await broker.marketData.getSnapshot(symbol).catch((error) => {
+        const snapshot = await broker.marketData.getSnapshot(brokerSymbol).catch((error) => {
           this.log("SignalResearch", "snapshot_fetch_failed", {
-            symbol,
+            symbol: brokerSymbol,
             broker: broker.broker,
             error: String(error),
           });
           return null;
         });
         if (!snapshot) {
-          this.log("SignalResearch", "snapshot_unavailable", { symbol, broker: broker.broker });
+          this.log("SignalResearch", "snapshot_unavailable", { symbol: brokerSymbol, broker: broker.broker });
           return null;
         }
         if (!this.validateMarketData(snapshot)) {
-          this.log("SignalResearch", "stale_data", { symbol });
+          this.log("SignalResearch", "stale_data", { symbol: brokerSymbol });
           return null;
         }
         price =
           snapshot?.latest_trade?.price || snapshot?.latest_quote?.ask_price || snapshot?.latest_quote?.bid_price || 0;
       }
 
-      const toolContext = await this.buildSymbolToolContext(symbol, isCrypto, broker);
+      const toolContext = await this.buildSymbolToolContext(brokerSymbol, isCrypto, broker);
       const toolSummary = this.formatToolContext(toolContext);
-      const matchingSignal = this.state.signalCache.find((signal) => signal.symbol === symbol);
+      const matchingSignal = this.state.signalCache.find(
+        (signal) => this.normalizeResearchSymbolForBroker(signal.symbol, broker.broker) === brokerSymbol
+      );
       const predictiveScore = this.predictSignalProbability({
-        symbol,
+        symbol: brokerSymbol,
         sentiment: matchingSignal?.sentiment ?? sentimentScore,
         freshness: matchingSignal?.freshness ?? 0.5,
         volume: matchingSignal?.volume ?? 1,
         sourceDiversity: new Set(
-          this.state.signalCache.filter((signal) => signal.symbol === symbol).map((signal) => signal.source)
+          this.state.signalCache
+            .filter((signal) => this.normalizeResearchSymbolForBroker(signal.symbol, broker.broker) === brokerSymbol)
+            .map((signal) => signal.source)
         ).size,
       });
       const memorySummary = this.getRelevantMemoryEpisodes([symbol, "research", "risk"], 3)
@@ -4617,7 +5114,7 @@ export class OwokxHarness extends DurableObject<Env> {
 
       const prompt = `Should we BUY this ${isCrypto ? "crypto" : "stock"} based on social sentiment and fundamentals?
 
-                      SYMBOL: ${symbol}
+                      SYMBOL: ${brokerSymbol}
                       SENTIMENT: ${(sentimentScore * 100).toFixed(0)}% bullish (sources: ${sources.join(", ")})
 
                       CURRENT DATA:
@@ -4681,16 +5178,9 @@ export class OwokxHarness extends DurableObject<Env> {
         });
       }
 
-      const parsedAnalysis = this.parseResearchAnalysis(response.content || "{}", symbol);
-      if (parsedAnalysis.repaired) {
-        this.log("SignalResearch", "invalid_llm_json", {
-          symbol,
-          message: "LLM returned malformed JSON; applied recovery parser",
-          parse_error: parsedAnalysis.parseError,
-          response_preview: parsedAnalysis.responsePreview,
-          severity: "warning",
-          status: "warning",
-        });
+      const parsedAnalysis = this.parseResearchAnalysis(response.content || "{}", brokerSymbol);
+      if (parsedAnalysis.parseFailure) {
+        this.logParseFailure(parsedAnalysis.parseFailure);
       }
       const analysis = parsedAnalysis.analysis;
 
@@ -4711,7 +5201,7 @@ export class OwokxHarness extends DurableObject<Env> {
       }
 
       const result: ResearchResult = {
-        symbol,
+        symbol: brokerSymbol,
         verdict: adjustedVerdict,
         confidence: adjustedConfidence,
         sentiment: this.clampSentiment(sentimentScore),
@@ -4722,9 +5212,9 @@ export class OwokxHarness extends DurableObject<Env> {
         timestamp: Date.now(),
       };
 
-      this.state.signalResearch[symbol] = result;
+      this.state.signalResearch[brokerSymbol] = result;
       this.log("SignalResearch", "signal_researched", {
-        symbol,
+        symbol: brokerSymbol,
         verdict: result.verdict,
         confidence: result.confidence,
         quality: result.entry_quality,
@@ -4745,9 +5235,9 @@ export class OwokxHarness extends DurableObject<Env> {
       }
 
       this.rememberEpisode(
-        `Research verdict for ${symbol}: ${result.verdict} (${(result.confidence * 100).toFixed(0)}%)`,
+        `Research verdict for ${brokerSymbol}: ${result.verdict} (${(result.confidence * 100).toFixed(0)}%)`,
         result.verdict === "BUY" ? "success" : "neutral",
-        ["research", symbol, ...(result.verdict === "BUY" ? ["entry_candidate"] : [])],
+        ["research", brokerSymbol, ...(result.verdict === "BUY" ? ["entry_candidate"] : [])],
         {
           impact: Math.min(1, Math.abs(sentimentScore)),
           confidence: result.confidence,
@@ -4764,11 +5254,7 @@ export class OwokxHarness extends DurableObject<Env> {
       return result;
     } catch (error) {
       const errorMsg = String(error);
-      if (
-        errorMsg.includes("Authentication Fails") ||
-        errorMsg.includes("401") ||
-        errorMsg.includes("invalid api key")
-      ) {
+      if (this.isLlmAuthFailure(errorMsg)) {
         this.state.lastLLMAuthError = { at: Date.now(), message: errorMsg };
         this.log("SignalResearch", "auth_error", {
           symbol,
@@ -4887,53 +5373,154 @@ export class OwokxHarness extends DurableObject<Env> {
     }
 
     const now = Date.now();
-    const queued = Array.from(aggregated.values())
-      .map((entry) => {
-        const avgSentiment = entry.totalSentiment / entry.mentions;
-        const avgRawSentiment = entry.totalRawSentiment / entry.mentions;
-        const sourceDiversity = Math.min(1, entry.sources.size / 3);
-        const mentionScore = Math.min(1, Math.log2(entry.mentions + 1) / 4);
-        const freshnessScore = Math.max(0, Math.min(entry.freshness, 1));
-        const predictiveScore = this.predictSignalProbability({
-          symbol: entry.symbol,
-          sentiment: avgSentiment,
-          freshness: freshnessScore,
-          volume: entry.mentions,
-          sourceDiversity: entry.sources.size,
-        });
-        const recentResearch = this.state.signalResearch[entry.symbol];
-        const recentlyResearched =
-          !!recentResearch &&
-          Number.isFinite(recentResearch.timestamp) &&
-          now - recentResearch.timestamp < 15 * 60 * 1000;
-        const recentPenalty = recentlyResearched ? 0.2 : 0;
+    const enrichedCandidates = Array.from(aggregated.values()).map((entry) => {
+      const avgSentiment = entry.totalSentiment / entry.mentions;
+      const avgRawSentiment = entry.totalRawSentiment / entry.mentions;
+      const sourceDiversity = Math.min(1, entry.sources.size / 3);
+      const mentionScore = Math.min(1, Math.log2(entry.mentions + 1) / 4);
+      const freshnessScore = Math.max(0, Math.min(entry.freshness, 1));
+      const predictiveScore = this.predictSignalProbability({
+        symbol: entry.symbol,
+        sentiment: avgSentiment,
+        freshness: freshnessScore,
+        volume: entry.mentions,
+        sourceDiversity: entry.sources.size,
+      });
+      const recentResearch = this.state.signalResearch[entry.symbol];
+      const recentlyResearched =
+        !!recentResearch &&
+        Number.isFinite(recentResearch.timestamp) &&
+        now - recentResearch.timestamp < 15 * 60 * 1000;
+      const recentPenalty = recentlyResearched ? 0.2 : 0;
 
-        const priority =
-          avgSentiment * 0.55 +
-          avgRawSentiment * 0.2 +
-          sourceDiversity * 0.15 +
-          mentionScore * 0.05 +
-          freshnessScore * 0.05 +
-          predictiveScore * 0.15 -
-          recentPenalty;
+      const priority =
+        avgSentiment * 0.55 +
+        avgRawSentiment * 0.2 +
+        sourceDiversity * 0.15 +
+        mentionScore * 0.05 +
+        freshnessScore * 0.05 +
+        predictiveScore * 0.15 -
+        recentPenalty;
 
-        return {
-          symbol: entry.symbol,
-          avgSentiment,
-          sources: Array.from(entry.sources),
-          mentions: entry.mentions,
-          predictiveScore,
-          priority,
-        };
+      return {
+        symbol: entry.symbol,
+        avgSentiment,
+        mentions: entry.mentions,
+        freshness: freshnessScore,
+        sources: entry.sources,
+        sourceList: Array.from(entry.sources),
+        predictiveScore,
+        priority,
+      };
+    });
+
+    const outlierScores = this.computeCandidateOutlierScores(
+      enrichedCandidates.map((candidate) => ({
+        symbol: candidate.symbol,
+        sentiment: candidate.avgSentiment,
+        mentions: candidate.mentions,
+        freshness: candidate.freshness,
+        sourceCount: candidate.sources.size,
+      }))
+    );
+
+    const candidatePool = enrichedCandidates
+      .filter((candidate) => {
+        const score = outlierScores[candidate.symbol] ?? 0;
+        return score < 2.4;
       })
-      .sort((a, b) => b.priority - a.priority)
-      .slice(0, limit);
+      .sort((a, b) => b.priority - a.priority);
+
+    const heldProfiles = Array.from(heldSymbols)
+      .map((symbol) => {
+        const symbolSignals = this.state.signalCache.filter((signal) => signal.symbol === symbol);
+        if (symbolSignals.length === 0) return null;
+        const mentions = symbolSignals.length;
+        const sentiment = symbolSignals.reduce((sum, signal) => sum + signal.sentiment, 0) / mentions;
+        const freshness = symbolSignals.reduce((max, signal) => Math.max(max, this.clamp01(signal.freshness || 0)), 0);
+        const sources = new Set(symbolSignals.map((signal) => signal.source));
+        return { symbol, sentiment, mentions, freshness, sources };
+      })
+      .filter((profile): profile is NonNullable<typeof profile> => profile !== null);
+
+    const queued: Array<{
+      symbol: string;
+      avgSentiment: number;
+      sources: string[];
+      mentions: number;
+      predictiveScore: number;
+      priority: number;
+      maxCorrelation: number;
+    }> = [];
+    const selectedProfiles: Array<{
+      symbol: string;
+      sentiment: number;
+      mentions: number;
+      freshness: number;
+      sources: Set<string>;
+    }> = [];
+
+    for (const candidate of candidatePool) {
+      const peers = [...heldProfiles, ...selectedProfiles];
+      let maxCorrelation = 0;
+      for (const peer of peers) {
+        maxCorrelation = Math.max(
+          maxCorrelation,
+          this.computeSignalCorrelation(
+            {
+              sentiment: candidate.avgSentiment,
+              mentions: candidate.mentions,
+              freshness: candidate.freshness,
+              sources: candidate.sources,
+            },
+            peer
+          )
+        );
+      }
+
+      if (maxCorrelation >= 0.82) {
+        this.log("SignalResearch", "candidate_skipped_high_correlation", {
+          symbol: candidate.symbol,
+          max_correlation: Number(maxCorrelation.toFixed(3)),
+        });
+        continue;
+      }
+
+      queued.push({
+        symbol: candidate.symbol,
+        avgSentiment: candidate.avgSentiment,
+        sources: candidate.sourceList,
+        mentions: candidate.mentions,
+        predictiveScore: candidate.predictiveScore,
+        priority: candidate.priority,
+        maxCorrelation,
+      });
+      selectedProfiles.push({
+        symbol: candidate.symbol,
+        sentiment: candidate.avgSentiment,
+        mentions: candidate.mentions,
+        freshness: candidate.freshness,
+        sources: candidate.sources,
+      });
+      if (queued.length >= limit) break;
+    }
+
+    const filteredOutliers = enrichedCandidates
+      .filter((candidate) => (outlierScores[candidate.symbol] ?? 0) >= 2.4)
+      .map((candidate) => candidate.symbol);
+    if (filteredOutliers.length > 0) {
+      this.log("SignalResearch", "candidate_outliers_filtered", {
+        count: filteredOutliers.length,
+        symbols: filteredOutliers.slice(0, 10),
+      });
+    }
 
     if (queued.length === 0) {
       this.log("SignalResearch", "no_candidates", {
         total_signals: allSignals.length,
         not_held: notHeld.length,
         above_threshold: eligibleSignals.length,
+        outlier_filtered: filteredOutliers.length,
         min_sentiment: this.state.config.min_sentiment_score,
       });
       this.recordPerformanceSample("research", Date.now() - startedAt, false);
@@ -4949,6 +5536,7 @@ export class OwokxHarness extends DurableObject<Env> {
         priority: Number(c.priority.toFixed(3)),
         predictive: Number(c.predictiveScore.toFixed(3)),
         mentions: c.mentions,
+        corr: Number(c.maxCorrelation.toFixed(3)),
       })),
     });
 
@@ -5400,17 +5988,39 @@ Response format:
       if (pos.asset_class === "us_option") continue; // Options handled separately
       if (isCryptoSymbol(pos.symbol, this.state.config.crypto_symbols || [])) continue;
 
-      const plPct = (pos.unrealized_pl / (pos.market_value - pos.unrealized_pl)) * 100;
+      const entry = this.state.positionEntries[pos.symbol];
+      if (entry) {
+        entry.peak_price = Math.max(entry.peak_price || 0, pos.current_price || 0);
+      }
+      const plPct = this.estimatePositionPnLPct(pos, entry);
+      const thresholds = this.computeAdaptiveExitThresholds(riskProfile, pos, entry);
 
       // Take profit
-      if (plPct >= this.state.config.take_profit_pct) {
-        await this.executeSell(broker, pos.symbol, `Take profit at +${plPct.toFixed(1)}%`);
+      if (plPct >= thresholds.takeProfitPct) {
+        await this.executeSell(
+          broker,
+          pos.symbol,
+          `Take profit at +${plPct.toFixed(1)}% (target ${thresholds.takeProfitPct.toFixed(1)}%)`
+        );
         continue;
       }
 
       // Stop loss
-      if (plPct <= -this.state.config.stop_loss_pct) {
-        await this.executeSell(broker, pos.symbol, `Stop loss at ${plPct.toFixed(1)}%`);
+      if (plPct <= -thresholds.stopLossPct) {
+        await this.executeSell(
+          broker,
+          pos.symbol,
+          `Stop loss at ${plPct.toFixed(1)}% (limit -${thresholds.stopLossPct.toFixed(1)}%)`
+        );
+        continue;
+      }
+
+      if (plPct > 0 && thresholds.peakDrawdownPct <= -thresholds.trailingStopPct) {
+        await this.executeSell(
+          broker,
+          pos.symbol,
+          `Trailing stop at ${thresholds.peakDrawdownPct.toFixed(1)}% from peak (limit -${thresholds.trailingStopPct.toFixed(1)}%)`
+        );
         continue;
       }
 
@@ -5460,6 +6070,15 @@ Response format:
             worst_case_drawdown_pct: this.state.lastStressTest
               ? Number((this.state.lastStressTest.worstCaseDrawdownPct * 100).toFixed(2))
               : null,
+          });
+          continue;
+        }
+        const corrCheck = this.shouldBlockCorrelatedTrade(research.symbol, heldSymbols);
+        if (corrCheck.blocked) {
+          this.log("Risk", "buy_deferred_signal_correlation", {
+            symbol: research.symbol,
+            with_symbol: corrCheck.peer,
+            correlation: Number(corrCheck.maxCorrelation.toFixed(3)),
           });
           continue;
         }
@@ -5548,6 +6167,15 @@ Response format:
           const adjustedRecConfidence = this.applyRegimeConfidenceAdjustment(rec.confidence, rec.confidence);
           if (stressFailed && adjustedRecConfidence < 0.9) continue;
           if (adjustedRecConfidence < this.state.config.min_analyst_confidence) continue;
+          const corrCheck = this.shouldBlockCorrelatedTrade(rec.symbol, heldSymbols);
+          if (corrCheck.blocked) {
+            this.log("Risk", "buy_deferred_signal_correlation", {
+              symbol: rec.symbol,
+              with_symbol: corrCheck.peer,
+              correlation: Number(corrCheck.maxCorrelation.toFixed(3)),
+            });
+            continue;
+          }
 
           const result = await this.executeBuy(broker, rec.symbol, adjustedRecConfidence, account, decisionId);
           if (result) {
@@ -5608,16 +6236,28 @@ Response format:
       return false;
     }
 
+    const isCrypto = isCryptoSymbol(symbol, this.state.config.crypto_symbols || []);
     const riskProfile = this.getDynamicRiskProfile(account);
-    const sizePct = Math.min(20, this.getAdaptivePositionSizePct(account));
-    const positionSize = Math.min(account.cash * (sizePct / 100) * confidence, this.state.config.max_position_value);
+    const symbolVolatility = await this.estimateSymbolVolatility(broker, symbol, isCrypto);
+    const baseSizePct = Math.min(20, this.getAdaptivePositionSizePct(account));
+    const positionScale = this.computeDynamicPositionScale(
+      symbolVolatility,
+      confidence,
+      riskProfile.multiplier,
+      riskProfile.marketRegime
+    );
+    const sizePct = Math.min(25, Math.max(2.5, baseSizePct * positionScale));
+    const maxPositionCap = isCrypto
+      ? Math.min(this.state.config.crypto_max_position_value, this.state.config.max_position_value)
+      : this.state.config.max_position_value;
+    const positionSize = Math.min(account.cash * (sizePct / 100), maxPositionCap);
 
     if (positionSize < 100) {
       this.log("Executor", "buy_skipped", { symbol, reason: "Position too small" });
       return false;
     }
 
-    const maxAllowed = this.state.config.max_position_value * 1.01;
+    const maxAllowed = maxPositionCap * 1.01;
     if (positionSize <= 0 || positionSize > maxAllowed || !Number.isFinite(positionSize)) {
       this.log("Executor", "buy_blocked", {
         symbol,
@@ -5671,7 +6311,6 @@ Response format:
     }
 
     try {
-      const isCrypto = isCryptoSymbol(symbol, this.state.config.crypto_symbols || []);
       const orderSymbol = isCrypto ? normalizeCryptoSymbol(symbol) : symbol;
       const timeInForce = isCrypto ? "gtc" : "day";
 
@@ -5719,6 +6358,9 @@ Response format:
         symbol: orderSymbol,
         isCrypto,
         size: positionSize,
+        size_pct: Number(sizePct.toFixed(2)),
+        confidence: Number(confidence.toFixed(3)),
+        symbol_volatility_pct: Number((symbolVolatility * 100).toFixed(2)),
         dynamic_risk_multiplier: riskProfile.multiplier,
         regime: riskProfile.marketRegime,
         submission_state: execution.submission.state,

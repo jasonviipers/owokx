@@ -38,7 +38,7 @@
     "ai": "^6.0.67",
     "okx-api": "^3.1.2",
     "openai": "^6.16.0",
-    "zod": "^3.23.8"
+    "zod": "^4.3.6"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.3.14",
