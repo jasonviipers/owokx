@@ -70,8 +70,8 @@ Environment variables:
 
 One-click deploy runs migrations remotely:
 
-- Staging: `wrangler d1 migrations apply owokx-db --remote`
-- Production: `wrangler d1 migrations apply owokx-db --remote --env production`
+- Staging: `wrangler d1 migrations apply Okx-db --remote`
+- Production: `wrangler d1 migrations apply Okx-db --remote --env production`
 
 ## Monitoring Endpoints
 

@@ -53,6 +53,77 @@ export async function markApprovalUsed(db: D1Client, approvalId: string): Promis
   );
 }
 
+export async function reserveApproval(
+  db: D1Client,
+  approvalId: string,
+  reservedBy: string,
+  reservedUntil: string
+): Promise<boolean> {
+  const now = nowISO();
+  const result = await db.run(
+    `UPDATE order_approvals
+     SET state = 'RESERVED',
+         reserved_at = ?,
+         reserved_by = ?,
+         reserved_until = ?,
+         failed_at = NULL,
+         last_error_json = NULL
+     WHERE id = ?
+       AND used_at IS NULL
+       AND expires_at > ?
+       AND (state = 'ACTIVE' OR state IS NULL OR (state = 'RESERVED' AND reserved_until < ?))`,
+    [now, reservedBy, reservedUntil, approvalId, now, now]
+  );
+  return (result.meta.changes ?? 0) > 0;
+}
+
+export async function markApprovalUsedByReservation(
+  db: D1Client,
+  approvalId: string,
+  reservedBy: string
+): Promise<boolean> {
+  const now = nowISO();
+  const result = await db.run(
+    `UPDATE order_approvals
+     SET used_at = ?,
+         submitted_at = ?,
+         state = 'USED',
+         reserved_at = NULL,
+         reserved_by = NULL,
+         reserved_until = NULL
+     WHERE id = ?
+       AND used_at IS NULL
+       AND state = 'RESERVED'
+       AND reserved_by = ?`,
+    [now, now, approvalId, reservedBy]
+  );
+  return (result.meta.changes ?? 0) > 0;
+}
+
+export async function releaseApprovalReservation(
+  db: D1Client,
+  approvalId: string,
+  reservedBy: string,
+  lastErrorJson?: string
+): Promise<boolean> {
+  const now = nowISO();
+  const result = await db.run(
+    `UPDATE order_approvals
+     SET state = 'ACTIVE',
+         reserved_at = NULL,
+         reserved_by = NULL,
+         reserved_until = NULL,
+         failed_at = ?,
+         last_error_json = COALESCE(?, last_error_json)
+     WHERE id = ?
+       AND used_at IS NULL
+       AND state = 'RESERVED'
+       AND reserved_by = ?`,
+    [now, lastErrorJson ?? null, approvalId, reservedBy]
+  );
+  return (result.meta.changes ?? 0) > 0;
+}
+
 export async function cleanupExpiredApprovals(db: D1Client): Promise<number> {
   const result = await db.run(`DELETE FROM order_approvals WHERE expires_at < ? AND used_at IS NULL`, [nowISO()]);
   return result.meta.changes ?? 0;

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import type { Env } from "../env";
 import { LearningAgent } from "../durable-objects/learning-agent";
+import type { Env } from "../env";
 
 class MockStorage {
   private data = new Map<string, unknown>();

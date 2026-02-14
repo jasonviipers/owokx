@@ -2,10 +2,16 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { McpAgent } from "agents/mcp";
 import { z } from "zod";
 import type { Env } from "../env.d";
-import { executeOrder } from "../execution/execute-order";
+import { type ExecuteOrderResult, executeOrder } from "../execution/execute-order";
 import { ErrorCode } from "../lib/errors";
 import { generateId, hmacVerify } from "../lib/utils";
-import { consumeApprovalToken, generateApprovalToken, validateApprovalToken } from "../policy/approval";
+import {
+  consumeReservedApprovalToken,
+  generateApprovalToken,
+  releaseReservedApprovalToken,
+  reserveApprovalToken,
+  validateApprovalToken,
+} from "../policy/approval";
 import { getDefaultPolicyConfig, type PolicyConfig } from "../policy/config";
 import { PolicyEngine } from "../policy/engine";
 import { getDTE } from "../providers/alpaca/options";
@@ -40,14 +46,12 @@ import type { OptionsOrderPreview } from "./types";
 import { failure, success } from "./types";
 
 export class OwokxMcpAgent extends McpAgent<Env> {
-  override server: McpAgent<Env>["server"] = new McpServer({
+  private readonly typedServer = new McpServer({
     name: "owokx",
     version: "0.1.0",
-  }) as unknown as McpAgent<Env>["server"];
+  });
 
-  private get mcpServer(): McpServer {
-    return this.server as unknown as McpServer;
-  }
+  override server: McpAgent<Env>["server"] = this.typedServer as unknown as McpAgent<Env>["server"];
 
   private requestId: string = "";
   private policyConfig: PolicyConfig | null = null;
@@ -86,7 +90,7 @@ export class OwokxMcpAgent extends McpAgent<Env> {
   }
 
   private registerAuthTools(db: ReturnType<typeof createD1Client>, broker: BrokerProviders) {
-    this.mcpServer.tool("auth-verify", "Verify that broker API credentials are valid", {}, async () => {
+    this.typedServer.tool("auth-verify", "Verify that broker API credentials are valid", {}, async () => {
       const startTime = Date.now();
       try {
         const account = await broker.trading.getAccount();
@@ -120,7 +124,7 @@ export class OwokxMcpAgent extends McpAgent<Env> {
       }
     });
 
-    this.mcpServer.tool("user-get", "Get user/session information and system configuration", {}, async () => {
+    this.typedServer.tool("user-get", "Get user/session information and system configuration", {}, async () => {
       const result = success({
         environment: this.env.ENVIRONMENT,
         paper_trading: this.env.ALPACA_PAPER === "true",
@@ -139,7 +143,7 @@ export class OwokxMcpAgent extends McpAgent<Env> {
   }
 
   private registerAccountTools(db: ReturnType<typeof createD1Client>, broker: BrokerProviders) {
-    this.mcpServer.tool(
+    this.typedServer.tool(
       "accounts-get",
       "Get detailed account information including buying power and equity",
       {},
@@ -171,7 +175,7 @@ export class OwokxMcpAgent extends McpAgent<Env> {
       }
     );
 
-    this.mcpServer.tool(
+    this.typedServer.tool(
       "portfolio-get",
       "Get comprehensive portfolio snapshot with positions and summary",
       {},
@@ -236,7 +240,7 @@ export class OwokxMcpAgent extends McpAgent<Env> {
   }
 
   private registerPositionTools(db: ReturnType<typeof createD1Client>, broker: BrokerProviders) {
-    this.mcpServer.tool(
+    this.typedServer.tool(
       "positions-list",
       "List all current positions",
       { symbol: z.string().optional() },
@@ -274,7 +278,7 @@ export class OwokxMcpAgent extends McpAgent<Env> {
       }
     );
 
-    this.mcpServer.tool(
+    this.typedServer.tool(
       "positions-close",
       "Close a position (bypasses preview/submit; allowed even during kill switch)",
       {
@@ -313,7 +317,7 @@ export class OwokxMcpAgent extends McpAgent<Env> {
   }
 
   private registerOrderTools(db: ReturnType<typeof createD1Client>, broker: BrokerProviders) {
-    this.mcpServer.tool(
+    this.typedServer.tool(
       "orders-preview",
       "Preview order and get approval token. Does NOT execute. Use orders-submit with the token.",
       {
@@ -509,7 +513,7 @@ export class OwokxMcpAgent extends McpAgent<Env> {
       }
     );
 
-    this.mcpServer.tool(
+    this.typedServer.tool(
       "orders-submit",
       "Execute order with valid approval token from orders-preview",
       { approval_token: z.string().min(1) },
@@ -575,19 +579,54 @@ export class OwokxMcpAgent extends McpAgent<Env> {
           }
 
           const orderParams = validation.order_params!;
-          const idempotencyKey = `approval:${validation.approval_id!}`;
-          const execution = await executeOrder({
-            env: this.env,
-            db,
-            broker,
-            source: "mcp",
-            idempotency_key: idempotencyKey,
-            order: orderParams,
-            approval_id: validation.approval_id!,
-          });
+          const reservationId = generateId();
+          const reserved = await reserveApprovalToken(db, validation.approval_id!, reservationId);
+          if (!reserved) {
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: JSON.stringify(
+                    failure({
+                      code: ErrorCode.INVALID_APPROVAL_TOKEN,
+                      message: "Approval token already in use, expired, or already consumed",
+                    }),
+                    null,
+                    2
+                  ),
+                },
+              ],
+              isError: true,
+            };
+          }
 
+          const idempotencyKey = `approval:${validation.approval_id!}`;
+          let execution: ExecuteOrderResult;
+          try {
+            execution = await executeOrder({
+              env: this.env,
+              db,
+              broker,
+              source: "mcp",
+              idempotency_key: idempotencyKey,
+              order: orderParams,
+              approval_id: validation.approval_id!,
+            });
+          } catch (error) {
+            await releaseReservedApprovalToken(db, validation.approval_id!, reservationId, error).catch(() => {});
+            throw error;
+          }
+
+          let approvalConsumed = false;
           if (execution.submission.state === "SUBMITTED") {
-            await consumeApprovalToken(db, validation.approval_id!);
+            approvalConsumed = await consumeReservedApprovalToken(db, validation.approval_id!, reservationId);
+          } else {
+            await releaseReservedApprovalToken(
+              db,
+              validation.approval_id!,
+              reservationId,
+              `submission_state_${execution.submission.state}`
+            ).catch(() => {});
           }
 
           const result = success({
@@ -604,6 +643,10 @@ export class OwokxMcpAgent extends McpAgent<Env> {
               id: execution.submission.id,
               idempotency_key: idempotencyKey,
               state: execution.submission.state,
+            },
+            approval: {
+              consumed: approvalConsumed,
+              id: validation.approval_id!,
             },
           });
 
@@ -631,7 +674,7 @@ export class OwokxMcpAgent extends McpAgent<Env> {
       }
     );
 
-    this.mcpServer.tool(
+    this.typedServer.tool(
       "orders-list",
       "List orders",
       {
@@ -668,7 +711,7 @@ export class OwokxMcpAgent extends McpAgent<Env> {
       }
     );
 
-    this.mcpServer.tool("orders-cancel", "Cancel an order by ID", { order_id: z.string() }, async ({ order_id }) => {
+    this.typedServer.tool("orders-cancel", "Cancel an order by ID", { order_id: z.string() }, async ({ order_id }) => {
       try {
         await broker.trading.cancelOrder(order_id);
         return {
@@ -694,7 +737,7 @@ export class OwokxMcpAgent extends McpAgent<Env> {
   }
 
   private registerRiskTools(db: ReturnType<typeof createD1Client>, broker: BrokerProviders) {
-    this.mcpServer.tool("risk-status", "Get current risk status and limits", {}, async () => {
+    this.typedServer.tool("risk-status", "Get current risk status and limits", {}, async () => {
       try {
         const [riskState, account, positions] = await Promise.all([
           getRiskState(db),
@@ -731,7 +774,7 @@ export class OwokxMcpAgent extends McpAgent<Env> {
       }
     });
 
-    this.mcpServer.tool(
+    this.typedServer.tool(
       "kill-switch-enable",
       "Enable kill switch to halt all trading",
       { reason: z.string().min(1) },
@@ -761,7 +804,7 @@ export class OwokxMcpAgent extends McpAgent<Env> {
       }
     );
 
-    this.mcpServer.tool(
+    this.typedServer.tool(
       "kill-switch-disable",
       "Disable kill switch (requires secret verification)",
       {
@@ -819,7 +862,7 @@ export class OwokxMcpAgent extends McpAgent<Env> {
   }
 
   private registerUtilityTools() {
-    this.mcpServer.tool("help-usage", "Get help information about using Okx", {}, async () => {
+    this.typedServer.tool("help-usage", "Get help information about using Okx", {}, async () => {
       const result = success({
         name: "Okx MCP Trading Server",
         version: "0.1.0",
@@ -829,7 +872,7 @@ export class OwokxMcpAgent extends McpAgent<Env> {
       return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
     });
 
-    this.mcpServer.tool("catalog-list", "List all available tools", {}, async () => {
+    this.typedServer.tool("catalog-list", "List all available tools", {}, async () => {
       const catalog = [
         { category: "Auth", tools: ["auth-verify", "user-get"] },
         { category: "Account", tools: ["accounts-get", "portfolio-get"] },
@@ -871,7 +914,7 @@ export class OwokxMcpAgent extends McpAgent<Env> {
   }
 
   private registerMemoryTools(db: D1Client) {
-    this.mcpServer.tool(
+    this.typedServer.tool(
       "memory-log-trade",
       "Log a trade entry to the journal for later analysis",
       {
@@ -920,7 +963,7 @@ export class OwokxMcpAgent extends McpAgent<Env> {
       }
     );
 
-    this.mcpServer.tool(
+    this.typedServer.tool(
       "memory-log-outcome",
       "Log the outcome of a previously logged trade",
       {
@@ -960,7 +1003,7 @@ export class OwokxMcpAgent extends McpAgent<Env> {
       }
     );
 
-    this.mcpServer.tool(
+    this.typedServer.tool(
       "memory-query",
       "Query journal entries and trading statistics",
       {
@@ -1004,7 +1047,7 @@ export class OwokxMcpAgent extends McpAgent<Env> {
       }
     );
 
-    this.mcpServer.tool(
+    this.typedServer.tool(
       "memory-summarize",
       "Use LLM to analyze trading history and extract patterns (requires LLM feature)",
       { days: z.number().min(1).max(365).default(30) },
@@ -1058,7 +1101,7 @@ export class OwokxMcpAgent extends McpAgent<Env> {
       }
     );
 
-    this.mcpServer.tool(
+    this.typedServer.tool(
       "memory-set-preferences",
       "Store user trading preferences",
       { preferences: z.record(z.string(), z.unknown()) },
@@ -1084,7 +1127,7 @@ export class OwokxMcpAgent extends McpAgent<Env> {
       }
     );
 
-    this.mcpServer.tool("memory-get-preferences", "Get stored user trading preferences", {}, async () => {
+    this.typedServer.tool("memory-get-preferences", "Get stored user trading preferences", {}, async () => {
       try {
         const preferences = await getPreferences(db);
         return { content: [{ type: "text" as const, text: JSON.stringify(success({ preferences }), null, 2) }] };
@@ -1103,7 +1146,7 @@ export class OwokxMcpAgent extends McpAgent<Env> {
   }
 
   private registerMarketDataTools(db: D1Client, broker: BrokerProviders) {
-    this.mcpServer.tool(
+    this.typedServer.tool(
       "symbol-overview",
       "Get comprehensive overview of a symbol including price, position, and recent bars",
       { symbol: z.string().min(1) },
@@ -1157,7 +1200,7 @@ export class OwokxMcpAgent extends McpAgent<Env> {
       }
     );
 
-    this.mcpServer.tool(
+    this.typedServer.tool(
       "prices-bars",
       "Get historical price bars for a symbol",
       {
@@ -1194,7 +1237,7 @@ export class OwokxMcpAgent extends McpAgent<Env> {
       }
     );
 
-    this.mcpServer.tool("market-clock", "Get current market clock status", {}, async () => {
+    this.typedServer.tool("market-clock", "Get current market clock status", {}, async () => {
       try {
         const clock = await broker.trading.getClock();
         return { content: [{ type: "text" as const, text: JSON.stringify(success(clock), null, 2) }] };
@@ -1211,7 +1254,7 @@ export class OwokxMcpAgent extends McpAgent<Env> {
       }
     });
 
-    this.mcpServer.tool(
+    this.typedServer.tool(
       "market-movers",
       "Get top gainers and losers from watchlist symbols",
       { symbols: z.array(z.string()).min(1).max(50) },
@@ -1245,7 +1288,7 @@ export class OwokxMcpAgent extends McpAgent<Env> {
       }
     );
 
-    this.mcpServer.tool(
+    this.typedServer.tool(
       "quotes-batch",
       "Get latest quotes for multiple symbols",
       { symbols: z.array(z.string()).min(1).max(100) },
@@ -1274,7 +1317,7 @@ export class OwokxMcpAgent extends McpAgent<Env> {
       }
     );
 
-    this.mcpServer.tool(
+    this.typedServer.tool(
       "market-quote",
       "Get a quote for a single symbol (stocks or crypto)",
       { symbol: z.string().min(1) },
@@ -1319,7 +1362,7 @@ export class OwokxMcpAgent extends McpAgent<Env> {
   }
 
   private registerTechnicalTools(_db: D1Client, broker: BrokerProviders) {
-    this.mcpServer.tool(
+    this.typedServer.tool(
       "technicals-get",
       "Calculate technical indicators for a symbol",
       {
@@ -1360,7 +1403,7 @@ export class OwokxMcpAgent extends McpAgent<Env> {
       }
     );
 
-    this.mcpServer.tool(
+    this.typedServer.tool(
       "signals-get",
       "Detect trading signals from technical indicators for a symbol",
       {
@@ -1413,7 +1456,7 @@ export class OwokxMcpAgent extends McpAgent<Env> {
       }
     );
 
-    this.mcpServer.tool(
+    this.typedServer.tool(
       "signals-batch",
       "Detect trading signals for multiple symbols at once",
       {
@@ -1456,7 +1499,7 @@ export class OwokxMcpAgent extends McpAgent<Env> {
   }
 
   private registerEventsTools(db: D1Client) {
-    this.mcpServer.tool(
+    this.typedServer.tool(
       "events-ingest",
       "Manually ingest a raw event for processing",
       {
@@ -1489,7 +1532,7 @@ export class OwokxMcpAgent extends McpAgent<Env> {
       }
     );
 
-    this.mcpServer.tool(
+    this.typedServer.tool(
       "events-list",
       "List structured events with optional filtering",
       {
@@ -1525,7 +1568,7 @@ export class OwokxMcpAgent extends McpAgent<Env> {
       }
     );
 
-    this.mcpServer.tool(
+    this.typedServer.tool(
       "events-classify",
       "Use LLM to classify raw content into structured event (requires LLM feature)",
       {
@@ -1583,7 +1626,7 @@ export class OwokxMcpAgent extends McpAgent<Env> {
   }
 
   private registerNewsTools(db: D1Client) {
-    this.mcpServer.tool(
+    this.typedServer.tool(
       "news-list",
       "List recent news items with optional filtering",
       {
@@ -1615,7 +1658,7 @@ export class OwokxMcpAgent extends McpAgent<Env> {
       }
     );
 
-    this.mcpServer.tool(
+    this.typedServer.tool(
       "news-index",
       "Manually index a news item",
       {
@@ -1662,7 +1705,7 @@ export class OwokxMcpAgent extends McpAgent<Env> {
   }
 
   private registerResearchTools(db: D1Client, broker: BrokerProviders) {
-    this.mcpServer.tool(
+    this.typedServer.tool(
       "symbol-research",
       "Generate comprehensive research report for a symbol (requires LLM feature)",
       { symbol: z.string().min(1) },
@@ -1701,7 +1744,7 @@ export class OwokxMcpAgent extends McpAgent<Env> {
               volume: snapshot.daily_bar.v,
             },
             recentNews: news.map((n) => ({ headline: n.headline, date: n.published_at ?? n.created_at })),
-            technicals: technicals as unknown as Record<string, unknown>,
+            technicals: { ...technicals } as Record<string, unknown>,
             positions: position ? [{ qty: position.qty, avg_entry_price: position.avg_entry_price }] : [],
           });
 
@@ -1736,7 +1779,7 @@ export class OwokxMcpAgent extends McpAgent<Env> {
       }
     );
 
-    this.mcpServer.tool(
+    this.typedServer.tool(
       "web-scrape-financial",
       "Scrape financial data from allowed domains (finance.yahoo.com, sec.gov, stockanalysis.com, companiesmarketcap.com)",
       {
@@ -1786,7 +1829,7 @@ export class OwokxMcpAgent extends McpAgent<Env> {
   }
 
   private registerOptionsTools() {
-    this.mcpServer.tool(
+    this.typedServer.tool(
       "options-expirations",
       "Get available option expiration dates for a symbol",
       { underlying: z.string().min(1) },
@@ -1830,7 +1873,7 @@ export class OwokxMcpAgent extends McpAgent<Env> {
       }
     );
 
-    this.mcpServer.tool(
+    this.typedServer.tool(
       "options-chain",
       "Get options chain for a symbol and expiration",
       {
@@ -1870,7 +1913,7 @@ export class OwokxMcpAgent extends McpAgent<Env> {
       }
     );
 
-    this.mcpServer.tool(
+    this.typedServer.tool(
       "options-snapshot",
       "Get current snapshot for an options contract",
       { contract_symbol: z.string().min(1) },
@@ -1907,7 +1950,7 @@ export class OwokxMcpAgent extends McpAgent<Env> {
       }
     );
 
-    this.mcpServer.tool(
+    this.typedServer.tool(
       "options-order-preview",
       "Preview options order and get approval token. Does NOT execute. Use options-order-submit with the token.",
       {
@@ -2068,7 +2111,7 @@ export class OwokxMcpAgent extends McpAgent<Env> {
       }
     );
 
-    this.mcpServer.tool(
+    this.typedServer.tool(
       "options-order-submit",
       "Execute options order with valid approval token from options-order-preview",
       { approval_token: z.string().min(1) },
@@ -2136,10 +2179,34 @@ export class OwokxMcpAgent extends McpAgent<Env> {
             };
           }
 
+          const reservationId = generateId();
+          const reserved = await reserveApprovalToken(db, validation.approval_id!, reservationId);
+          if (!reserved) {
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: JSON.stringify(
+                    failure({
+                      code: ErrorCode.INVALID_APPROVAL_TOKEN,
+                      message: "Approval token already in use, expired, or already consumed",
+                    }),
+                    null,
+                    2
+                  ),
+                },
+              ],
+              isError: true,
+            };
+          }
+
           const orderParams = validation.order_params!;
           const clock = await broker.trading.getClock();
           const isCrypto = orderParams.asset_class === "crypto";
           if (!isCrypto && !clock.is_open && orderParams.time_in_force === "day") {
+            await releaseReservedApprovalToken(db, validation.approval_id!, reservationId, "market_closed").catch(
+              () => {}
+            );
             return {
               content: [
                 {
@@ -2151,17 +2218,23 @@ export class OwokxMcpAgent extends McpAgent<Env> {
             };
           }
 
-          const order = await broker.trading.createOrder({
-            symbol: orderParams.symbol,
-            qty: orderParams.qty,
-            side: orderParams.side,
-            type: orderParams.order_type,
-            time_in_force: orderParams.time_in_force,
-            limit_price: orderParams.limit_price,
-            client_order_id: validation.approval_id,
-          });
+          let order;
+          try {
+            order = await broker.trading.createOrder({
+              symbol: orderParams.symbol,
+              qty: orderParams.qty,
+              side: orderParams.side,
+              type: orderParams.order_type,
+              time_in_force: orderParams.time_in_force,
+              limit_price: orderParams.limit_price,
+              client_order_id: validation.approval_id,
+            });
+          } catch (error) {
+            await releaseReservedApprovalToken(db, validation.approval_id!, reservationId, error).catch(() => {});
+            throw error;
+          }
 
-          await consumeApprovalToken(db, validation.approval_id!);
+          const approvalConsumed = await consumeReservedApprovalToken(db, validation.approval_id!, reservationId);
           await createTrade(db, {
             approval_id: validation.approval_id,
             alpaca_order_id: order.id,
@@ -2175,6 +2248,10 @@ export class OwokxMcpAgent extends McpAgent<Env> {
           const result = success({
             message: "Options order submitted",
             order: { id: order.id, symbol: order.symbol, status: order.status },
+            approval: {
+              consumed: approvalConsumed,
+              id: validation.approval_id!,
+            },
           });
 
           await insertToolLog(db, {
@@ -2225,5 +2302,3 @@ export class OwokxMcpAgent extends McpAgent<Env> {
     return { underlying, expiration, type, strike };
   }
 }
-
-

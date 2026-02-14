@@ -5,6 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "typecheck": "tsc -b --pretty false",
+    "check": "pnpm run typecheck && vite build",
     "build": "tsc -b && vite build",
     "preview": "vite preview"
   },

@@ -1,7 +1,7 @@
 import { getHarnessStub } from "./durable-objects/owokx-harness";
 import type { Env } from "./env.d";
 import { handleCronEvent } from "./jobs/cron";
-import { isRequestAuthorized } from "./lib/auth";
+import { isRequestAuthorized, isTokenAuthorized } from "./lib/auth";
 import { OwokxMcpAgent } from "./mcp/agent";
 
 export { SessionDO } from "./durable-objects/session";
@@ -21,6 +21,21 @@ function unauthorizedResponse(): Response {
   });
 }
 
+function buildSessionCookie(request: Request, token: string): string {
+  const url = new URL(request.url);
+  const isSecure =
+    url.protocol === "https:" ||
+    request.headers.get("x-forwarded-proto") === "https" ||
+    !url.hostname.includes("localhost");
+  const parts = [`OWOKX_SESSION=${encodeURIComponent(token)}`, "Path=/", "HttpOnly", "SameSite=Lax", "Max-Age=43200"];
+  if (isSecure) parts.push("Secure");
+  return parts.join("; ");
+}
+
+function clearSessionCookie(): string {
+  return "OWOKX_SESSION=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0";
+}
+
 function getRegistryStub(env: Env): DurableObjectStub {
   const registryId = env.SWARM_REGISTRY.idFromName("default");
   return env.SWARM_REGISTRY.get(registryId);
@@ -29,6 +44,42 @@ function getRegistryStub(env: Env): DurableObjectStub {
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
+
+    if (url.pathname === "/auth/session" && request.method === "POST") {
+      let body: { token?: string };
+      try {
+        body = (await request.json()) as { token?: string };
+      } catch {
+        return new Response(JSON.stringify({ ok: false, error: "Invalid JSON body" }), {
+          status: 400,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+
+      const token = typeof body.token === "string" ? body.token.trim() : "";
+      if (!token || !isTokenAuthorized(token, env, "read")) {
+        return new Response(JSON.stringify({ ok: false, error: "Invalid token" }), {
+          status: 401,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+
+      return new Response(JSON.stringify({ ok: true }), {
+        headers: {
+          "Content-Type": "application/json",
+          "Set-Cookie": buildSessionCookie(request, token),
+        },
+      });
+    }
+
+    if (url.pathname === "/auth/session" && request.method === "DELETE") {
+      return new Response(JSON.stringify({ ok: true }), {
+        headers: {
+          "Content-Type": "application/json",
+          "Set-Cookie": clearSessionCookie(),
+        },
+      });
+    }
 
     if (url.pathname === "/health") {
       return new Response(

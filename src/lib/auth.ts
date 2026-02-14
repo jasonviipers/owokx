@@ -1,6 +1,7 @@
 import type { Env } from "../env.d";
 
 export type AuthScope = "read" | "trade" | "admin";
+const SESSION_COOKIE_NAME = "OWOKX_SESSION";
 
 function constantTimeCompare(a: string, b: string): boolean {
   if (a.length !== b.length) return false;
@@ -13,13 +14,30 @@ function constantTimeCompare(a: string, b: string): boolean {
 
 function getBearerToken(request: Request): string | null {
   const authHeader = request.headers.get("Authorization");
-  if (!authHeader?.startsWith("Bearer ")) return null;
-  const token = authHeader.slice(7);
-  return token.length > 0 ? token : null;
+  if (authHeader?.startsWith("Bearer ")) {
+    const token = authHeader.slice(7);
+    if (token.length > 0) return token;
+  }
+
+  const cookieHeader = request.headers.get("Cookie");
+  if (!cookieHeader) return null;
+  for (const part of cookieHeader.split(";")) {
+    const [rawName, ...valueParts] = part.trim().split("=");
+    if (rawName !== SESSION_COOKIE_NAME) continue;
+    const rawValue = valueParts.join("=");
+    if (!rawValue) return null;
+    try {
+      const decoded = decodeURIComponent(rawValue);
+      return decoded.length > 0 ? decoded : null;
+    } catch {
+      return rawValue.length > 0 ? rawValue : null;
+    }
+  }
+  return null;
 }
 
-export function isRequestAuthorized(request: Request, env: Env, scope: AuthScope): boolean {
-  const bearer = getBearerToken(request);
+export function isTokenAuthorized(token: string, env: Env, scope: AuthScope): boolean {
+  const bearer = token.trim();
   if (!bearer) return false;
 
   const legacy = env.OWOKX_API_TOKEN;
@@ -43,4 +61,10 @@ export function isRequestAuthorized(request: Request, env: Env, scope: AuthScope
   }
 
   return false;
+}
+
+export function isRequestAuthorized(request: Request, env: Env, scope: AuthScope): boolean {
+  const bearer = getBearerToken(request);
+  if (!bearer) return false;
+  return isTokenAuthorized(bearer, env, scope);
 }

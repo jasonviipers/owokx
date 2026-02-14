@@ -1,5 +1,5 @@
-import { describe, it, expect } from "vitest";
-import { isAllowedDomain, extractFinancialData } from "../providers/scraper";
+import { describe, expect, it } from "vitest";
+import { extractFinancialData, isAllowedDomain } from "../providers/scraper";
 
 describe("scraper", () => {
   describe("isAllowedDomain", () => {
@@ -27,14 +27,14 @@ describe("scraper", () => {
     it("should extract mentions of stock symbol", () => {
       const text = "AAPL closed at $150. AAPL is up today.";
       const result = extractFinancialData(text, "AAPL");
-      
+
       expect(result.mentions).toBe(2);
     });
 
     it("should extract price references", () => {
       const text = "Stock traded at $150.50 and $149.75 today";
       const result = extractFinancialData(text, "TEST");
-      
+
       expect(result.priceReferences).toContain("$150.50");
       expect(result.priceReferences).toContain("$149.75");
     });
@@ -42,7 +42,7 @@ describe("scraper", () => {
     it("should extract percentage changes", () => {
       const text = "Stock up +5.2% and down -3.1% during session";
       const result = extractFinancialData(text, "TEST");
-      
+
       expect(result.percentChanges).toContain("+5.2%");
       expect(result.percentChanges).toContain("-3.1%");
     });
@@ -50,15 +50,15 @@ describe("scraper", () => {
     it("should extract key financial phrases", () => {
       const text = "Company earnings beat expectations with revenue growth";
       const result = extractFinancialData(text, "TEST");
-      
+
       expect(result.keyPhrases.length).toBeGreaterThan(0);
-      expect(result.keyPhrases.some(p => p.toLowerCase().includes("earnings beat"))).toBe(true);
+      expect(result.keyPhrases.some((p) => p.toLowerCase().includes("earnings beat"))).toBe(true);
     });
 
     it("should limit results to prevent overflow", () => {
       const text = "$1 $2 $3 $4 $5 $6 $7 $8 $9 $10 $11 $12 $13";
       const result = extractFinancialData(text, "TEST");
-      
+
       expect(result.priceReferences.length).toBeLessThanOrEqual(10);
     });
   });
