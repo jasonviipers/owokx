@@ -26,34 +26,53 @@ interface StockTwitsTrendingResponse {
   symbols: StockTwitsTrending[];
 }
 
+const DEFAULT_REQUEST_TIMEOUT_MS = 8_000;
+const MAX_FEED_LIMIT = 100;
+
+function clampFeedLimit(limit: number): number {
+  return Math.max(1, Math.min(MAX_FEED_LIMIT, Math.floor(limit)));
+}
+
+async function fetchJson<T>(url: string, timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS): Promise<T> {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, { signal: controller.signal });
+    if (!response.ok) {
+      throw new Error(`Request failed (${response.status})`);
+    }
+    return (await response.json()) as T;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
 export class StockTwitsProvider {
   private baseUrl = "https://api.stocktwits.com/api/2";
 
   async getTrendingSymbols(): Promise<StockTwitsTrending[]> {
-    const response = await fetch(`${this.baseUrl}/trending/symbols.json`);
-    if (!response.ok) {
-      throw new Error(`StockTwits API error: ${response.status}`);
-    }
-    const data = (await response.json()) as StockTwitsTrendingResponse;
+    const data = await fetchJson<StockTwitsTrendingResponse>(`${this.baseUrl}/trending/symbols.json`);
     return data.symbols || [];
   }
 
   async getSymbolStream(symbol: string, limit = 30): Promise<StockTwitMessage[]> {
-    const response = await fetch(`${this.baseUrl}/streams/symbol/${symbol}.json?limit=${limit}`);
-    if (!response.ok) {
-      if (response.status === 404) return [];
-      throw new Error(`StockTwits API error: ${response.status}`);
+    const safeSymbol = encodeURIComponent(symbol.trim().toUpperCase());
+    const safeLimit = clampFeedLimit(limit);
+    try {
+      const data = await fetchJson<StockTwitsStreamResponse>(
+        `${this.baseUrl}/streams/symbol/${safeSymbol}.json?limit=${safeLimit}`
+      );
+      return data.messages || [];
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (message.includes("(404)")) return [];
+      throw new Error(`StockTwits API error for symbol ${safeSymbol}: ${message}`);
     }
-    const data = (await response.json()) as StockTwitsStreamResponse;
-    return data.messages || [];
   }
 
   async getTrendingStream(limit = 30): Promise<StockTwitMessage[]> {
-    const response = await fetch(`${this.baseUrl}/streams/trending.json?limit=${limit}`);
-    if (!response.ok) {
-      throw new Error(`StockTwits API error: ${response.status}`);
-    }
-    const data = (await response.json()) as StockTwitsStreamResponse;
+    const safeLimit = clampFeedLimit(limit);
+    const data = await fetchJson<StockTwitsStreamResponse>(`${this.baseUrl}/streams/trending.json?limit=${safeLimit}`);
     return data.messages || [];
   }
 
@@ -145,52 +164,49 @@ export class TradingViewProvider {
   async getTrendingMarkets(): Promise<TradingViewMarket[]> {
     // TradingView uses a different API structure - often requires auth or uses internal endpoints
     // This uses their public hotlists/screener data
-    const response = await fetch(`${this.baseUrl}/hotlists/?format=json&limit=50`);
-
-    if (!response.ok) {
-      throw new Error(`TradingView API error: ${response.status}`);
-    }
-
-    const data = (await response.json()) as TradingViewMarketsResponse;
+    const data = await fetchJson<TradingViewMarketsResponse>(`${this.baseUrl}/hotlists/?format=json&limit=50`);
     return data.data || [];
   }
 
   async getMarketIdeas(symbol: string, limit = 30): Promise<TradingViewIdea[]> {
     // Fetch ideas for a specific symbol/market
-    const response = await fetch(`${this.baseUrl}/ideas/${symbol}/?format=json&limit=${limit}`);
-
-    if (!response.ok) {
-      if (response.status === 404) return [];
-      throw new Error(`TradingView API error: ${response.status}`);
+    const safeSymbol = encodeURIComponent(symbol.trim().toUpperCase());
+    const safeLimit = clampFeedLimit(limit);
+    try {
+      const data = await fetchJson<TradingViewIdeasResponse>(
+        `${this.baseUrl}/ideas/${safeSymbol}/?format=json&limit=${safeLimit}`
+      );
+      return data.data || [];
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (message.includes("(404)")) return [];
+      throw new Error(`TradingView API error for symbol ${safeSymbol}: ${message}`);
     }
-
-    const data = (await response.json()) as TradingViewIdeasResponse;
-    return data.data || [];
   }
 
   async getTrendingIdeas(limit = 30): Promise<TradingViewIdea[]> {
     // Fetch trending ideas across all markets
-    const response = await fetch(`${this.baseUrl}/ideas/?format=json&sort=trending&limit=${limit}`);
-
-    if (!response.ok) {
-      throw new Error(`TradingView API error: ${response.status}`);
-    }
-
-    const data = (await response.json()) as TradingViewIdeasResponse;
+    const safeLimit = clampFeedLimit(limit);
+    const data = await fetchJson<TradingViewIdeasResponse>(
+      `${this.baseUrl}/ideas/?format=json&sort=trending&limit=${safeLimit}`
+    );
     return data.data || [];
   }
 
   async getUserIdeas(username: string, limit = 30): Promise<TradingViewIdea[]> {
     // Fetch ideas from a specific user
-    const response = await fetch(`${this.baseUrl}/u/${username}/ideas/?format=json&limit=${limit}`);
-
-    if (!response.ok) {
-      if (response.status === 404) return [];
-      throw new Error(`TradingView API error: ${response.status}`);
+    const safeUsername = encodeURIComponent(username.trim());
+    const safeLimit = clampFeedLimit(limit);
+    try {
+      const data = await fetchJson<TradingViewIdeasResponse>(
+        `${this.baseUrl}/u/${safeUsername}/ideas/?format=json&limit=${safeLimit}`
+      );
+      return data.data || [];
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (message.includes("(404)")) return [];
+      throw new Error(`TradingView API error for user ${safeUsername}: ${message}`);
     }
-
-    const data = (await response.json()) as TradingViewIdeasResponse;
-    return data.data || [];
   }
 
   analyzeSentiment(ideas: TradingViewIdea[]): {
@@ -249,7 +265,7 @@ export class TradingViewProvider {
   }
 
   // Helper to map old StockTwits format to TradingView format
-  static fromStockTwitsFormat(stockTwitsData: any): TradingViewIdea {
+  static fromStockTwitsFormat(stockTwitsData: StockTwitMessage): TradingViewIdea {
     return {
       id: stockTwitsData.id,
       description: stockTwitsData.body,
@@ -258,7 +274,7 @@ export class TradingViewProvider {
         username: stockTwitsData.user?.username,
         followers_count: stockTwitsData.user?.followers || 0,
       },
-      markets: (stockTwitsData.symbols || []).map((s: any) => ({
+      markets: (stockTwitsData.symbols || []).map((s) => ({
         name: s.symbol,
         exchange: "NASDAQ", // Default fallback
       })),
@@ -279,4 +295,6 @@ export function createTradingViewProvider(): TradingViewProvider {
 }
 
 // Backward compatibility alias
-export const createStockTwitsProvider = createTradingViewProvider;
+export function createStockTwitsProvider(): StockTwitsProvider {
+  return new StockTwitsProvider();
+}

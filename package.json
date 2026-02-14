@@ -20,6 +20,8 @@
     "format:check": "biome format src/",
     "check": "biome check src/",
     "check:fix": "biome check --write src/",
+    "secrets:scan": "node scripts/scan-secrets.mjs",
+    "hooks:install": "node scripts/setup-git-hooks.mjs",
     "test": "vitest",
     "test:run": "vitest run",
     "setup:access": "npx tsx scripts/setup-access.ts"

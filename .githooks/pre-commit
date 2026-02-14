@@ -1,0 +1,8 @@
+#!/usr/bin/env sh
+
+node scripts/scan-secrets.mjs --staged
+status=$?
+if [ "$status" -ne 0 ]; then
+  echo "Commit blocked by secret scanner."
+  exit "$status"
+fi

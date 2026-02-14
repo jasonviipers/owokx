@@ -7,8 +7,23 @@ on:
     branches: [main, master]
 
 jobs:
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Run secret scan
+        run: node scripts/scan-secrets.mjs
+
   test:
     runs-on: ubuntu-latest
+    needs: secrets
 
     steps:
       - name: Checkout
