@@ -134,11 +134,11 @@ jobs:
 
       - name: Set up Docker Buildx
         if: inputs.components == 'all' || inputs.components == 'dashboard'
-        uses: docker/setup-buildx-action@8d2750cb0e2ce4ba6d24279f8bcd3fd8bd4be1d3 # v3.12.0
+        uses: docker/setup-buildx-action@v3
 
       - name: Log in to GHCR
         if: inputs.components == 'all' || inputs.components == 'dashboard'
-        uses: docker/login-action@5e57cd1215c9c2bfeb5f430035f7aa7ec4cc15c7 # v3.4.0
+        uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -147,7 +147,7 @@ jobs:
       - name: Build and push dashboard image
         if: inputs.components == 'all' || inputs.components == 'dashboard'
         id: dashboard_image
-        uses: docker/build-push-action@263435318d21f672e57212dbd2013ff48475b5e2 # v6.18.0
+        uses: docker/build-push-action@v6
         with:
           context: ./dashboard
           file: ./dashboard/Dockerfile
