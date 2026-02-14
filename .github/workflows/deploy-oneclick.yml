@@ -31,7 +31,7 @@ jobs:
     steps:
       - name: Create GitHub deployment record
         id: gh_deploy
-        uses: actions/github-script@v7
+        uses: actions/github-script@f28e40c71b31f280037facc361f47a9f3d669158 # v7.1.0
         with:
           script: |
             const env = core.getInput('environment') || '${{ inputs.environment }}';
@@ -49,7 +49,7 @@ jobs:
             core.setOutput('deployment_id', String(res.data.id));
 
       - name: Mark deployment in progress
-        uses: actions/github-script@v7
+        uses: actions/github-script@f28e40c71b31f280037facc361f47a9f3d669158 # v7.1.0
         with:
           script: |
             const deployment_id = Number('${{ steps.gh_deploy.outputs.deployment_id }}');
@@ -62,15 +62,15 @@ jobs:
             });
 
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "20"
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@41ff72655975bd51cab0327fa583b6e92b6d3061 # v4.2.0
         with:
           version: 10
 
@@ -134,11 +134,11 @@ jobs:
 
       - name: Set up Docker Buildx
         if: inputs.components == 'all' || inputs.components == 'dashboard'
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750cb0e2ce4ba6d24279f8bcd3fd8bd4be1d3 # v3.12.0
 
       - name: Log in to GHCR
         if: inputs.components == 'all' || inputs.components == 'dashboard'
-        uses: docker/login-action@v3
+        uses: docker/login-action@5e57cd1215c9c2bfeb5f430035f7aa7ec4cc15c7 # v3.4.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -147,7 +147,7 @@ jobs:
       - name: Build and push dashboard image
         if: inputs.components == 'all' || inputs.components == 'dashboard'
         id: dashboard_image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@263435318d21f672e57212dbd2013ff48475b5e2 # v6.18.0
         with:
           context: ./dashboard
           file: ./dashboard/Dockerfile
@@ -157,7 +157,7 @@ jobs:
 
       - name: Setup kubectl
         if: inputs.components == 'all' || inputs.components == 'dashboard'
-        uses: azure/setup-kubectl@v4
+        uses: azure/setup-kubectl@776406b8848f4cc87c7547066f2f6e865edb0a51 # v4.0.1
         with:
           version: v1.30.0
 
@@ -212,7 +212,7 @@ jobs:
 
       - name: Upload deployment report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: deploy-report-${{ inputs.environment }}-${{ github.sha }}
           path: deploy-report.json
@@ -228,7 +228,7 @@ jobs:
 
       - name: Mark deployment success
         if: success()
-        uses: actions/github-script@v7
+        uses: actions/github-script@f28e40c71b31f280037facc361f47a9f3d669158 # v7.1.0
         with:
           script: |
             const deployment_id = Number('${{ steps.gh_deploy.outputs.deployment_id }}');
@@ -267,7 +267,7 @@ jobs:
 
       - name: Notify email (failure)
         if: failure() && secrets.SMTP_SERVER != '' && secrets.NOTIFY_EMAIL_TO != '' && secrets.NOTIFY_EMAIL_FROM != ''
-        uses: dawidd6/action-send-mail@v4
+        uses: dawidd6/action-send-mail@6118791332e603d34fcd7508e33217a8c8c5f73f # v4.0.1
         with:
           server_address: ${{ secrets.SMTP_SERVER }}
           server_port: ${{ secrets.SMTP_PORT }}
@@ -286,7 +286,7 @@ jobs:
 
       - name: Mark deployment failure
         if: failure()
-        uses: actions/github-script@v7
+        uses: actions/github-script@f28e40c71b31f280037facc361f47a9f3d669158 # v7.1.0
         with:
           script: |
             const deployment_id = Number('${{ steps.gh_deploy.outputs.deployment_id }}');
@@ -297,3 +297,4 @@ jobs:
               state: 'failure',
               description: 'Deployment failed',
             });
+
