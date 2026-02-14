@@ -15,7 +15,9 @@ export interface BrokerProviders {
 }
 
 export function resolveBroker(env: Env, preferred?: string | null): BrokerId {
-  const raw = (preferred ?? env.BROKER_PROVIDER ?? "alpaca").toLowerCase();
+  const raw = String(preferred ?? env.BROKER_PROVIDER ?? "alpaca")
+    .trim()
+    .toLowerCase();
   if (raw === "okx") return "okx";
   return "alpaca";
 }

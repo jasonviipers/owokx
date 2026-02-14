@@ -15,18 +15,44 @@ export function SettingsModal({ config, onSave, onClose, onReset }: SettingsModa
   const [resetting, setResetting] = useState(false)
   const [showResetConfirm, setShowResetConfirm] = useState(false)
   const [resetError, setResetError] = useState<string | null>(null)
-  const [apiToken, setApiToken] = useState(localStorage.getItem('OWOKX_API_TOKEN') || '')
+  const [apiToken, setApiToken] = useState('')
+  const [authMessage, setAuthMessage] = useState<string | null>(null)
+  const [authSaving, setAuthSaving] = useState(false)
 
   // Note: We intentionally do NOT sync localConfig with the config prop after initial mount.
   // This prevents the parent's polling (every 5s) from overwriting user's unsaved changes.
 
-  const handleTokenSave = () => {
-    if (apiToken) {
-      localStorage.setItem('OWOKX_API_TOKEN', apiToken)
-    } else {
-      localStorage.removeItem('OWOKX_API_TOKEN')
+  const handleTokenSave = async () => {
+    setAuthSaving(true)
+    setAuthMessage(null)
+    try {
+      const token = apiToken.trim()
+      if (token.length === 0) {
+        await fetch('/auth/session', {
+          method: 'DELETE',
+          credentials: 'include',
+        })
+        setAuthMessage('Session cleared')
+        return
+      }
+
+      const response = await fetch('/auth/session', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({ token }),
+      })
+      const data = await response.json().catch(() => ({}))
+      if (!response.ok || data?.ok === false) {
+        throw new Error(data?.error || 'Failed to save session')
+      }
+      setApiToken('')
+      setAuthMessage('Session saved')
+    } catch (error) {
+      setAuthMessage(`Auth failed: ${String(error)}`)
+    } finally {
+      setAuthSaving(false)
     }
-    window.location.reload()
   }
 
   const handleChange = <K extends keyof Config>(key: K, value: Config[K]) => {
@@ -103,12 +129,15 @@ export function SettingsModal({ config, onSave, onClose, onReset }: SettingsModa
                 onChange={e => setApiToken(e.target.value)}
                 placeholder="Enter owokx_API_TOKEN"
               />
-              <button className="hud-button" onClick={handleTokenSave}>
-                Save & Reload
+              <button className="hud-button" onClick={handleTokenSave} disabled={authSaving}>
+                {authSaving ? 'Saving...' : 'Save Session'}
               </button>
             </div>
+            {authMessage && (
+              <p className="text-[10px] text-hud-text mt-1">{authMessage}</p>
+            )}
             <p className="text-[9px] text-hud-text-dim mt-1">
-              Your owokx_API_TOKEN from Cloudflare secrets. Required for all API access.
+              Sets an HttpOnly session cookie for API access. Token is not stored in browser storage.
             </p>
           </div>
 

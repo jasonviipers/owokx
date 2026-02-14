@@ -7,6 +7,7 @@
 import type { Env } from "../env.d";
 import { AgentBase, type AgentBaseState } from "../lib/agents/base";
 import type { AgentMessage, AgentType } from "../lib/agents/protocol";
+import { createError, ErrorCode, OwokxError } from "../lib/errors";
 import { createLLMProvider } from "../providers/llm/factory";
 
 interface AnalysisCacheEntry {
@@ -558,7 +559,43 @@ Return JSON array:
 
   private parseJsonResponse(content: string): any {
     const cleaned = content.replace(/```json\n?|```/g, "").trim();
-    return JSON.parse(cleaned);
+    const firstBrace = cleaned.indexOf("{");
+    const lastBrace = cleaned.lastIndexOf("}");
+    const firstBracket = cleaned.indexOf("[");
+    const lastBracket = cleaned.lastIndexOf("]");
+
+    const objectCandidate =
+      firstBrace >= 0 && lastBrace > firstBrace ? cleaned.slice(firstBrace, lastBrace + 1).trim() : cleaned;
+    const arrayCandidate =
+      firstBracket >= 0 && lastBracket > firstBracket ? cleaned.slice(firstBracket, lastBracket + 1).trim() : cleaned;
+
+    const parseCandidates = [
+      cleaned,
+      objectCandidate,
+      arrayCandidate,
+      cleaned.replace(/,\s*([}\]])/g, "$1"),
+      objectCandidate.replace(/,\s*([}\]])/g, "$1"),
+      arrayCandidate.replace(/,\s*([}\]])/g, "$1"),
+    ].filter((candidate) => candidate.length > 0);
+
+    const seen = new Set<string>();
+    let parseError: string | null = null;
+    for (const candidate of parseCandidates) {
+      if (seen.has(candidate)) continue;
+      seen.add(candidate);
+      try {
+        return JSON.parse(candidate);
+      } catch (error) {
+        parseError = String(error);
+      }
+    }
+
+    throw createError(ErrorCode.PROVIDER_ERROR, "Model returned invalid JSON", {
+      parser: "json-recovery",
+      parse_error: parseError,
+      response_preview: cleaned.slice(0, 320),
+      candidate_count: parseCandidates.length,
+    });
   }
 
   private isLlmCircuitOpen(): boolean {
@@ -609,7 +646,15 @@ Return JSON array:
       return result;
     } catch (error) {
       this.markLlmFailure(String(error));
-      this.log("warn", "LLM call failed; fallback used", { context, error: String(error) });
+      const details =
+        error instanceof OwokxError && error.details && typeof error.details === "object"
+          ? (error.details as Record<string, unknown>)
+          : {};
+      this.log("warn", "LLM call failed; fallback used", {
+        context,
+        error: String(error),
+        ...details,
+      });
       return fallback;
     }
   }

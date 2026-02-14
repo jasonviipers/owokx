@@ -58,6 +58,26 @@ function isAuthFailure(error: unknown): boolean {
   );
 }
 
+function isProviderConfigFailure(error: unknown): boolean {
+  const message = String(error).toLowerCase();
+  return message.includes("not configured") || message.includes("available:");
+}
+
+function parseModelSpec(spec: string): { provider: SupportedProvider; modelId: string } {
+  const normalized = spec.trim();
+  const separator = normalized.includes(":") ? ":" : "/";
+  if (normalized.includes("/") || normalized.includes(":")) {
+    const parts = normalized.split(separator);
+    const providerCandidate = (parts[0] ?? "").toLowerCase() as SupportedProvider;
+    const modelId = parts.slice(1).join(separator).trim();
+    if (providerCandidate in SUPPORTED_PROVIDERS && modelId.length > 0) {
+      return { provider: providerCandidate, modelId };
+    }
+  }
+
+  return { provider: "openai", modelId: normalized };
+}
+
 /**
  * AI SDK Provider - Supports multiple AI providers via Vercel AI SDK
  *
@@ -113,13 +133,10 @@ export class AISDKProvider implements LLMProvider {
     let modelId = params.model ?? this.defaultModel;
     try {
       const modelSpec = params.model ?? this.defaultModel;
-
-      // Parse provider/model format (supports both / and : separators)
-      const separator = modelSpec.includes(":") ? ":" : "/";
-      const parts = modelSpec.split(separator);
-      const providerName = (parts[0] ?? "openai").toLowerCase() as SupportedProvider;
+      const parsedModel = parseModelSpec(modelSpec);
+      const providerName = parsedModel.provider;
       providerNameForLog = providerName;
-      modelId = parts.slice(1).join(separator) || modelSpec;
+      modelId = parsedModel.modelId;
 
       const runAttempt = async (
         selectedProvider: SupportedProvider,
@@ -160,46 +177,59 @@ export class AISDKProvider implements LLMProvider {
         };
       };
 
+      const availableProviders = this.getAvailableProviders();
+      const fallbackQueue: SupportedProvider[] = [
+        providerName,
+        ...availableProviders.filter((provider) => provider !== providerName),
+      ];
       let selectedProvider = providerName;
       let selectedModelId = modelId;
-      let attempt: { completion: CompletionResult; provider: SupportedProvider; model: string };
-      try {
-        attempt = await runAttempt(selectedProvider, selectedModelId);
-      } catch (error) {
-        if (!isAuthFailure(error)) {
-          throw error;
-        }
+      let attempt: { completion: CompletionResult; provider: SupportedProvider; model: string } | null = null;
+      let lastError: unknown = null;
 
-        const fallbackProvider = this.getAvailableProviders().find((candidate) => candidate !== providerName);
-        if (!fallbackProvider) {
-          throw error;
-        }
+      for (let i = 0; i < fallbackQueue.length; i += 1) {
+        const candidateProvider = fallbackQueue[i]!;
+        const candidateModel = i === 0 ? selectedModelId : (PROVIDER_MODELS[candidateProvider]?.[0] ?? selectedModelId);
 
-        const fallbackModel = PROVIDER_MODELS[fallbackProvider]?.[0] ?? selectedModelId;
-        providerNameForLog = fallbackProvider;
-        modelId = fallbackModel;
         try {
-          console.warn(
-            JSON.stringify({
-              provider: "llm",
-              engine: "ai-sdk",
-              level: "warn",
-              event: "provider_fallback",
-              from_provider: providerName,
-              from_model: selectedModelId,
-              to_provider: fallbackProvider,
-              to_model: fallbackModel,
-              reason: String(error),
-              timestamp: new Date().toISOString(),
-            })
-          );
-        } catch {
-          // ignore logging errors
+          attempt = await runAttempt(candidateProvider, candidateModel);
+          selectedProvider = candidateProvider;
+          selectedModelId = candidateModel;
+          break;
+        } catch (error) {
+          lastError = error;
+          if (!isAuthFailure(error) && !isProviderConfigFailure(error)) {
+            throw error;
+          }
+          if (i < fallbackQueue.length - 1) {
+            const nextProvider = fallbackQueue[i + 1]!;
+            const nextModel = PROVIDER_MODELS[nextProvider]?.[0] ?? selectedModelId;
+            providerNameForLog = nextProvider;
+            modelId = nextModel;
+            try {
+              console.warn(
+                JSON.stringify({
+                  provider: "llm",
+                  engine: "ai-sdk",
+                  level: "warn",
+                  event: "provider_fallback",
+                  from_provider: candidateProvider,
+                  from_model: candidateModel,
+                  to_provider: nextProvider,
+                  to_model: nextModel,
+                  reason: String(error),
+                  timestamp: new Date().toISOString(),
+                })
+              );
+            } catch {
+              // ignore logging errors
+            }
+          }
         }
+      }
 
-        selectedProvider = fallbackProvider;
-        selectedModelId = fallbackModel;
-        attempt = await runAttempt(fallbackProvider, fallbackModel);
+      if (!attempt) {
+        throw lastError ?? createError(ErrorCode.PROVIDER_ERROR, "No AI SDK provider succeeded");
       }
 
       const latencyMs = Date.now() - startedAt;

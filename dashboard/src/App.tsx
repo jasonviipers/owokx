@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, useCallback } from 'react'
+import { useState, useEffect, useMemo, useCallback, useRef } from 'react'
 import { motion, AnimatePresence } from 'motion/react'
 import clsx from 'clsx'
 import { Panel } from './components/Panel'
@@ -30,20 +30,21 @@ interface SetupStatusData {
   }
 }
 
-function getApiToken(): string {
-  return localStorage.getItem('OWOKX_API_TOKEN') || (window as unknown as { VITE_OWOKX_API_TOKEN?: string }).VITE_OWOKX_API_TOKEN || ''
-}
-
 function authFetch(url: string, options: RequestInit = {}): Promise<Response> {
-  const token = getApiToken()
   const headers = new Headers(options.headers)
-  if (token) {
-    headers.set('Authorization', `Bearer ${token}`)
-  }
   if (!headers.has('Content-Type') && options.body) {
     headers.set('Content-Type', 'application/json')
   }
-  return fetch(url, { ...options, headers })
+  return fetch(url, { ...options, headers, credentials: 'include' })
+}
+
+async function saveSessionToken(token: string): Promise<Response> {
+  return fetch('/auth/session', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    credentials: 'include',
+    body: JSON.stringify({ token }),
+  })
 }
 
 function resolveConfiguredApiOrigin(): string | null {
@@ -393,6 +394,8 @@ function generateMockPriceHistory(currentPrice: number, unrealizedPl: number, po
 export default function App() {
   const [status, setStatus] = useState<Status | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [authTokenInput, setAuthTokenInput] = useState('')
+  const [authSaving, setAuthSaving] = useState(false)
   const [showSettings, setShowSettings] = useState(false)
   const [showSetup, setShowSetup] = useState(false)
   const [enableCommandHint, setEnableCommandHint] = useState(() =>
@@ -410,6 +413,7 @@ export default function App() {
   const [activitySeverityFilter, setActivitySeverityFilter] = useState<ActivitySeverityFilter>('all')
   const [activityTimeRangeFilter, setActivityTimeRangeFilter] = useState<ActivityTimeRange>('24h')
   const [activityExpandedRows, setActivityExpandedRows] = useState<Record<string, boolean>>({})
+  const lastActivitySinceRef = useRef<number | null>(null)
   const [mobileView, setMobileView] = useState<'overview' | 'positions' | 'activity' | 'signals'>('overview')
   
   const [wasConnected, setWasConnected] = useState(false)
@@ -483,7 +487,7 @@ export default function App() {
 
     try {
       const params = new URLSearchParams()
-      params.set('limit', activityTimeRangeFilter === 'all' ? '2000' : '600')
+      params.set('limit', activityTimeRangeFilter === 'all' ? '250' : '120')
       if (activityEventTypeFilter !== 'all') {
         params.set('event_type', activityEventTypeFilter)
       }
@@ -493,7 +497,9 @@ export default function App() {
 
       const windowMs = timeRangeToMs(activityTimeRangeFilter)
       if (windowMs !== null) {
-        params.set('since', String(Date.now() - windowMs))
+        const windowStart = Date.now() - windowMs
+        const incrementalStart = lastActivitySinceRef.current
+        params.set('since', String(incrementalStart ? Math.max(windowStart, incrementalStart) : windowStart))
       }
 
       const res = await authFetch(`${API_BASE}/logs?${params.toString()}`)
@@ -502,6 +508,12 @@ export default function App() {
       const sorted = [...logs].sort((a, b) => getActivityTimestampMs(b) - getActivityTimestampMs(a))
       setActivityFeed(sorted)
       setActivityFeedReady(true)
+      if (sorted.length > 0) {
+        const newestMs = getActivityTimestampMs(sorted[0]!)
+        if (Number.isFinite(newestMs)) {
+          lastActivitySinceRef.current = newestMs + 1
+        }
+      }
     } catch {
       // Fallback stays on status payload logs when dedicated feed fetch fails.
     }
@@ -510,12 +522,13 @@ export default function App() {
   useEffect(() => {
     if (!setupChecked || showSetup) return
     fetchActivityFeed()
-    const interval = setInterval(fetchActivityFeed, 2000)
+    const interval = setInterval(fetchActivityFeed, 10000)
     return () => clearInterval(interval)
   }, [setupChecked, showSetup, fetchActivityFeed])
 
   useEffect(() => {
     setActivityExpandedRows({})
+    lastActivitySinceRef.current = null
   }, [activityEventTypeFilter, activitySeverityFilter, activityTimeRangeFilter])
 
   useEffect(() => {
@@ -574,6 +587,9 @@ export default function App() {
   const account = status?.account
   const positions = status?.positions || []
   const signals = status?.signals || []
+  const portfolioRisk = status?.portfolioRisk ?? null
+  const signalQuality = status?.signalQuality
+  const signalPerformance = status?.signalPerformance
   const logsFromStatus = status?.logs || []
   const agentEnabled = status?.enabled ?? null
 
@@ -767,6 +783,29 @@ export default function App() {
     }).filter(Boolean) as { label: string; data: number[]; variant: typeof positionColors[number] }[]
   }, [positions, positionPriceHistories])
 
+  const handleAuthTokenSave = useCallback(async () => {
+    const token = authTokenInput.trim()
+    if (!token) {
+      setError('Token is required')
+      return
+    }
+    setAuthSaving(true)
+    try {
+      const res = await saveSessionToken(token)
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok || data?.ok === false) {
+        throw new Error(data?.error || 'Authentication failed')
+      }
+      setAuthTokenInput('')
+      setError(null)
+      await fetchStatus()
+    } catch (e) {
+      setError(String(e))
+    } finally {
+      setAuthSaving(false)
+    }
+  }, [authTokenInput, fetchStatus])
+
   if (showSetup) {
     return <SetupWizard onComplete={() => setShowSetup(false)} />
   }
@@ -787,14 +826,15 @@ export default function App() {
                     type="password"
                     className="hud-input w-full mb-2"
                     placeholder="Enter OWOKX_API_TOKEN"
-                    defaultValue={localStorage.getItem('OWOKX_API_TOKEN') || ''}
-                    onChange={(e) => localStorage.setItem('OWOKX_API_TOKEN', e.target.value)}
+                    value={authTokenInput}
+                    onChange={(e) => setAuthTokenInput(e.target.value)}
                   />
                   <button
-                    onClick={() => window.location.reload()}
+                    onClick={handleAuthTokenSave}
                     className="hud-button w-full"
+                    disabled={authSaving}
                   >
-                    Save & Reload
+                    {authSaving ? 'Saving...' : 'Save Session'}
                   </button>
                 </div>
                 <p className="text-hud-text-dim text-xs">
@@ -1135,6 +1175,54 @@ export default function App() {
              <SwarmDashboard swarm={status?.swarm} />
           </div>
 
+          <div className="col-span-4 md:col-span-8 lg:col-span-12">
+            <Panel title="RISK & SIGNAL QUALITY" className="h-full">
+              <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+                <div className="space-y-2">
+                  <div className="hud-label text-hud-primary">PORTFOLIO RISK</div>
+                  <div className="grid grid-cols-2 gap-2">
+                    <MetricInline label="REGIME" value={portfolioRisk?.regime?.toUpperCase() || 'N/A'} />
+                    <MetricInline label="LEVERAGE" value={portfolioRisk ? `${portfolioRisk.leverage.toFixed(2)}x` : 'N/A'} />
+                    <MetricInline label="VOLATILITY" value={portfolioRisk ? formatRatioPercent(portfolioRisk.realizedVolatility, 2) : 'N/A'} />
+                    <MetricInline label="MAX DD" value={portfolioRisk ? formatRatioPercent(portfolioRisk.maxDrawdownPct, 2) : 'N/A'} />
+                    <MetricInline label="VaR 95" value={portfolioRisk ? formatRatioPercent(portfolioRisk.valueAtRisk95Pct, 2) : 'N/A'} />
+                    <MetricInline label="ES 95" value={portfolioRisk ? formatRatioPercent(portfolioRisk.expectedShortfall95Pct, 2) : 'N/A'} />
+                    <MetricInline label="TOP 3 CONC" value={portfolioRisk ? formatRatioPercent(portfolioRisk.concentrationTop3Pct, 1) : 'N/A'} />
+                    <MetricInline label="SHARPE*" value={portfolioRisk?.sharpeLike !== undefined ? portfolioRisk.sharpeLike.toFixed(2) : 'N/A'} />
+                  </div>
+                </div>
+
+                <div className="space-y-2">
+                  <div className="hud-label text-hud-primary">SIGNAL QUALITY</div>
+                  <div className="grid grid-cols-2 gap-2">
+                    <MetricInline label="SIGNALS" value={(signalQuality?.totalSignals ?? 0).toString()} />
+                    <MetricInline label="SYMBOLS" value={(signalQuality?.uniqueSymbols ?? 0).toString()} />
+                    <MetricInline label="OUTLIERS" value={(signalQuality?.outlierCount ?? 0).toString()} color={(signalQuality?.outlierCount || 0) > 0 ? 'warning' : undefined} />
+                    <MetricInline label="AVG CORR" value={signalQuality ? formatRatioPercent(signalQuality.averageCorrelation, 0) : 'N/A'} />
+                    <MetricInline label="MAX CORR" value={signalQuality ? formatRatioPercent(signalQuality.maxCorrelation, 0) : 'N/A'} color={(signalQuality?.maxCorrelation || 0) >= 0.8 ? 'error' : undefined} />
+                    <MetricInline label="FILTERED" value={(signalQuality?.filteredSymbols.length ?? 0).toString()} />
+                  </div>
+                  <div className="text-xs text-hud-text-dim">
+                    {(signalQuality?.highCorrelationPairs || []).slice(0, 2).map((pair) => `${pair.left}/${pair.right} ${formatRatioPercent(pair.correlation, 0)}`).join(' | ') || 'No high-correlation clusters detected'}
+                  </div>
+                </div>
+
+                <div className="space-y-2">
+                  <div className="hud-label text-hud-primary">SIGNAL ATTRIBUTION</div>
+                  <div className="grid grid-cols-2 gap-2">
+                    <MetricInline label="SAMPLES" value={(signalPerformance?.totalSamples ?? 0).toString()} />
+                    <MetricInline label="HIT RATE" value={signalPerformance ? formatRatioPercent(signalPerformance.hitRate, 1) : 'N/A'} />
+                    <MetricInline label="AVG RETURN" value={signalPerformance ? formatPercent(signalPerformance.avgReturnPct) : 'N/A'} color={(signalPerformance?.avgReturnPct || 0) >= 0 ? 'success' : 'error'} />
+                    <MetricInline label="TOP FACTOR" value={signalPerformance?.factorAttribution?.[0]?.factor || 'N/A'} />
+                  </div>
+                  <div className="text-xs text-hud-text-dim">
+                    {(signalPerformance?.topSymbols || []).slice(0, 2).map((row) => `${row.symbol} ${formatPercent(row.avgReturnPct)}`).join(' | ') || 'Insufficient closed-trade samples for attribution'}
+                  </div>
+                </div>
+              </div>
+            </Panel>
+          </div>
+
           {/* Row 3: Signals, Activity, Research */}
           <div className="col-span-4 lg:col-span-4">
             <Panel title="ACTIVE SIGNALS" titleRight={signals.length.toString()} className="h-100">
@@ -1472,6 +1560,17 @@ export default function App() {
                 <div className="grid grid-cols-2 gap-3">
                   <Metric label="SPENT" value={`$${costs.total_usd.toFixed(4)}`} size="md" />
                   <Metric label="CALLS" value={costs.calls.toString()} size="md" />
+                </div>
+              </Panel>
+
+              <Panel title="RISK SNAPSHOT">
+                <div className="grid grid-cols-2 gap-2">
+                  <MetricInline label="REGIME" value={portfolioRisk?.regime?.toUpperCase() || 'N/A'} />
+                  <MetricInline label="LEVERAGE" value={portfolioRisk ? `${portfolioRisk.leverage.toFixed(2)}x` : 'N/A'} />
+                  <MetricInline label="VaR 95" value={portfolioRisk ? formatRatioPercent(portfolioRisk.valueAtRisk95Pct, 1) : 'N/A'} />
+                  <MetricInline label="MAX CORR" value={signalQuality ? formatRatioPercent(signalQuality.maxCorrelation, 0) : 'N/A'} />
+                  <MetricInline label="OUTLIERS" value={(signalQuality?.outlierCount ?? 0).toString()} />
+                  <MetricInline label="HIT RATE" value={signalPerformance ? formatRatioPercent(signalPerformance.hitRate, 1) : 'N/A'} />
                 </div>
               </Panel>
             </>

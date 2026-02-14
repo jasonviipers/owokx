@@ -160,6 +160,11 @@ export interface StructuredEventRow {
   created_at: string;
 }
 
-export function createD1Client(db: D1Database): D1Client {
+export function createD1Client(db: D1Database | undefined | null): D1Client {
+  if (!db || typeof db.prepare !== "function") {
+    throw new Error(
+      'D1 binding "DB" is not configured. Ensure wrangler D1 binding name is "DB" and redeploy the Worker.'
+    );
+  }
   return new D1Client(db);
 }

@@ -220,6 +220,9 @@ export interface Status {
   overnightActivity?: OvernightActivity
   broker_error?: string
   swarm?: SwarmStatus
+  portfolioRisk?: PortfolioRisk | null
+  signalQuality?: SignalQuality
+  signalPerformance?: SignalPerformance
 }
 
 export interface AgentStatus {
@@ -234,4 +237,40 @@ export interface SwarmStatus {
   healthy: boolean
   active_agents: number
   agents: Record<string, AgentStatus>
+}
+
+export interface PortfolioRisk {
+  timestamp: number
+  regime: 'trending' | 'ranging' | 'volatile'
+  realizedVolatility: number
+  maxDrawdownPct: number
+  sharpeLike: number
+  valueAtRisk95Pct: number
+  expectedShortfall95Pct: number
+  grossExposureUsd: number
+  netExposureUsd: number
+  leverage: number
+  largestPositionPct: number
+  concentrationTop3Pct: number
+}
+
+export interface SignalQuality {
+  timestamp: number
+  totalSignals: number
+  uniqueSymbols: number
+  outlierCount: number
+  averageCorrelation: number
+  maxCorrelation: number
+  highCorrelationPairs: Array<{ left: string; right: string; correlation: number }>
+  filteredSymbols: string[]
+}
+
+export interface SignalPerformance {
+  timestamp: number
+  totalSamples: number
+  hitRate: number
+  avgReturnPct: number
+  topSymbols: Array<{ symbol: string; samples: number; winRate: number; avgReturnPct: number }>
+  laggingSymbols: Array<{ symbol: string; samples: number; winRate: number; avgReturnPct: number }>
+  factorAttribution: Array<{ factor: string; contribution: number }>
 }

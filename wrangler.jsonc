@@ -32,7 +32,7 @@
 			},
 			"d1_databases": [
 				{
-					"binding": "Okx_db",
+					"binding": "DB",
 					"database_name": "Okx-db",
 					"database_id": "7d388d30-92d0-4bd0-a13d-d4231b307f70",
 					"remote": true
@@ -40,7 +40,7 @@
 			],
 			"kv_namespaces": [
 				{
-					"binding": "okx_cache",
+					"binding": "CACHE",
 					"id": "99c5d6c0ae3c48409c255a094c4b8918",
 					"remote": true
 				}
@@ -128,7 +128,7 @@
 	// - DISCORD_WEBHOOK_URL
 	"d1_databases": [
 		{
-			"binding": "Okx_db",
+			"binding": "DB",
 			"database_name": "Okx-db",
 			"database_id": "7d388d30-92d0-4bd0-a13d-d4231b307f70",
 			"remote": true
@@ -136,7 +136,7 @@
 	],
 	"kv_namespaces": [
 		{
-			"binding": "okx_cache",
+			"binding": "CACHE",
 			"id": "99c5d6c0ae3c48409c255a094c4b8918",
 			"remote": true
 		}

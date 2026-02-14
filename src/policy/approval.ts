@@ -6,6 +6,9 @@ import {
   getApprovalByToken,
   getApprovalByTokenHash,
   markApprovalUsed,
+  markApprovalUsedByReservation,
+  releaseApprovalReservation,
+  reserveApproval,
 } from "../storage/d1/queries/approvals";
 
 export interface GenerateApprovalParams {
@@ -109,4 +112,37 @@ export async function validateApprovalToken(params: {
 
 export async function consumeApprovalToken(db: D1Client, approvalId: string): Promise<void> {
   await markApprovalUsed(db, approvalId);
+}
+
+export async function reserveApprovalToken(
+  db: D1Client,
+  approvalId: string,
+  reservationId: string,
+  ttlSeconds: number = 60
+): Promise<boolean> {
+  const reservedUntil = new Date(Date.now() + ttlSeconds * 1000).toISOString();
+  return reserveApproval(db, approvalId, reservationId, reservedUntil);
+}
+
+export async function consumeReservedApprovalToken(
+  db: D1Client,
+  approvalId: string,
+  reservationId: string
+): Promise<boolean> {
+  return markApprovalUsedByReservation(db, approvalId, reservationId);
+}
+
+export async function releaseReservedApprovalToken(
+  db: D1Client,
+  approvalId: string,
+  reservationId: string,
+  lastError?: unknown
+): Promise<boolean> {
+  const lastErrorJson = lastError
+    ? JSON.stringify({
+        message: String(lastError),
+        at: new Date().toISOString(),
+      })
+    : undefined;
+  return releaseApprovalReservation(db, approvalId, reservationId, lastErrorJson);
 }
