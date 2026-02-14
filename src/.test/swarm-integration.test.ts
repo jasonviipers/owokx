@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { Env } from "../env.d";
+import type { Env } from "../env";
 
 const { completeMock, executeOrderMock, createBrokerProvidersMock, createD1ClientMock } = vi.hoisted(() => ({
   completeMock: vi.fn(),
@@ -26,9 +26,9 @@ vi.mock("../storage/d1/client", () => ({
   createD1Client: createD1ClientMock,
 }));
 
-import { AnalystSimple } from "./analyst-simple";
-import { SwarmRegistry } from "./swarm-registry";
-import { TraderSimple } from "./trader-simple";
+import { AnalystSimple } from "../durable-objects/analyst-simple";
+import { SwarmRegistry } from "../durable-objects/swarm-registry";
+import { TraderSimple } from "../durable-objects/trader-simple";
 
 class MockStorage {
   private readonly data = new Map<string, unknown>();

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import type { Env } from "../env.d";
-import { SwarmRegistry } from "./swarm-registry";
+import type { Env } from "../env";
+import { SwarmRegistry } from "../durable-objects/swarm-registry";
 
 class MockStorage {
   private data = new Map<string, unknown>();

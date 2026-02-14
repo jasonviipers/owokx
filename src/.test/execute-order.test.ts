@@ -113,7 +113,7 @@ vi.mock("../storage/d1/queries/trades", () => {
   };
 });
 
-import { executeOrder } from "./execute-order";
+import { executeOrder } from "../execution/execute-order";
 
 function envStub() {
   return {

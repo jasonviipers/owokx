@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { ErrorCode } from "../../lib/errors";
-import { createOpenAIProvider, OpenAIProvider } from "./openai";
+import { ErrorCode } from "../lib/errors";
+import { createOpenAIProvider, OpenAIProvider } from "../providers/llm/openai";
 
 describe("OpenAI Provider", () => {
   const mockFetch = vi.fn();

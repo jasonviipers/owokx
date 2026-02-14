@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseBoolean } from "./utils";
+import { parseBoolean } from "../lib/utils";
 
 describe("utils.parseBoolean", () => {
   it("returns default for undefined", () => {

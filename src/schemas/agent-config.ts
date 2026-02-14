@@ -26,6 +26,8 @@ export const AgentConfigSchema = z
     llm_provider: z.enum(["openai-raw", "ai-sdk", "cloudflare-gateway"]),
     llm_model: z.string().min(1),
     llm_analyst_model: z.string().min(1),
+    llm_min_hold_minutes: z.number().min(0).max(1440),
+    starting_equity: z.number().positive().max(100000000).optional(),
 
     options_enabled: z.boolean(),
     options_min_confidence: z.number().min(0).max(1),
@@ -46,6 +48,7 @@ export const AgentConfigSchema = z
     crypto_stop_loss_pct: z.number().min(1).max(50),
 
     ticker_blacklist: z.array(z.string()),
+    allowed_exchanges: z.array(z.string()),
     allow_unhealthy_swarm: z.boolean().optional(),
   })
   .refine((data) => data.options_min_delta < data.options_max_delta, {

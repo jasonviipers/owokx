@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { ErrorCode } from "../../lib/errors";
+import { ErrorCode } from "../lib/errors";
 
 // Mock the AI SDK modules
 vi.mock("ai", () => ({
@@ -33,7 +33,7 @@ import { createOpenAI } from "@ai-sdk/openai";
 import { createXai } from "@ai-sdk/xai";
 // Import after mocks
 import { generateText } from "ai";
-import { AISDKProvider, createAISDKProvider, PROVIDER_MODELS, SUPPORTED_PROVIDERS } from "./ai-sdk";
+import { AISDKProvider, createAISDKProvider, PROVIDER_MODELS, SUPPORTED_PROVIDERS } from "../providers/llm/ai-sdk";
 
 const mockGenerateText = generateText as ReturnType<typeof vi.fn>;
 

@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { AlpacaClient } from "./client";
-import { AlpacaTradingProvider, createAlpacaTradingProvider } from "./trading";
+import type { AlpacaClient } from "../providers/alpaca/client";
+import { AlpacaTradingProvider, createAlpacaTradingProvider } from "../providers/alpaca/trading";
 
 describe("Alpaca Trading Provider", () => {
   let mockClient: {

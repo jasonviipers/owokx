@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { Env } from "../env.d";
+import type { Env } from "../env";
 
 const { executeOrderMock, createBrokerProvidersMock, createD1ClientMock } = vi.hoisted(() => ({
   executeOrderMock: vi.fn(),
@@ -19,7 +19,7 @@ vi.mock("../storage/d1/client", () => ({
   createD1Client: createD1ClientMock,
 }));
 
-import { TraderSimple } from "./trader-simple";
+import { TraderSimple } from "../durable-objects/trader-simple";
 
 class MockStorage {
   private data = new Map<string, unknown>();

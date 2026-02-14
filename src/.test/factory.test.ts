@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { Env } from "../../env.d";
+import type { Env } from "../env";
 
 describe("LLM Provider Factory", () => {
   afterEach(() => {
@@ -21,7 +21,7 @@ describe("LLM Provider Factory", () => {
         });
         vi.stubGlobal("fetch", fetchMock);
 
-        const { createLLMProvider } = await import("./factory");
+        const { createLLMProvider } = await import("../providers/llm/factory");
         const env = {
           OPENAI_API_KEY: "sk-test",
           LLM_PROVIDER: "openai-raw",
@@ -32,7 +32,7 @@ describe("LLM Provider Factory", () => {
       }, 10_000);
 
       it("returns null when OPENAI_API_KEY is missing", async () => {
-        const { createLLMProvider } = await import("./factory");
+        const { createLLMProvider } = await import("../providers/llm/factory");
         const env = {
           LLM_PROVIDER: "openai-raw",
         } as unknown as Env;
@@ -52,7 +52,7 @@ describe("LLM Provider Factory", () => {
         });
         vi.stubGlobal("fetch", fetchMock);
 
-        const { createLLMProvider } = await import("./factory");
+        const { createLLMProvider } = await import("../providers/llm/factory");
         const env = {
           OPENAI_API_KEY: "sk-test",
           LLM_PROVIDER: "openai-raw",
@@ -77,7 +77,7 @@ describe("LLM Provider Factory", () => {
         });
         vi.stubGlobal("fetch", fetchMock);
 
-        const { createLLMProvider } = await import("./factory");
+        const { createLLMProvider } = await import("../providers/llm/factory");
         const env = {
           OPENAI_API_KEY: "sk-test",
           LLM_PROVIDER: "openai-raw",
@@ -103,7 +103,7 @@ describe("LLM Provider Factory", () => {
         });
         vi.stubGlobal("fetch", fetchMock);
 
-        const { createLLMProvider } = await import("./factory");
+        const { createLLMProvider } = await import("../providers/llm/factory");
         const env = {
           OPENAI_API_KEY: "sk-test",
           LLM_PROVIDER: "openai-raw",
@@ -129,7 +129,7 @@ describe("LLM Provider Factory", () => {
         });
         vi.stubGlobal("fetch", fetchMock);
 
-        const { createLLMProvider } = await import("./factory");
+        const { createLLMProvider } = await import("../providers/llm/factory");
         const env = {
           OPENAI_API_KEY: "test",
           OPENAI_BASE_URL: "https://example.com/v1/",
@@ -169,7 +169,7 @@ describe("LLM Provider Factory", () => {
         vi.doMock("@ai-sdk/xai", () => ({ createXai: createXaiMock }));
         vi.doMock("@ai-sdk/deepseek", () => ({ createDeepSeek: createDeepSeekMock }));
 
-        const { createLLMProvider } = await import("./factory");
+        const { createLLMProvider } = await import("../providers/llm/factory");
         const env = {
           OPENAI_API_KEY: "sk-test",
           LLM_PROVIDER: "ai-sdk",
@@ -202,7 +202,7 @@ describe("LLM Provider Factory", () => {
         vi.doMock("@ai-sdk/xai", () => ({ createXai: createXaiMock }));
         vi.doMock("@ai-sdk/deepseek", () => ({ createDeepSeek: createDeepSeekMock }));
 
-        const { createLLMProvider } = await import("./factory");
+        const { createLLMProvider } = await import("../providers/llm/factory");
         const env = {
           ANTHROPIC_API_KEY: "sk-ant-test",
           LLM_PROVIDER: "ai-sdk",
@@ -215,7 +215,7 @@ describe("LLM Provider Factory", () => {
       });
 
       it("returns null when no API keys are set", async () => {
-        const { createLLMProvider } = await import("./factory");
+        const { createLLMProvider } = await import("../providers/llm/factory");
         const env = {
           LLM_PROVIDER: "ai-sdk",
           LLM_MODEL: "openai/gpt-4o",
@@ -231,7 +231,7 @@ describe("LLM Provider Factory", () => {
         );
         vi.doMock("@ai-sdk/openai", () => ({ createOpenAI: createOpenAIMock }));
 
-        const { createLLMProvider } = await import("./factory");
+        const { createLLMProvider } = await import("../providers/llm/factory");
         const env = {
           OPENAI_API_KEY: "sk-test",
           LLM_PROVIDER: "ai-sdk",
@@ -263,7 +263,7 @@ describe("LLM Provider Factory", () => {
         vi.doMock("@ai-sdk/xai", () => ({ createXai: createXaiMock }));
         vi.doMock("@ai-sdk/deepseek", () => ({ createDeepSeek: createDeepSeekMock }));
 
-        const { createLLMProvider } = await import("./factory");
+        const { createLLMProvider } = await import("../providers/llm/factory");
         const env = {
           OPENAI_API_KEY: "test",
           OPENAI_BASE_URL: "https://proxy.example/v1/",
@@ -301,7 +301,7 @@ describe("LLM Provider Factory", () => {
         vi.doMock("@ai-sdk/xai", () => ({ createXai: createXaiMock }));
         vi.doMock("@ai-sdk/deepseek", () => ({ createDeepSeek: createDeepSeekMock }));
 
-        const { createLLMProvider } = await import("./factory");
+        const { createLLMProvider } = await import("../providers/llm/factory");
         const env = {
           OPENAI_API_KEY: "test",
           OPENAI_BASE_URL: "   ",
@@ -329,7 +329,7 @@ describe("LLM Provider Factory", () => {
         });
         vi.stubGlobal("fetch", fetchMock);
 
-        const { createLLMProvider } = await import("./factory");
+        const { createLLMProvider } = await import("../providers/llm/factory");
         const env = {
           CLOUDFLARE_AI_GATEWAY_ACCOUNT_ID: "acc-123",
           CLOUDFLARE_AI_GATEWAY_ID: "gw-456",
@@ -343,7 +343,7 @@ describe("LLM Provider Factory", () => {
       });
 
       it("returns null when credentials are missing", async () => {
-        const { createLLMProvider } = await import("./factory");
+        const { createLLMProvider } = await import("../providers/llm/factory");
         const env = {
           LLM_PROVIDER: "cloudflare-gateway",
         } as unknown as Env;
@@ -353,7 +353,7 @@ describe("LLM Provider Factory", () => {
       });
 
       it("returns null when only account ID is set", async () => {
-        const { createLLMProvider } = await import("./factory");
+        const { createLLMProvider } = await import("../providers/llm/factory");
         const env = {
           CLOUDFLARE_AI_GATEWAY_ACCOUNT_ID: "acc-123",
           LLM_PROVIDER: "cloudflare-gateway",
@@ -376,7 +376,7 @@ describe("LLM Provider Factory", () => {
         });
         vi.stubGlobal("fetch", fetchMock);
 
-        const { createLLMProvider } = await import("./factory");
+        const { createLLMProvider } = await import("../providers/llm/factory");
         const env = {
           OPENAI_API_KEY: "sk-test",
         } as unknown as Env;
@@ -394,7 +394,7 @@ describe("LLM Provider Factory", () => {
         );
         vi.doMock("@ai-sdk/anthropic", () => ({ createAnthropic: createAnthropicMock }));
 
-        const { createLLMProvider } = await import("./factory");
+        const { createLLMProvider } = await import("../providers/llm/factory");
         const env = {
           ANTHROPIC_API_KEY: "sk-ant-test",
           LLM_PROVIDER: "openai-raw",

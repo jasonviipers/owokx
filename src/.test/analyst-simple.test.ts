@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { Env } from "../env.d";
+import type { Env } from "../env";
 
 const { completeMock } = vi.hoisted(() => ({
   completeMock: vi.fn(),
@@ -11,7 +11,7 @@ vi.mock("../providers/llm/factory", () => ({
   })),
 }));
 
-import { AnalystSimple } from "./analyst-simple";
+import { AnalystSimple } from "../durable-objects/analyst-simple";
 
 class MockStorage {
   private data = new Map<string, unknown>();

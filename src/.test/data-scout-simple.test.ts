@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { Env } from "../env.d";
-import { DataScoutSimple } from "./data-scout-simple";
+import type { Env } from "../env";
+import { DataScoutSimple } from "../durable-objects/data-scout-simple";
 
 class MockStorage {
   private data = new Map<string, unknown>();

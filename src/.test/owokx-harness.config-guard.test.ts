@@ -1,11 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
-import type { Env } from "../env.d";
+import type { Env } from "../env";
 
 vi.mock("../providers/llm/factory", () => ({
   createLLMProvider: vi.fn(() => null),
 }));
 
-import { OwokxHarness } from "./owokx-harness";
+import { OwokxHarness } from "../durable-objects/owokx-harness";
 
 class MockStorage {
   private data = new Map<string, unknown>();

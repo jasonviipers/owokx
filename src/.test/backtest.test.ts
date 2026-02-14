@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { BacktestBrokerProvider, BacktestMarketDataProvider } from "./backtest";
+import { BacktestBrokerProvider, BacktestMarketDataProvider } from "../providers/backtest";
 
 describe("Backtest providers", () => {
   it("fills market buy/sell and updates cash/positions", async () => {

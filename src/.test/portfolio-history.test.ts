@@ -4,7 +4,7 @@ import {
   downsampleEquityPoints,
   periodWindowMs,
   timeframeBucketMs,
-} from "./portfolio-history";
+} from "../lib/portfolio-history";
 
 describe("portfolio-history", () => {
   it("parses standard period windows", () => {

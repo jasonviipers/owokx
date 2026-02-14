@@ -49,6 +49,7 @@ import {
 import { type BrokerProviders, createBrokerProviders } from "../providers/broker-factory";
 import { createLLMProvider } from "../providers/llm/factory";
 import type { Account, LLMProvider, MarketClock, Position, Snapshot } from "../providers/types";
+import { safeValidateAgentConfig } from "../schemas/agent-config";
 import { createD1Client } from "../storage/d1/client";
 import { createDecision } from "../storage/d1/queries/decisions";
 
@@ -2160,7 +2161,35 @@ export class OwokxHarness extends DurableObject<Env> {
       );
     }
 
-    this.state.config = { ...this.state.config, ...body };
+    const candidateConfig = { ...this.state.config, ...body };
+    const parsedConfig = safeValidateAgentConfig(candidateConfig);
+    if (!parsedConfig.success) {
+      this.log("System", "config_update_rejected", {
+        reason: "schema_validation_failed",
+        changed_keys: changedKeys,
+        validation_errors: parsedConfig.error.flatten(),
+        severity: "error",
+        status: "failed",
+        event_type: "api",
+      });
+      return new Response(
+        JSON.stringify(
+          {
+            ok: false,
+            error: "Invalid configuration payload",
+            details: parsedConfig.error.flatten(),
+          },
+          null,
+          2
+        ),
+        {
+          status: 400,
+          headers: { "Content-Type": "application/json" },
+        }
+      );
+    }
+
+    this.state.config = parsedConfig.data;
     this.enforceProductionSwarmGuard();
     this.state.optimization.adaptiveDataPollIntervalMs = this.state.config.data_poll_interval_ms;
     this.state.optimization.adaptiveAnalystIntervalMs = this.state.config.analyst_interval_ms;

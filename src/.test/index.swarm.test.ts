@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
-import type { Env } from "./env.d";
+import type { Env } from "../env.d";
 
-vi.mock("./mcp/agent", () => ({
+vi.mock("../mcp/agent", () => ({
   OwokxMcpAgent: {
     mount: () => ({
       fetch: async () => new Response(JSON.stringify({ ok: true }), { status: 200 }),
@@ -9,14 +9,14 @@ vi.mock("./mcp/agent", () => ({
   },
 }));
 
-vi.mock("./durable-objects/owokx-harness", () => ({
+vi.mock("../durable-objects/owokx-harness", () => ({
   getHarnessStub: () =>
     ({
       fetch: async () => new Response(JSON.stringify({ ok: true }), { status: 200 }),
     }) as unknown as DurableObjectStub,
 }));
 
-import worker from "./index";
+import worker from "../index";
 
 function createId(id: string): DurableObjectId {
   return { toString: () => id } as unknown as DurableObjectId;

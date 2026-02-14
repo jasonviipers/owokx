@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { hasExplicitOkxQuote, normalizeOkxSymbol } from "./symbols";
+import { hasExplicitOkxQuote, normalizeOkxSymbol } from "../providers/okx/symbols";
 
 describe("OKX symbol normalization", () => {
   it("maps USD quote symbols to configured default quote", () => {

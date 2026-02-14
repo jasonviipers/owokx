@@ -7,7 +7,7 @@ const configDir = fileURLToPath(new URL(".", import.meta.url));
 export default defineConfig({
   resolve: {
     alias: {
-      "cloudflare:workers": resolve(configDir, "src/test/cloudflare-workers.mock.ts"),
+      "cloudflare:workers": resolve(configDir, "src/.test/cloudflare-workers.mock.ts"),
     },
   },
   test: {

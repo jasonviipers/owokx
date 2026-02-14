@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { ErrorCode } from "../../lib/errors";
-import { CloudflareGatewayProvider, createCloudflareGatewayProvider } from "./cloudflare-gateway";
+import { ErrorCode } from "../lib/errors";
+import { CloudflareGatewayProvider, createCloudflareGatewayProvider } from "../providers/llm/cloudflare-gateway";
 
 describe("Cloudflare Gateway Provider", () => {
   const mockFetch = vi.fn();

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { createOkxClient } from "./client";
+import { createOkxClient } from "../providers/okx/client";
 
 const hasCreds = !!process.env.OKX_API_KEY && !!process.env.OKX_SECRET && !!process.env.OKX_PASSPHRASE;
 const simulated = (process.env.OKX_SIMULATED_TRADING ?? "").toLowerCase() === "true";

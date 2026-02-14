@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { ErrorCode } from "../../lib/errors";
-import { AlpacaClient, createAlpacaClient } from "./client";
+import { ErrorCode } from "../lib/errors";
+import { AlpacaClient, createAlpacaClient } from "../providers/alpaca/client";
 
 describe("Alpaca Client", () => {
   const mockFetch = vi.fn();
