@@ -52,6 +52,10 @@ import type { Account, LLMProvider, MarketClock, Position, Snapshot } from "../p
 import { safeValidateAgentConfig } from "../schemas/agent-config";
 import { createD1Client } from "../storage/d1/client";
 import { createDecision } from "../storage/d1/queries/decisions";
+import { createHarnessContext } from "./harness/context";
+import { createResearchService, type ResearchService } from "./harness/research-service";
+import { createSignalService, type SignalService } from "./harness/signal-service";
+import type { HarnessContext } from "./harness/types";
 
 // ============================================================================
 // SECTION 1: TYPES & CONFIGURATION
@@ -1149,12 +1153,26 @@ function detectSentiment(text: string): number {
 export class OwokxHarness extends DurableObject<Env> {
   private state: AgentState = { ...DEFAULT_STATE };
   private _llm: LLMProvider | null = null;
+  private readonly harnessContext: HarnessContext<AgentState>;
+  private readonly signalService: SignalService;
+  private readonly researchService: ResearchService<ResearchResult>;
   private lastLogPersistAt = 0;
   private logPersistTimerArmed = false;
   private lastSwarmBypassLogAt = 0;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
+    this.harnessContext = createHarnessContext({
+      env: this.env,
+      getState: () => this.state,
+      getLLM: () => this._llm,
+    });
+    this.signalService = createSignalService(this.harnessContext, {
+      runDataGatherers: () => this.runDataGatherers(),
+    });
+    this.researchService = createResearchService<ResearchResult>(this.harnessContext, {
+      researchTopSignals: (limit?: number) => this.researchTopSignals(limit),
+    });
 
     this._llm = createLLMProvider(env);
     if (this._llm) {
@@ -1511,12 +1529,12 @@ export class OwokxHarness extends DurableObject<Env> {
       const clock = await broker.trading.getClock();
 
       if (now - this.state.lastDataGatherRun >= dataPollIntervalMs) {
-        await this.runDataGatherers();
+        await this.signalService.runDataGatherers();
         this.state.lastDataGatherRun = now;
       }
 
       if (now - this.state.lastResearchRun >= researchIntervalMs) {
-        await this.researchTopSignals(5);
+        await this.researchService.researchTopSignals(5);
         this.state.lastResearchRun = now;
       }
 
@@ -6964,7 +6982,7 @@ Response format:
       researched: Object.keys(this.state.signalResearch).length,
     });
 
-    const signalResearch = await this.researchTopSignals(10);
+    const signalResearch = await this.researchService.researchTopSignals(10);
     const analysis = await this.analyzeSignalsWithLLM(this.state.signalCache, positions, account);
 
     this.state.premarketPlan = {
