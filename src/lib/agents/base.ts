@@ -1,5 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "../../env.d";
+import { resolveShardKey } from "../sharding";
 import {
   type AgentMessage,
   type AgentStatus,
@@ -329,7 +330,7 @@ export abstract class AgentBase<TState extends AgentBaseState = AgentBaseState> 
     if (!this.env.SWARM_REGISTRY || this.agentType === "registry") {
       return null;
     }
-    const registryId = this.env.SWARM_REGISTRY.idFromName("default");
+    const registryId = this.env.SWARM_REGISTRY.idFromName(resolveShardKey(this.env.OWOKX_SHARD_KEY, "default"));
     return this.env.SWARM_REGISTRY.get(registryId);
   }
 
@@ -352,7 +353,7 @@ export abstract class AgentBase<TState extends AgentBaseState = AgentBaseState> 
     if (!this.env.SWARM_REGISTRY) return;
 
     try {
-      const registryId = this.env.SWARM_REGISTRY.idFromName("default");
+      const registryId = this.env.SWARM_REGISTRY.idFromName(resolveShardKey(this.env.OWOKX_SHARD_KEY, "default"));
       const registry = this.env.SWARM_REGISTRY.get(registryId);
       const message: AgentMessage = {
         id: createMessageId("heartbeat"),

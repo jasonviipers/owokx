@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { validateAgentMethod } from "./lib/http-guards";
+import { validateAgentMethod } from "../lib/http-guards";
 
 describe("validateAgentMethod", () => {
   it("rejects GET on post-only mutation endpoints", () => {

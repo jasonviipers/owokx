@@ -69,6 +69,8 @@ export interface Env {
   DEFAULT_COOLDOWN_MINUTES: string;
   DEFAULT_MAX_OPEN_POSITIONS: string;
   DEFAULT_APPROVAL_TTL_SECONDS: string;
+  OWOKX_SHARD_KEY?: string;
+  OWOKX_HARNESS_SHARD_KEY?: string;
 }
 
 declare module "cloudflare:workers" {

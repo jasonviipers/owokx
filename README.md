@@ -96,6 +96,10 @@ npx wrangler secret put OPENAI_API_KEY
 npx wrangler secret put TWITTER_BEARER_TOKEN
 npx wrangler secret put DISCORD_WEBHOOK_URL
 npx wrangler secret put ALPHA_VANTAGE_API_KEY
+
+# Optional shard routing vars (wrangler vars, not secrets)
+# OWOKX_SHARD_KEY="default"         # shared key for registry/scout/analyst/trader/risk/learning
+# OWOKX_HARNESS_SHARD_KEY="main"    # key for the harness Durable Object
 ```
 
 ### 4. Run locally

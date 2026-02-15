@@ -3,6 +3,7 @@ import type { Env } from "./env.d";
 import { handleCronEvent } from "./jobs/cron";
 import { isRequestAuthorized, isSessionTokenMutationAllowed, isTokenAuthorized } from "./lib/auth";
 import { validateAgentMethod } from "./lib/http-guards";
+import { resolveShardKey } from "./lib/sharding";
 import { OwokxMcpAgent } from "./mcp/agent";
 
 export { SessionDO } from "./durable-objects/session";
@@ -52,7 +53,7 @@ function clearSessionCookie(): string {
 }
 
 function getRegistryStub(env: Env): DurableObjectStub {
-  const registryId = env.SWARM_REGISTRY.idFromName("default");
+  const registryId = env.SWARM_REGISTRY.idFromName(resolveShardKey(env.OWOKX_SHARD_KEY, "default"));
   return env.SWARM_REGISTRY.get(registryId);
 }
 
@@ -177,8 +178,8 @@ export default {
       if (!isRequestAuthorized(request, env, "read")) {
         return unauthorizedResponse();
       }
-      const dataScoutId = env.DATA_SCOUT.idFromName("default");
-      const dataScout = env.DATA_SCOUT.get(dataScoutId);
+      const dataScoutShard = resolveShardKey(env.OWOKX_SHARD_KEY, "default");
+      const dataScout = env.DATA_SCOUT.get(env.DATA_SCOUT.idFromName(dataScoutShard));
       const dataScoutPath = url.pathname.replace("/data-scout", "") || "/health";
       const dataScoutUrl = new URL(dataScoutPath, "http://data-scout");
       dataScoutUrl.search = url.search;
@@ -195,8 +196,7 @@ export default {
       if (!isRequestAuthorized(request, env, "read")) {
         return unauthorizedResponse();
       }
-      const analystId = env.ANALYST.idFromName("default");
-      const analyst = env.ANALYST.get(analystId);
+      const analyst = env.ANALYST.get(env.ANALYST.idFromName(resolveShardKey(env.OWOKX_SHARD_KEY, "default")));
       const analystPath = url.pathname.replace("/analyst", "") || "/health";
       const analystUrl = new URL(analystPath, "http://analyst");
       analystUrl.search = url.search;
@@ -213,8 +213,7 @@ export default {
       if (!isRequestAuthorized(request, env, "trade")) {
         return unauthorizedResponse();
       }
-      const traderId = env.TRADER.idFromName("default");
-      const trader = env.TRADER.get(traderId);
+      const trader = env.TRADER.get(env.TRADER.idFromName(resolveShardKey(env.OWOKX_SHARD_KEY, "default")));
       const traderPath = url.pathname.replace("/trader", "") || "/health";
       const traderUrl = new URL(traderPath, "http://trader");
       traderUrl.search = url.search;
@@ -471,8 +470,9 @@ export default {
       if (!isRequestAuthorized(request, env, "read")) {
         return unauthorizedResponse();
       }
-      const riskId = env.RISK_MANAGER.idFromName("default");
-      const riskManager = env.RISK_MANAGER.get(riskId);
+      const riskManager = env.RISK_MANAGER.get(
+        env.RISK_MANAGER.idFromName(resolveShardKey(env.OWOKX_SHARD_KEY, "default"))
+      );
       const riskPath = url.pathname.replace("/risk-manager", "") || "/health";
       const riskUrl = new URL(riskPath, "http://risk-manager");
       riskUrl.search = url.search;
@@ -495,8 +495,9 @@ export default {
           headers: { "Content-Type": "application/json" },
         });
       }
-      const learningId = env.LEARNING_AGENT.idFromName("default");
-      const learningAgent = env.LEARNING_AGENT.get(learningId);
+      const learningAgent = env.LEARNING_AGENT.get(
+        env.LEARNING_AGENT.idFromName(resolveShardKey(env.OWOKX_SHARD_KEY, "default"))
+      );
       const learningPath = url.pathname.replace("/learning", "") || "/health";
       const learningUrl = new URL(learningPath, "http://learning");
       learningUrl.search = url.search;

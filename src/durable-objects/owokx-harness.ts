@@ -46,12 +46,16 @@ import {
   periodWindowMs,
   timeframeBucketMs,
 } from "../lib/portfolio-history";
+import { resolveShardKey } from "../lib/sharding";
 import { type BrokerProviders, createBrokerProviders } from "../providers/broker-factory";
 import { createLLMProvider } from "../providers/llm/factory";
-import type { Account, LLMProvider, MarketClock, Position, Snapshot } from "../providers/types";
+import type { Account, CompletionParams, CompletionResult, LLMProvider, MarketClock, Position, Snapshot } from "../providers/types";
 import { safeValidateAgentConfig } from "../schemas/agent-config";
+import type { D1Client } from "../storage/d1/client";
 import { createD1Client } from "../storage/d1/client";
+import { insertActivityLog, queryActivityLogs } from "../storage/d1/queries/activity-logs";
 import { createDecision } from "../storage/d1/queries/decisions";
+import { insertPortfolioSnapshot, queryPortfolioSnapshots } from "../storage/d1/queries/portfolio-snapshots";
 
 // ============================================================================
 // SECTION 1: TYPES & CONFIGURATION
@@ -152,6 +156,7 @@ interface PositionEntry {
   symbol: string;
   entry_time: number;
   entry_price: number;
+  entry_confidence?: number;
   entry_sentiment: number;
   entry_social_volume: number;
   entry_sources: string[];
@@ -365,6 +370,44 @@ interface OptimizationState {
   optimizationRuns: number;
 }
 
+type LLMTaskType = "research" | "analyst" | "position" | "crypto";
+type PromptTier = "lean" | "standard" | "deep";
+
+interface LLMModelRouteStats {
+  calls: number;
+  successes: number;
+  failures: number;
+  parseFailures: number;
+  latencyEmaMs: number;
+  costEmaUsd: number;
+  lastUsedAt: number;
+}
+
+interface LLMRoutingState {
+  perModel: Record<string, LLMModelRouteStats>;
+  confidenceCalibrationEmaError: number;
+  confidenceScale: number;
+  calibrationSamples: number;
+  selectorWeights: {
+    quality: number;
+    latency: number;
+    cost: number;
+    failurePenalty: number;
+    parsePenalty: number;
+  };
+  gating: {
+    baseBias: number;
+    stressPenalty: number;
+    volatilePenalty: number;
+    trendingRelief: number;
+    sellRelief: number;
+    calibrationPenaltyWeight: number;
+    parsePenaltyWeight: number;
+  };
+  lastSelectionReason: string;
+  lastUpdatedAt: number;
+}
+
 interface SymbolToolContext {
   technical: {
     rsi14: number | null;
@@ -418,6 +461,7 @@ interface AgentState {
   predictiveModel: PredictiveModelState;
   lastStressTest: StressTestResult | null;
   optimization: OptimizationState;
+  llmRouting: LLMRoutingState;
   lastSwarmRoleSyncAt: number;
   swarmRoleHealth: Partial<Record<"scout" | "analyst" | "trader" | "risk_manager" | "learning", number>>;
   premarketPlan: PremarketPlan | null;
@@ -599,6 +643,31 @@ const DEFAULT_OPTIMIZATION_STATE: OptimizationState = {
   optimizationRuns: 0,
 };
 
+const DEFAULT_LLM_ROUTING_STATE: LLMRoutingState = {
+  perModel: {},
+  confidenceCalibrationEmaError: 0.2,
+  confidenceScale: 1,
+  calibrationSamples: 0,
+  selectorWeights: {
+    quality: 0.52,
+    latency: 0.18,
+    cost: 0.14,
+    failurePenalty: 0.18,
+    parsePenalty: 0.32,
+  },
+  gating: {
+    baseBias: 0,
+    stressPenalty: 0.06,
+    volatilePenalty: 0.05,
+    trendingRelief: 0.02,
+    sellRelief: 0.03,
+    calibrationPenaltyWeight: 0.18,
+    parsePenaltyWeight: 0.08,
+  },
+  lastSelectionReason: "default",
+  lastUpdatedAt: 0,
+};
+
 const DEFAULT_STATE: AgentState = {
   config: DEFAULT_CONFIG,
   signalCache: [],
@@ -629,6 +698,7 @@ const DEFAULT_STATE: AgentState = {
   predictiveModel: { ...DEFAULT_PREDICTIVE_MODEL, weights: { ...DEFAULT_PREDICTIVE_MODEL.weights }, perSymbol: {} },
   lastStressTest: null,
   optimization: { ...DEFAULT_OPTIMIZATION_STATE },
+  llmRouting: { ...DEFAULT_LLM_ROUTING_STATE, perModel: {} },
   lastSwarmRoleSyncAt: 0,
   swarmRoleHealth: {},
   premarketPlan: null,
@@ -931,6 +1001,7 @@ class ValidTickerCache {
   private lastSecRefresh = 0;
   private alpacaCache: Map<string, boolean> = new Map();
   private readonly SEC_REFRESH_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
+  private readonly MAX_ALPACA_CACHE_ENTRIES = 4_000;
 
   async refreshSecTickersIfNeeded(): Promise<void> {
     if (this.secTickers && Date.now() - this.lastSecRefresh < this.SEC_REFRESH_INTERVAL_MS) {
@@ -959,6 +1030,7 @@ class ValidTickerCache {
 
   setCachedValidation(symbol: string, isValid: boolean): void {
     this.alpacaCache.set(symbol.toUpperCase(), isValid);
+    this.pruneAlpacaCache();
   }
 
   async validateWithBroker(
@@ -973,10 +1045,24 @@ class ValidTickerCache {
       const asset = await broker.trading.getAsset(upper);
       const isValid = asset !== null && asset.tradable;
       this.alpacaCache.set(upper, isValid);
+      this.pruneAlpacaCache();
       return isValid;
     } catch {
       this.alpacaCache.set(upper, false);
+      this.pruneAlpacaCache();
       return false;
+    }
+  }
+
+  private pruneAlpacaCache(): void {
+    const overflow = this.alpacaCache.size - this.MAX_ALPACA_CACHE_ENTRIES;
+    if (overflow <= 0) return;
+
+    const it = this.alpacaCache.keys();
+    for (let i = 0; i < overflow; i++) {
+      const next = it.next();
+      if (next.done) break;
+      this.alpacaCache.delete(next.value);
     }
   }
 }
@@ -1138,9 +1224,17 @@ export class OwokxHarness extends DurableObject<Env> {
   private lastLogPersistAt = 0;
   private logPersistTimerArmed = false;
   private lastSwarmBypassLogAt = 0;
+  private isAlarmRunning = false;
+  private alarmRunStartedAt = 0;
+  private readonly alarmReentrancyStaleMs = 5 * 60_000;
+  private readonly serviceShardKey: string;
+  private readonly l1ReadCache = new Map<string, { expiresAt: number; payload: unknown }>();
+  private readonly inFlightReads = new Map<string, Promise<unknown>>();
+  private readonly maxL1ReadCacheEntries = 128;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
+    this.serviceShardKey = resolveShardKey(env.OWOKX_SHARD_KEY, "default");
 
     this._llm = createLLMProvider(env);
     if (this._llm) {
@@ -1194,6 +1288,19 @@ export class OwokxHarness extends DurableObject<Env> {
         this.state.optimization = {
           ...DEFAULT_OPTIMIZATION_STATE,
           ...(this.state.optimization ?? {}),
+        };
+        this.state.llmRouting = {
+          ...DEFAULT_LLM_ROUTING_STATE,
+          ...(this.state.llmRouting ?? {}),
+          perModel: { ...(this.state.llmRouting?.perModel ?? {}) },
+          selectorWeights: {
+            ...DEFAULT_LLM_ROUTING_STATE.selectorWeights,
+            ...(this.state.llmRouting?.selectorWeights ?? {}),
+          },
+          gating: {
+            ...DEFAULT_LLM_ROUTING_STATE.gating,
+            ...(this.state.llmRouting?.gating ?? {}),
+          },
         };
         if (!Array.isArray(this.state.logs)) {
           this.state.logs = [];
@@ -1295,7 +1402,7 @@ export class OwokxHarness extends DurableObject<Env> {
 
     if (this.env.RISK_MANAGER) {
       try {
-        const id = this.env.RISK_MANAGER.idFromName("default");
+        const id = this.env.RISK_MANAGER.idFromName(this.serviceShardKey);
         const stub = this.env.RISK_MANAGER.get(id);
         const res = await stub.fetch("http://risk/status");
         if (res.ok) {
@@ -1326,7 +1433,7 @@ export class OwokxHarness extends DurableObject<Env> {
     }
 
     try {
-      const id = this.env.SWARM_REGISTRY.idFromName("default");
+      const id = this.env.SWARM_REGISTRY.idFromName(this.serviceShardKey);
       const stub = this.env.SWARM_REGISTRY.get(id);
 
       const res = await stub.fetch("http://registry/health");
@@ -1447,22 +1554,37 @@ export class OwokxHarness extends DurableObject<Env> {
   }
 
   async alarm(): Promise<void> {
-    if (!this.state.enabled) {
-      this.log("System", "alarm_skipped", { reason: "Agent not enabled" });
-      await this.persist();
-      return;
+    const runStartedAt = Date.now();
+    if (this.isAlarmRunning) {
+      const elapsed = runStartedAt - this.alarmRunStartedAt;
+      if (elapsed < this.alarmReentrancyStaleMs) {
+        this.log("System", "alarm_skipped", { reason: "Alarm already running", elapsed_ms: elapsed });
+        return;
+      }
+      this.log("System", "alarm_overlap_recovered", {
+        elapsed_ms: elapsed,
+        stale_after_ms: this.alarmReentrancyStaleMs,
+      });
     }
 
-    const now = Date.now();
-    const researchIntervalMs =
-      this.state.optimization?.adaptiveResearchIntervalMs || DEFAULT_OPTIMIZATION_STATE.adaptiveResearchIntervalMs;
-    const dataPollIntervalMs =
-      this.state.optimization?.adaptiveDataPollIntervalMs || this.state.config.data_poll_interval_ms;
-    const analystIntervalMs =
-      this.state.optimization?.adaptiveAnalystIntervalMs || this.state.config.analyst_interval_ms;
-    const POSITION_RESEARCH_INTERVAL_MS = 300_000;
+    this.isAlarmRunning = true;
+    this.alarmRunStartedAt = runStartedAt;
 
     try {
+      if (!this.state.enabled) {
+        this.log("System", "alarm_skipped", { reason: "Agent not enabled" });
+        return;
+      }
+
+      const now = Date.now();
+      const researchIntervalMs =
+        this.state.optimization?.adaptiveResearchIntervalMs || DEFAULT_OPTIMIZATION_STATE.adaptiveResearchIntervalMs;
+      const dataPollIntervalMs =
+        this.state.optimization?.adaptiveDataPollIntervalMs || this.state.config.data_poll_interval_ms;
+      const analystIntervalMs =
+        this.state.optimization?.adaptiveAnalystIntervalMs || this.state.config.analyst_interval_ms;
+      const POSITION_RESEARCH_INTERVAL_MS = 300_000;
+
       // 1. Check Kill Switch (Task 3)
       const isKillSwitchActive = await this.checkKillSwitch();
       if (isKillSwitchActive) {
@@ -1576,9 +1698,14 @@ export class OwokxHarness extends DurableObject<Env> {
       this.log("System", "alarm_error", { error: String(error) });
       this.recordPerformanceSample("analyst", this.state.optimization.analystLatencyEmaMs || 1_000, true);
     } finally {
+      this.isAlarmRunning = false;
+      this.alarmRunStartedAt = 0;
       this.pruneMemoryEpisodes();
+      this.pruneEphemeralCaches();
       await this.persist();
-      await this.scheduleNextAlarm();
+      if (this.state.enabled) {
+        await this.scheduleNextAlarm();
+      }
     }
   }
 
@@ -1940,6 +2067,8 @@ export class OwokxHarness extends DurableObject<Env> {
       .filter((p) => p.timestamp_ms >= cutoffMs)
       .slice(-5000);
 
+    this.ctx.waitUntil(this.persistPortfolioSnapshotToD1(now, equity));
+    this.invalidateL1ReadCacheByPrefix("cache:history:");
     this.ctx.waitUntil(this.persist());
   }
 
@@ -2067,7 +2196,7 @@ export class OwokxHarness extends DurableObject<Env> {
     let swarm: any;
     if (this.env.SWARM_REGISTRY) {
       try {
-        const id = this.env.SWARM_REGISTRY.idFromName("default");
+        const id = this.env.SWARM_REGISTRY.idFromName(this.serviceShardKey);
         const stub = this.env.SWARM_REGISTRY.get(id);
         const [healthRes, agentsRes] = await Promise.all([
           stub.fetch("http://registry/health"),
@@ -2387,7 +2516,7 @@ export class OwokxHarness extends DurableObject<Env> {
     });
   }
 
-  private handleGetLogs(url: URL): Response {
+  private async handleGetLogs(url: URL): Promise<Response> {
     const parseSet = (key: string): Set<string> => {
       const values = url.searchParams
         .getAll(key)
@@ -2410,45 +2539,90 @@ export class OwokxHarness extends DurableObject<Env> {
     const statuses = parseSet("status");
     const agents = parseSet("agent");
     const search = (url.searchParams.get("search") || "").trim().toLowerCase();
+    const queryKey = `cache:logs:${url.searchParams.toString()}`;
 
-    let filtered = [...this.state.logs];
-    if (since !== null) {
-      filtered = filtered.filter((entry) => entry.timestamp_ms >= since);
-    }
-    if (until !== null) {
-      filtered = filtered.filter((entry) => entry.timestamp_ms <= until);
-    }
-    if (eventTypes.size > 0) {
-      filtered = filtered.filter((entry) => eventTypes.has(entry.event_type));
-    }
-    if (severities.size > 0) {
-      filtered = filtered.filter((entry) => severities.has(entry.severity));
-    }
-    if (statuses.size > 0) {
-      filtered = filtered.filter((entry) => statuses.has(entry.status));
-    }
-    if (agents.size > 0) {
-      filtered = filtered.filter((entry) => agents.has(entry.agent.toLowerCase()));
-    }
-    if (search.length > 0) {
-      filtered = filtered.filter((entry) => {
-        const haystack =
-          `${entry.agent} ${entry.action} ${entry.description} ${JSON.stringify(entry.metadata)}`.toLowerCase();
-        return haystack.includes(search);
-      });
-    }
+    const payload = await this.readThroughCache(queryKey, { l1TtlMs: 2_000, kvTtlSeconds: 5 }, async () => {
+      const db = this.getD1ClientOrNull();
+      if (db) {
+        try {
+          const queried = await queryActivityLogs(db, {
+            since,
+            until,
+            eventTypes: [...eventTypes],
+            severities: [...severities],
+            statuses: [...statuses],
+            agents: [...agents],
+            search,
+            limit,
+          });
 
-    const logs = filtered.sort((a, b) => b.timestamp_ms - a.timestamp_ms).slice(0, limit);
-    return this.jsonResponse({
-      ok: true,
-      logs,
-      total: this.state.logs.length,
-      filtered: filtered.length,
-      limit,
-      available_event_types: ["agent", "trade", "crypto", "research", "system", "swarm", "risk", "data", "api"],
-      available_severities: ["debug", "info", "warning", "error", "critical"],
-      available_statuses: ["info", "started", "in_progress", "success", "warning", "failed", "skipped"],
+          const parsedLogs = queried.logs
+            .map((value) => {
+              try {
+                return JSON.parse(value) as LogEntry;
+              } catch {
+                return null;
+              }
+            })
+            .filter((entry): entry is LogEntry => entry !== null);
+
+          return {
+            ok: true,
+            logs: parsedLogs,
+            total: queried.totalCount,
+            filtered: queried.filteredCount,
+            limit,
+            available_event_types: ["agent", "trade", "crypto", "research", "system", "swarm", "risk", "data", "api"],
+            available_severities: ["debug", "info", "warning", "error", "critical"],
+            available_statuses: ["info", "started", "in_progress", "success", "warning", "failed", "skipped"],
+            source: "d1_indexed",
+          };
+        } catch {
+          // Fall through to in-memory scan.
+        }
+      }
+
+      let filtered = [...this.state.logs];
+      if (since !== null) {
+        filtered = filtered.filter((entry) => entry.timestamp_ms >= since);
+      }
+      if (until !== null) {
+        filtered = filtered.filter((entry) => entry.timestamp_ms <= until);
+      }
+      if (eventTypes.size > 0) {
+        filtered = filtered.filter((entry) => eventTypes.has(entry.event_type));
+      }
+      if (severities.size > 0) {
+        filtered = filtered.filter((entry) => severities.has(entry.severity));
+      }
+      if (statuses.size > 0) {
+        filtered = filtered.filter((entry) => statuses.has(entry.status));
+      }
+      if (agents.size > 0) {
+        filtered = filtered.filter((entry) => agents.has(entry.agent.toLowerCase()));
+      }
+      if (search.length > 0) {
+        filtered = filtered.filter((entry) => {
+          const haystack =
+            `${entry.agent} ${entry.action} ${entry.description} ${JSON.stringify(entry.metadata)}`.toLowerCase();
+          return haystack.includes(search);
+        });
+      }
+
+      return {
+        ok: true,
+        logs: filtered.sort((a, b) => b.timestamp_ms - a.timestamp_ms).slice(0, limit),
+        total: this.state.logs.length,
+        filtered: filtered.length,
+        limit,
+        available_event_types: ["agent", "trade", "crypto", "research", "system", "swarm", "risk", "data", "api"],
+        available_severities: ["debug", "info", "warning", "error", "critical"],
+        available_statuses: ["info", "started", "in_progress", "success", "warning", "failed", "skipped"],
+        source: "memory_fallback",
+      };
     });
+
+    return this.jsonResponse(payload);
   }
 
   private async handleGetHistory(url: URL): Promise<Response> {
@@ -2472,69 +2646,88 @@ export class OwokxHarness extends DurableObject<Env> {
       return this.jsonResponse({ ok: false, error: cachedAuthError.message });
     }
 
+    const historyCacheKey = `cache:history:${url.searchParams.toString()}`;
+
     try {
-      const history = await broker.trading.getPortfolioHistory({
-        period,
-        timeframe,
-        intraday_reporting: intradayReporting || "extended_hours",
-      });
-      this.state.lastBrokerAuthError = undefined;
+      const payload = await this.readThroughCache(historyCacheKey, { l1TtlMs: 2_000, kvTtlSeconds: 8 }, async () => {
+        const history = await broker.trading.getPortfolioHistory({
+          period,
+          timeframe,
+          intraday_reporting: intradayReporting || "extended_hours",
+        });
+        this.state.lastBrokerAuthError = undefined;
 
-      const hasTimeseries =
-        Array.isArray(history.timestamp) &&
-        Array.isArray(history.equity) &&
-        history.timestamp.length > 1 &&
-        history.equity.length > 1;
+        const hasTimeseries =
+          Array.isArray(history.timestamp) &&
+          Array.isArray(history.equity) &&
+          history.timestamp.length > 1 &&
+          history.equity.length > 1;
 
-      if (!hasTimeseries) {
-        const windowMs = periodWindowMs(period);
-        const cutoffMs = windowMs ? Date.now() - windowMs : 0;
-        const bucketMs = timeframeBucketMs(timeframe);
-        const points = downsampleEquityPoints(
-          this.state.portfolioEquityHistory.filter((p) => (cutoffMs ? p.timestamp_ms >= cutoffMs : true)),
-          bucketMs
-        );
-        const nowMs = Date.now();
-        const latestEquity = history.equity?.[history.equity.length - 1];
-        const ensuredPoints =
-          points.length > 0
-            ? points.length > 1
-              ? points
-              : [...points, { timestamp_ms: nowMs, equity: points[0]!.equity }]
-            : Number.isFinite(latestEquity)
-              ? [
-                  { timestamp_ms: nowMs - (bucketMs || 60_000), equity: latestEquity as number },
-                  { timestamp_ms: nowMs, equity: latestEquity as number },
-                ]
-              : [];
+        if (!hasTimeseries) {
+          const windowMs = periodWindowMs(period);
+          const cutoffMs = windowMs ? Date.now() - windowMs : 0;
+          const bucketMs = timeframeBucketMs(timeframe);
+          const pointsFromD1 = await (async () => {
+            const db = this.getD1ClientOrNull();
+            if (!db) return [] as Array<{ timestamp_ms: number; equity: number }>;
+            try {
+              return await queryPortfolioSnapshots(db, { since: cutoffMs || null, limit: 5000 });
+            } catch {
+              return [] as Array<{ timestamp_ms: number; equity: number }>;
+            }
+          })();
 
-        const baseValue = this.state.config.starting_equity ?? ensuredPoints[0]?.equity ?? 0;
+          const candidatePoints =
+            pointsFromD1.length > 1
+              ? pointsFromD1
+              : this.state.portfolioEquityHistory.filter((p) => (cutoffMs ? p.timestamp_ms >= cutoffMs : true));
 
-        return this.jsonResponse({
+          const points = downsampleEquityPoints(candidatePoints, bucketMs);
+          const nowMs = Date.now();
+          const latestEquity = history.equity?.[history.equity.length - 1];
+          const ensuredPoints =
+            points.length > 0
+              ? points.length > 1
+                ? points
+                : [...points, { timestamp_ms: nowMs, equity: points[0]!.equity }]
+              : Number.isFinite(latestEquity)
+                ? [
+                    { timestamp_ms: nowMs - (bucketMs || 60_000), equity: latestEquity as number },
+                    { timestamp_ms: nowMs, equity: latestEquity as number },
+                  ]
+                : [];
+
+          const baseValue = this.state.config.starting_equity ?? ensuredPoints[0]?.equity ?? 0;
+          return {
+            ok: true,
+            data: {
+              snapshots: buildPortfolioSnapshots(ensuredPoints, baseValue),
+              base_value: baseValue,
+              timeframe,
+            },
+            source: pointsFromD1.length > 1 ? "d1_fallback" : "memory_fallback",
+          };
+        }
+
+        const snapshots = history.timestamp.map((ts, i) => ({
+          timestamp: ts * 1000,
+          equity: history.equity[i],
+          pl: history.profit_loss[i],
+          pl_pct: history.profit_loss_pct[i],
+        }));
+
+        return {
           ok: true,
           data: {
-            snapshots: buildPortfolioSnapshots(ensuredPoints, baseValue),
-            base_value: baseValue,
-            timeframe,
+            snapshots,
+            base_value: history.base_value,
+            timeframe: history.timeframe,
           },
-        });
-      }
-
-      const snapshots = history.timestamp.map((ts, i) => ({
-        timestamp: ts * 1000,
-        equity: history.equity[i],
-        pl: history.profit_loss[i],
-        pl_pct: history.profit_loss_pct[i],
-      }));
-
-      return this.jsonResponse({
-        ok: true,
-        data: {
-          snapshots,
-          base_value: history.base_value,
-          timeframe: history.timeframe,
-        },
+          source: "broker_live",
+        };
       });
+
+      return this.jsonResponse(payload);
     } catch (error) {
       this.log("System", "history_error", { error: String(error) });
       const code = (error as { code?: string } | null)?.code;
@@ -2545,10 +2738,20 @@ export class OwokxHarness extends DurableObject<Env> {
         const windowMs = periodWindowMs(period);
         const cutoffMs = windowMs ? Date.now() - windowMs : 0;
         const bucketMs = timeframeBucketMs(timeframe);
-        const points = downsampleEquityPoints(
-          this.state.portfolioEquityHistory.filter((p) => (cutoffMs ? p.timestamp_ms >= cutoffMs : true)),
-          bucketMs
-        );
+        const pointsFromD1 = await (async () => {
+          const db = this.getD1ClientOrNull();
+          if (!db) return [] as Array<{ timestamp_ms: number; equity: number }>;
+          try {
+            return await queryPortfolioSnapshots(db, { since: cutoffMs || null, limit: 5000 });
+          } catch {
+            return [] as Array<{ timestamp_ms: number; equity: number }>;
+          }
+        })();
+        const sourcePoints =
+          pointsFromD1.length > 1
+            ? pointsFromD1
+            : this.state.portfolioEquityHistory.filter((p) => (cutoffMs ? p.timestamp_ms >= cutoffMs : true));
+        const points = downsampleEquityPoints(sourcePoints, bucketMs);
         if (points.length > 1) {
           const baseValue = this.state.config.starting_equity ?? points[0]?.equity ?? 0;
           return this.jsonResponse({
@@ -2558,6 +2761,7 @@ export class OwokxHarness extends DurableObject<Env> {
               base_value: baseValue,
               timeframe,
             },
+            source: pointsFromD1.length > 1 ? "d1_fallback" : "memory_fallback",
           });
         }
       }
@@ -2782,7 +2986,7 @@ export class OwokxHarness extends DurableObject<Env> {
     if (!this.env.DATA_SCOUT) return [];
 
     try {
-      const id = this.env.DATA_SCOUT.idFromName("default");
+      const id = this.env.DATA_SCOUT.idFromName(this.serviceShardKey);
       const stub = this.env.DATA_SCOUT.get(id);
       const res = await this.withTimeout(
         stub.fetch("http://data-scout/signals"),
@@ -3263,13 +3467,19 @@ export class OwokxHarness extends DurableObject<Env> {
     return match ? (match[1] ?? null) : null;
   }
 
-  private companyToTickerCache: Map<string, string | null> = new Map();
+  private companyToTickerCache: Map<string, { ticker: string | null; cachedAt: number }> = new Map();
+  private readonly companyToTickerCacheTtlMs = 12 * 60 * 60 * 1000;
+  private readonly maxCompanyToTickerCacheEntries = 2_000;
 
   private async resolveTickerFromCompanyName(companyName: string): Promise<string | null> {
     const normalized = companyName.toUpperCase().trim();
 
-    if (this.companyToTickerCache.has(normalized)) {
-      return this.companyToTickerCache.get(normalized) ?? null;
+    const cached = this.companyToTickerCache.get(normalized);
+    if (cached) {
+      if (Date.now() - cached.cachedAt <= this.companyToTickerCacheTtlMs) {
+        return cached.ticker;
+      }
+      this.companyToTickerCache.delete(normalized);
     }
 
     try {
@@ -3288,7 +3498,8 @@ export class OwokxHarness extends DurableObject<Env> {
       for (const entry of Object.values(data)) {
         const entryTitle = entry.title.toUpperCase();
         if (entryTitle === normalized || normalized.includes(entryTitle) || entryTitle.includes(normalized)) {
-          this.companyToTickerCache.set(normalized, entry.ticker);
+          this.companyToTickerCache.set(normalized, { ticker: entry.ticker, cachedAt: Date.now() });
+          this.pruneCompanyTickerCache();
           return entry.ticker;
         }
       }
@@ -3296,15 +3507,37 @@ export class OwokxHarness extends DurableObject<Env> {
       const firstWord = normalized.split(/[\s,]+/)[0];
       for (const entry of Object.values(data)) {
         if (entry.title.toUpperCase().startsWith(firstWord || "")) {
-          this.companyToTickerCache.set(normalized, entry.ticker);
+          this.companyToTickerCache.set(normalized, { ticker: entry.ticker, cachedAt: Date.now() });
+          this.pruneCompanyTickerCache();
           return entry.ticker;
         }
       }
 
-      this.companyToTickerCache.set(normalized, null);
+      this.companyToTickerCache.set(normalized, { ticker: null, cachedAt: Date.now() });
+      this.pruneCompanyTickerCache();
       return null;
     } catch {
       return null;
+    }
+  }
+
+  private pruneCompanyTickerCache(): void {
+    const now = Date.now();
+
+    for (const [key, entry] of this.companyToTickerCache.entries()) {
+      if (now - entry.cachedAt > this.companyToTickerCacheTtlMs) {
+        this.companyToTickerCache.delete(key);
+      }
+    }
+
+    const overflow = this.companyToTickerCache.size - this.maxCompanyToTickerCacheEntries;
+    if (overflow <= 0) return;
+
+    const it = this.companyToTickerCache.keys();
+    for (let i = 0; i < overflow; i++) {
+      const next = it.next();
+      if (next.done) break;
+      this.companyToTickerCache.delete(next.value);
     }
   }
 
@@ -3382,7 +3615,11 @@ export class OwokxHarness extends DurableObject<Env> {
         continue;
       }
 
-      if (research.confidence < this.state.config.min_analyst_confidence) {
+      const cryptoThreshold = this.getCalibratedConfidenceThreshold(
+        "research_buy",
+        !!this.state.lastStressTest && !this.state.lastStressTest.passed
+      );
+      if (research.confidence < cryptoThreshold) {
         this.log("Crypto", "low_confidence", { symbol: signal.symbol, confidence: research.confidence });
         continue;
       }
@@ -3439,8 +3676,15 @@ export class OwokxHarness extends DurableObject<Env> {
                         "catalysts": ["positive factors"]
                       }`;
 
-      const response = await this._llm.complete({
-        model: this.state.config.llm_model, // Use config model (usually cheap one)
+      const promptPolicy = this.resolvePromptPolicy("crypto", {
+        stressFailed: !!this.state.lastStressTest && !this.state.lastStressTest.passed,
+        volatility: this.state.marketRegime.characteristics?.volatility,
+        avgSignalStrength: sentiment,
+      });
+
+      const { response, modelUsed } = await this.completeWithRouting(
+        "crypto",
+        {
         messages: [
           {
             role: "system",
@@ -3449,19 +3693,17 @@ export class OwokxHarness extends DurableObject<Env> {
           },
           { role: "user", content: prompt },
         ],
-        max_tokens: 250,
+        max_tokens: promptPolicy.maxTokens,
         temperature: 0, // Task 2: Deterministic
         seed: 42, // Task 2: Deterministic
         response_format: { type: "json_object" },
-      });
-
-      const usage = response.usage;
-      if (usage) {
-        this.trackLLMCost(response.model || this.state.config.llm_model, usage.prompt_tokens, usage.completion_tokens);
-      }
+        },
+        { stressFailed: !!this.state.lastStressTest && !this.state.lastStressTest.passed }
+      );
 
       const parsedAnalysis = this.parseResearchAnalysis(response.content || "{}", symbol, "research_crypto");
       if (parsedAnalysis.parseFailure) {
+        this.markModelParseFailure(modelUsed);
         this.logParseFailure(parsedAnalysis.parseFailure);
       }
       const analysis = parsedAnalysis.analysis;
@@ -3469,7 +3711,7 @@ export class OwokxHarness extends DurableObject<Env> {
       const result: ResearchResult = {
         symbol,
         verdict: analysis.verdict,
-        confidence: analysis.confidence,
+        confidence: this.calibrateActionConfidence(analysis.confidence, modelUsed),
         sentiment: this.clampSentiment(sentiment),
         entry_quality: analysis.entry_quality,
         reasoning: analysis.reasoning,
@@ -3897,6 +4139,245 @@ export class OwokxHarness extends DurableObject<Env> {
   private clampSentiment(value: number): number {
     if (!Number.isFinite(value)) return 0;
     return Math.max(-1, Math.min(1, value));
+  }
+
+  private normalizeModelName(model: string): string {
+    return model.trim().toLowerCase();
+  }
+
+  private getModelPricingRates(model: string): { input: number; output: number } {
+    const pricing: Record<string, { input: number; output: number }> = {
+      "gpt-4o": { input: 2.5, output: 10 },
+      "gpt-4o-mini": { input: 0.15, output: 0.6 },
+      "deepseek-chat": { input: 0.27, output: 1.1 },
+      "deepseek-reasoner": { input: 0.55, output: 2.19 },
+    };
+    const normalizedModel = model.includes("/") ? (model.split("/", 2)[1] ?? model) : model;
+    return pricing[normalizedModel] ?? pricing[model] ?? pricing["gpt-4o-mini"]!;
+  }
+
+  private getOrCreateRouteStats(model: string): LLMModelRouteStats {
+    const key = this.normalizeModelName(model);
+    if (!this.state.llmRouting.perModel[key]) {
+      this.state.llmRouting.perModel[key] = {
+        calls: 0,
+        successes: 0,
+        failures: 0,
+        parseFailures: 0,
+        latencyEmaMs: 0,
+        costEmaUsd: 0,
+        lastUsedAt: 0,
+      };
+    }
+    return this.state.llmRouting.perModel[key]!;
+  }
+
+  private recordLLMRouteOutcome(
+    model: string,
+    outcome: { success: boolean; latencyMs: number; costUsd?: number; parseFailure?: boolean }
+  ): void {
+    const stats = this.getOrCreateRouteStats(model);
+    const alpha = 0.22;
+    const latencyMs = Math.max(0, outcome.latencyMs);
+
+    stats.calls += 1;
+    if (outcome.success) stats.successes += 1;
+    else stats.failures += 1;
+    if (outcome.parseFailure) stats.parseFailures += 1;
+    stats.latencyEmaMs = stats.latencyEmaMs > 0 ? stats.latencyEmaMs * (1 - alpha) + latencyMs * alpha : latencyMs;
+    if (typeof outcome.costUsd === "number" && Number.isFinite(outcome.costUsd)) {
+      stats.costEmaUsd =
+        stats.costEmaUsd > 0 ? stats.costEmaUsd * (1 - alpha) + Math.max(0, outcome.costUsd) * alpha : outcome.costUsd;
+    }
+    stats.lastUsedAt = Date.now();
+    this.state.llmRouting.lastUpdatedAt = stats.lastUsedAt;
+  }
+
+  private markModelParseFailure(model: string): void {
+    const stats = this.getOrCreateRouteStats(model);
+    stats.parseFailures += 1;
+    stats.lastUsedAt = Date.now();
+    this.state.llmRouting.confidenceCalibrationEmaError = this.clamp01(
+      this.state.llmRouting.confidenceCalibrationEmaError * 0.92 + 0.08
+    );
+    this.state.llmRouting.lastUpdatedAt = stats.lastUsedAt;
+  }
+
+  private updateConfidenceCalibration(predictedConfidence: number, outcome: 0 | 1): void {
+    const safePrediction = this.clamp01(predictedConfidence);
+    const absoluteError = Math.abs(outcome - safePrediction);
+    const alpha = 0.12;
+    const previous = this.state.llmRouting.confidenceCalibrationEmaError;
+    const emaError = previous * (1 - alpha) + absoluteError * alpha;
+    this.state.llmRouting.confidenceCalibrationEmaError = this.clamp01(emaError);
+    this.state.llmRouting.calibrationSamples += 1;
+
+    const targetScale = Math.max(0.78, Math.min(1.04, 1 - Math.max(0, emaError - 0.18) * 0.42));
+    this.state.llmRouting.confidenceScale =
+      this.state.llmRouting.confidenceScale * 0.8 + targetScale * 0.2;
+  }
+
+  private calibrateActionConfidence(rawConfidence: number, model: string): number {
+    const stats = this.getOrCreateRouteStats(model);
+    const calls = Math.max(1, stats.calls);
+    const parseRate = stats.parseFailures / calls;
+    const failureRate = stats.failures / calls;
+    const reliabilityScale = Math.max(0.78, 1 - parseRate * 0.18 - failureRate * 0.1);
+    return this.clamp01(rawConfidence * reliabilityScale * this.state.llmRouting.confidenceScale);
+  }
+
+  private getCalibratedConfidenceThreshold(
+    stage: "research_buy" | "analyst_buy" | "analyst_sell" | "premarket_buy",
+    stressFailed: boolean
+  ): number {
+    const routing = this.state.llmRouting;
+    let threshold = this.state.config.min_analyst_confidence + routing.gating.baseBias;
+    const regime = this.state.marketRegime;
+
+    if (regime.type === "volatile") threshold += routing.gating.volatilePenalty * regime.confidence;
+    if (regime.type === "trending") threshold -= routing.gating.trendingRelief * regime.confidence;
+    if (stressFailed) threshold += routing.gating.stressPenalty;
+    if (stage === "analyst_sell") threshold -= routing.gating.sellRelief;
+
+    const models = Object.values(this.state.llmRouting.perModel);
+    const totalCalls = models.reduce((sum, item) => sum + item.calls, 0);
+    const totalParseFailures = models.reduce((sum, item) => sum + item.parseFailures, 0);
+    const parseFailureRate = totalCalls > 0 ? totalParseFailures / totalCalls : 0;
+    const calibrationPenalty =
+      Math.max(0, this.state.llmRouting.confidenceCalibrationEmaError - 0.18) *
+        routing.gating.calibrationPenaltyWeight +
+      parseFailureRate * routing.gating.parsePenaltyWeight;
+
+    threshold += calibrationPenalty;
+    return Math.max(0.45, Math.min(0.95, threshold));
+  }
+
+  private resolvePromptPolicy(
+    task: LLMTaskType,
+    context: { candidateCount?: number; stressFailed?: boolean; volatility?: number; avgSignalStrength?: number }
+  ): {
+    tier: PromptTier;
+    maxTokens: number;
+    includeMemory: boolean;
+    includeLearning: boolean;
+    includeToolContext: boolean;
+  } {
+    const volatility = typeof context.volatility === "number" ? this.clamp01(context.volatility / 0.05) : 0.25;
+    const candidatePressure = this.clamp01((context.candidateCount ?? 0) / 12);
+    const signalStrength = this.clamp01(Math.abs(context.avgSignalStrength ?? 0));
+    const stressPenalty = context.stressFailed ? 0.25 : 0;
+    const intensity = this.clamp01(volatility * 0.45 + candidatePressure * 0.25 + signalStrength * 0.15 + stressPenalty);
+
+    const tier: PromptTier = intensity > 0.72 ? "deep" : intensity > 0.42 ? "standard" : "lean";
+
+    const baseTokens: Record<LLMTaskType, number> = {
+      research: tier === "deep" ? 320 : tier === "standard" ? 250 : 170,
+      analyst: tier === "deep" ? 950 : tier === "standard" ? 800 : 620,
+      position: tier === "deep" ? 240 : tier === "standard" ? 200 : 150,
+      crypto: tier === "deep" ? 280 : tier === "standard" ? 220 : 160,
+    };
+
+    return {
+      tier,
+      maxTokens: baseTokens[task],
+      includeMemory: tier !== "lean",
+      includeLearning: tier === "deep" || task === "analyst",
+      includeToolContext: task === "analyst" || tier !== "lean",
+    };
+  }
+
+  private selectModelForTask(
+    task: LLMTaskType,
+    context: { stressFailed?: boolean; urgent?: boolean }
+  ): { model: string; fallbacks: string[]; reason: string } {
+    const primaryResearch = this.state.config.llm_model || this.env.LLM_MODEL || "gpt-4o-mini";
+    const primaryAnalyst = this.state.config.llm_analyst_model || primaryResearch;
+    const ordered =
+      task === "analyst"
+        ? [primaryAnalyst, primaryResearch]
+        : task === "position"
+          ? [primaryResearch, primaryAnalyst]
+          : [primaryResearch, primaryAnalyst];
+    const candidates = Array.from(new Set(ordered.map((m) => m.trim()).filter((m) => m.length > 0)));
+
+    const best = candidates
+      .map((model) => {
+        const weights = this.state.llmRouting.selectorWeights;
+        const stats = this.getOrCreateRouteStats(model);
+        const calls = Math.max(1, stats.calls);
+        const successRate = stats.successes / calls;
+        const failureRate = stats.failures / calls;
+        const parseRate = stats.parseFailures / calls;
+        const latencyNorm = stats.latencyEmaMs > 0 ? this.clamp01(stats.latencyEmaMs / 2200) : 0.3;
+        const costNorm =
+          stats.costEmaUsd > 0
+            ? this.clamp01(stats.costEmaUsd / 0.0025)
+            : this.clamp01((this.getModelPricingRates(model).input + this.getModelPricingRates(model).output) / 12);
+
+        const modelBias =
+          model === primaryAnalyst ? (task === "analyst" ? 0.18 : -0.03) : model === primaryResearch ? 0.08 : 0;
+        const latencyWeight = context.urgent
+          ? Math.min(0.36, weights.latency + 0.08)
+          : task === "analyst"
+            ? Math.max(0.08, weights.latency - 0.02)
+            : weights.latency;
+        const costWeight = task === "analyst" ? Math.max(0.04, weights.cost - 0.05) : weights.cost;
+        const qualityWeight = context.stressFailed ? Math.min(0.82, weights.quality + 0.1) : weights.quality;
+        const score =
+          modelBias +
+          successRate * qualityWeight -
+          failureRate * weights.failurePenalty -
+          parseRate * weights.parsePenalty -
+          latencyNorm * latencyWeight -
+          costNorm * costWeight;
+        return { model, score, successRate, latencyMs: stats.latencyEmaMs || null };
+      })
+      .sort((a, b) => b.score - a.score);
+
+    const selected = best[0] ?? { model: primaryResearch, score: 0, successRate: 0.75, latencyMs: null };
+    const reason = `selected=${selected.model} score=${selected.score.toFixed(3)} success=${(
+      selected.successRate * 100
+    ).toFixed(0)}% latency_ms=${selected.latencyMs ? selected.latencyMs.toFixed(0) : "n/a"}`;
+    this.state.llmRouting.lastSelectionReason = reason;
+    return { model: selected.model, fallbacks: best.slice(1).map((x) => x.model), reason };
+  }
+
+  private async completeWithRouting(
+    task: LLMTaskType,
+    params: CompletionParams,
+    context: { stressFailed?: boolean; urgent?: boolean }
+  ): Promise<{ response: CompletionResult; modelUsed: string }> {
+    if (!this._llm) throw new Error("LLM provider unavailable");
+    const selection = this.selectModelForTask(task, context);
+    const attempts = [selection.model, ...selection.fallbacks].slice(0, 2);
+    let lastError: unknown = new Error("No LLM model attempts");
+
+    for (let i = 0; i < attempts.length; i += 1) {
+      const model = attempts[i]!;
+      const startedAt = Date.now();
+      try {
+        const response = await this._llm.complete({ ...params, model });
+        const usage = response.usage;
+        let cost = 0;
+        if (usage) {
+          cost = this.trackLLMCost(response.model || model, usage.prompt_tokens, usage.completion_tokens);
+        }
+        this.recordLLMRouteOutcome(response.model || model, {
+          success: true,
+          latencyMs: Date.now() - startedAt,
+          costUsd: cost,
+        });
+        return { response, modelUsed: response.model || model };
+      } catch (error) {
+        this.recordLLMRouteOutcome(model, {
+          success: false,
+          latencyMs: Date.now() - startedAt,
+        });
+        lastError = error;
+      }
+    }
+
+    throw lastError;
   }
 
   private ensureSignalResearchSentiment(): void {
@@ -4489,6 +4970,74 @@ export class OwokxHarness extends DurableObject<Env> {
     opt.errorRateEma = updateEma(opt.errorRateEma, errorPoint);
   }
 
+  private tuneLLMPolicyFromTelemetry(): void {
+    const routing = this.state.llmRouting;
+    const opt = this.state.optimization;
+    const models = Object.values(routing.perModel);
+    const totalCalls = models.reduce((sum, model) => sum + model.calls, 0);
+    const totalFailures = models.reduce((sum, model) => sum + model.failures, 0);
+    const totalParses = models.reduce((sum, model) => sum + model.parseFailures, 0);
+    const failureRate = totalCalls > 0 ? totalFailures / totalCalls : 0;
+    const parseFailureRate = totalCalls > 0 ? totalParses / totalCalls : 0;
+
+    const researchLatencyPressure =
+      opt.researchLatencyEmaMs > 0 ? this.clamp01((opt.researchLatencyEmaMs - 4_500) / 5_500) : 0;
+    const analystLatencyPressure =
+      opt.analystLatencyEmaMs > 0 ? this.clamp01((opt.analystLatencyEmaMs - 7_000) / 7_000) : 0;
+    const latencyPressure = this.clamp01((researchLatencyPressure + analystLatencyPressure) / 2);
+    const errorPressure = this.clamp01(opt.errorRateEma / 0.22);
+    const calibrationPressure = this.clamp01((routing.confidenceCalibrationEmaError - 0.18) / 0.45);
+    const qualityPressure = this.clamp01(failureRate * 2.2 + parseFailureRate * 2.4 + calibrationPressure * 0.45);
+
+    const targetQuality = this.clamp01(0.5 + qualityPressure * 0.25 + errorPressure * 0.08);
+    const targetLatency = this.clamp01(0.14 + latencyPressure * 0.18 - qualityPressure * 0.08);
+    const targetCost = this.clamp01(0.12 + Math.max(0, errorPressure - latencyPressure) * 0.14);
+    const targetFailurePenalty = this.clamp01(0.16 + qualityPressure * 0.22);
+    const targetParsePenalty = this.clamp01(0.28 + qualityPressure * 0.3);
+
+    const smooth = (current: number, target: number, alpha = 0.18) => current * (1 - alpha) + target * alpha;
+
+    routing.selectorWeights.quality = Math.max(0.42, Math.min(0.82, smooth(routing.selectorWeights.quality, targetQuality)));
+    routing.selectorWeights.latency = Math.max(0.08, Math.min(0.36, smooth(routing.selectorWeights.latency, targetLatency)));
+    routing.selectorWeights.cost = Math.max(0.04, Math.min(0.34, smooth(routing.selectorWeights.cost, targetCost)));
+    routing.selectorWeights.failurePenalty = Math.max(
+      0.08,
+      Math.min(0.42, smooth(routing.selectorWeights.failurePenalty, targetFailurePenalty))
+    );
+    routing.selectorWeights.parsePenalty = Math.max(
+      0.16,
+      Math.min(0.56, smooth(routing.selectorWeights.parsePenalty, targetParsePenalty))
+    );
+
+    const targetBaseBias = Math.max(0, calibrationPressure * 0.06 + parseFailureRate * 0.05 + errorPressure * 0.03);
+    const targetStressPenalty = 0.05 + Math.max(0, errorPressure - 0.4) * 0.07;
+    const targetVolatilePenalty = 0.04 + latencyPressure * 0.03;
+    const targetTrendingRelief = Math.max(0.01, 0.025 - qualityPressure * 0.01);
+    const targetSellRelief = 0.02 + Math.max(0, qualityPressure - 0.3) * 0.02;
+    const targetCalibrationPenaltyWeight = 0.14 + calibrationPressure * 0.14;
+    const targetParsePenaltyWeight = 0.06 + parseFailureRate * 0.2;
+
+    routing.gating.baseBias = Math.max(0, Math.min(0.12, smooth(routing.gating.baseBias, targetBaseBias)));
+    routing.gating.stressPenalty = Math.max(0.04, Math.min(0.14, smooth(routing.gating.stressPenalty, targetStressPenalty)));
+    routing.gating.volatilePenalty = Math.max(
+      0.03,
+      Math.min(0.12, smooth(routing.gating.volatilePenalty, targetVolatilePenalty))
+    );
+    routing.gating.trendingRelief = Math.max(
+      0.005,
+      Math.min(0.04, smooth(routing.gating.trendingRelief, targetTrendingRelief))
+    );
+    routing.gating.sellRelief = Math.max(0.01, Math.min(0.06, smooth(routing.gating.sellRelief, targetSellRelief)));
+    routing.gating.calibrationPenaltyWeight = Math.max(
+      0.08,
+      Math.min(0.34, smooth(routing.gating.calibrationPenaltyWeight, targetCalibrationPenaltyWeight))
+    );
+    routing.gating.parsePenaltyWeight = Math.max(
+      0.04,
+      Math.min(0.22, smooth(routing.gating.parsePenaltyWeight, targetParsePenaltyWeight))
+    );
+  }
+
   private optimizeRuntimeParameters(now = Date.now()): void {
     const opt = this.state.optimization;
     const maxDataPoll = 60_000;
@@ -4526,6 +5075,7 @@ export class OwokxHarness extends DurableObject<Env> {
     opt.adaptiveDataPollIntervalMs = dataPoll;
     opt.adaptiveResearchIntervalMs = research;
     opt.adaptiveAnalystIntervalMs = analyst;
+    this.tuneLLMPolicyFromTelemetry();
     opt.optimizationRuns += 1;
     opt.lastOptimizationAt = now;
 
@@ -4537,6 +5087,20 @@ export class OwokxHarness extends DurableObject<Env> {
       research_ema_ms: Number(opt.researchLatencyEmaMs.toFixed(1)),
       analyst_ema_ms: Number(opt.analystLatencyEmaMs.toFixed(1)),
       error_rate_ema: Number(opt.errorRateEma.toFixed(3)),
+      llm_selector_weights: {
+        quality: Number(this.state.llmRouting.selectorWeights.quality.toFixed(3)),
+        latency: Number(this.state.llmRouting.selectorWeights.latency.toFixed(3)),
+        cost: Number(this.state.llmRouting.selectorWeights.cost.toFixed(3)),
+        failure_penalty: Number(this.state.llmRouting.selectorWeights.failurePenalty.toFixed(3)),
+        parse_penalty: Number(this.state.llmRouting.selectorWeights.parsePenalty.toFixed(3)),
+      },
+      llm_gating: {
+        base_bias: Number(this.state.llmRouting.gating.baseBias.toFixed(3)),
+        stress_penalty: Number(this.state.llmRouting.gating.stressPenalty.toFixed(3)),
+        volatile_penalty: Number(this.state.llmRouting.gating.volatilePenalty.toFixed(3)),
+        trending_relief: Number(this.state.llmRouting.gating.trendingRelief.toFixed(3)),
+        sell_relief: Number(this.state.llmRouting.gating.sellRelief.toFixed(3)),
+      },
       overloaded,
       healthy,
     });
@@ -4812,7 +5376,7 @@ export class OwokxHarness extends DurableObject<Env> {
     if (!this.env.LEARNING_AGENT) return null;
 
     try {
-      const id = this.env.LEARNING_AGENT.idFromName("default");
+      const id = this.env.LEARNING_AGENT.idFromName(this.serviceShardKey);
       const stub = this.env.LEARNING_AGENT.get(id);
       const res = await stub.fetch("http://learning/advice", {
         method: "POST",
@@ -4846,7 +5410,7 @@ export class OwokxHarness extends DurableObject<Env> {
     if (!this.env.ANALYST || signals.length === 0) return {};
 
     try {
-      const id = this.env.ANALYST.idFromName("default");
+      const id = this.env.ANALYST.idFromName(this.serviceShardKey);
       const stub = this.env.ANALYST.get(id);
       const res = await stub.fetch("http://analyst/research-batch", {
         method: "POST",
@@ -4915,7 +5479,7 @@ export class OwokxHarness extends DurableObject<Env> {
     if (!this.env.SWARM_REGISTRY) return;
 
     try {
-      const id = this.env.SWARM_REGISTRY.idFromName("default");
+      const id = this.env.SWARM_REGISTRY.idFromName(this.serviceShardKey);
       const stub = this.env.SWARM_REGISTRY.get(id);
       const res = await stub.fetch("http://registry/agents");
       if (!res.ok) return;
@@ -5243,6 +5807,13 @@ export class OwokxHarness extends DurableObject<Env> {
       }
 
       const isCrypto = isCryptoSymbol(brokerSymbol, this.state.config.crypto_symbols || []);
+      const stressFailed = !!this.state.lastStressTest && !this.state.lastStressTest.passed;
+      const promptPolicy = this.resolvePromptPolicy("research", {
+        candidateCount: sources.length,
+        stressFailed,
+        volatility: this.state.marketRegime.characteristics?.volatility,
+        avgSignalStrength: sentimentScore,
+      });
       let price = 0;
       if (isCrypto) {
         const normalized = normalizeCryptoSymbol(brokerSymbol);
@@ -5281,8 +5852,11 @@ export class OwokxHarness extends DurableObject<Env> {
           snapshot?.latest_trade?.price || snapshot?.latest_quote?.ask_price || snapshot?.latest_quote?.bid_price || 0;
       }
 
-      const toolContext = await this.buildSymbolToolContext(brokerSymbol, isCrypto, broker);
-      const toolSummary = this.formatToolContext(toolContext);
+      let toolSummary = "- Omitted in lean prompt mode";
+      if (promptPolicy.includeToolContext) {
+        const toolContext = await this.buildSymbolToolContext(brokerSymbol, isCrypto, broker);
+        toolSummary = this.formatToolContext(toolContext);
+      }
       const matchingSignal = this.state.signalCache.find(
         (signal) => this.normalizeResearchSymbolForBroker(signal.symbol, broker.broker) === brokerSymbol
       );
@@ -5297,13 +5871,17 @@ export class OwokxHarness extends DurableObject<Env> {
             .map((signal) => signal.source)
         ).size,
       });
-      const memorySummary = this.getRelevantMemoryEpisodes([symbol, "research", "risk"], 3)
-        .map(
-          (episode) =>
-            `- [${episode.outcome}] ${episode.context} (importance ${(episode.importance * 100).toFixed(0)}%)`
-        )
-        .join("\n");
-      const learningAdvice = await this.fetchLearningAdvice(symbol, Math.max(0, Math.min(1, sentimentScore)));
+      const memorySummary = promptPolicy.includeMemory
+        ? this.getRelevantMemoryEpisodes([symbol, "research", "risk"], 3)
+            .map(
+              (episode) =>
+                `- [${episode.outcome}] ${episode.context} (importance ${(episode.importance * 100).toFixed(0)}%)`
+            )
+            .join("\n")
+        : "- Skipped (lean prompt mode)";
+      const learningAdvice = promptPolicy.includeLearning
+        ? await this.fetchLearningAdvice(symbol, Math.max(0, Math.min(1, sentimentScore)))
+        : null;
 
       const prompt = `Should we BUY this ${isCrypto ? "crypto" : "stock"} based on social sentiment and fundamentals?
 
@@ -5323,7 +5901,7 @@ export class OwokxHarness extends DurableObject<Env> {
                       MEMORY LESSONS:
                       ${memorySummary || "- No relevant memory episodes yet"}
 
-                      LEARNING ADVICE:
+                      LEARNING ADVICE (${promptPolicy.tier}):
                       ${
                         learningAdvice
                           ? `- approved: ${learningAdvice.approved}
@@ -5344,8 +5922,9 @@ export class OwokxHarness extends DurableObject<Env> {
                         "catalysts": ["positive factors"]
                       }`;
 
-      const response = await this._llm.complete({
-        model: this.state.config.llm_model,
+      const { response, modelUsed } = await this.completeWithRouting(
+        "research",
+        {
         messages: [
           {
             role: "system",
@@ -5353,17 +5932,19 @@ export class OwokxHarness extends DurableObject<Env> {
           },
           { role: "user", content: prompt },
         ],
-        max_tokens: 250,
+        max_tokens: promptPolicy.maxTokens,
         temperature: 0,
         response_format: { type: "json_object" },
-      });
+        },
+        { stressFailed }
+      );
 
       const usage = response.usage;
       if (usage) {
-        this.trackLLMCost(response.model || this.state.config.llm_model, usage.prompt_tokens, usage.completion_tokens);
         this.log("SignalResearch", "llm_usage", {
           symbol,
-          model: response.model || this.state.config.llm_model,
+          model: modelUsed,
+          routed_tier: promptPolicy.tier,
           prompt_tokens: usage.prompt_tokens,
           completion_tokens: usage.completion_tokens,
           total_tokens: usage.total_tokens,
@@ -5373,11 +5954,12 @@ export class OwokxHarness extends DurableObject<Env> {
 
       const parsedAnalysis = this.parseResearchAnalysis(response.content || "{}", brokerSymbol);
       if (parsedAnalysis.parseFailure) {
+        this.markModelParseFailure(modelUsed);
         this.logParseFailure(parsedAnalysis.parseFailure);
       }
       const analysis = parsedAnalysis.analysis;
-
-      const confidenceWithPrediction = this.clamp01(analysis.confidence * 0.75 + predictiveScore * 0.25);
+      const calibratedModelConfidence = this.calibrateActionConfidence(analysis.confidence, modelUsed);
+      const confidenceWithPrediction = this.clamp01(calibratedModelConfidence * 0.75 + predictiveScore * 0.25);
       const adjustedConfidence = this.clamp01(
         learningAdvice ? (confidenceWithPrediction + learningAdvice.adjustedConfidence) / 2 : confidenceWithPrediction
       );
@@ -5820,8 +6402,9 @@ Provide a brief risk assessment and recommendation (HOLD, SELL, or ADD). JSON fo
 }`;
 
     try {
-      const response = await this._llm.complete({
-        model: this.state.config.llm_model,
+      const { response, modelUsed } = await this.completeWithRouting(
+        "position",
+        {
         messages: [
           { role: "system", content: "You are a position risk analyst. Be concise. Output valid JSON only." },
           { role: "user", content: prompt },
@@ -5830,12 +6413,9 @@ Provide a brief risk assessment and recommendation (HOLD, SELL, or ADD). JSON fo
         temperature: 0, // Task 2: Deterministic
         seed: 42, // Task 2: Deterministic
         response_format: { type: "json_object" },
-      });
-
-      const usage = response.usage;
-      if (usage) {
-        this.trackLLMCost(response.model || this.state.config.llm_model, usage.prompt_tokens, usage.completion_tokens);
-      }
+        },
+        { stressFailed: !!this.state.lastStressTest && !this.state.lastStressTest.passed, urgent: true }
+      );
 
       const content = response.content || "{}";
       const analysis = JSON.parse(content.replace(/```json\n?|```/g, "").trim()) as {
@@ -5844,6 +6424,10 @@ Provide a brief risk assessment and recommendation (HOLD, SELL, or ADD). JSON fo
         reasoning: string;
         key_factors: string[];
       };
+
+      if (!analysis || !analysis.recommendation) {
+        this.markModelParseFailure(modelUsed);
+      }
 
       this.state.positionResearch[symbol] = { ...analysis, timestamp: Date.now() };
       this.log("PositionResearch", "position_analyzed", {
@@ -5919,18 +6503,34 @@ Provide a brief risk assessment and recommendation (HOLD, SELL, or ADD). JSON fo
     const broker = createBrokerProviders(this.env, this.state.config.broker);
     const portfolioRisk = this.computePortfolioRiskMetrics();
     const dynamicRisk = this.getDynamicRiskProfile(account);
-    const candidateToolSummaries = await Promise.all(
-      candidates.slice(0, 3).map(async (candidate) => {
-        const isCrypto = isCryptoSymbol(candidate.symbol, this.state.config.crypto_symbols || []);
-        const toolContext = await this.buildSymbolToolContext(candidate.symbol, isCrypto, broker);
-        return `- ${candidate.symbol}: ${this.formatToolContext(toolContext)}`;
-      })
-    );
-    const memoryLessons = this.getRelevantMemoryEpisodes(["analyst", "risk", "trade"], 4)
-      .map(
-        (episode) => `- ${episode.context} (${episode.outcome}, importance ${(episode.importance * 100).toFixed(0)}%)`
-      )
-      .join("\n");
+    const stressFailed = !!this.state.lastStressTest && !this.state.lastStressTest.passed;
+    const avgSignalStrength =
+      candidates.reduce((sum, candidate) => sum + Math.abs(candidate.avgSentiment), 0) / Math.max(1, candidates.length);
+    const promptPolicy = this.resolvePromptPolicy("analyst", {
+      candidateCount: candidates.length,
+      stressFailed,
+      volatility: dynamicRisk.realizedVolatility,
+      avgSignalStrength,
+    });
+    const minTradeConfidence = this.getCalibratedConfidenceThreshold("analyst_buy", stressFailed);
+
+    const candidateToolSummaries = promptPolicy.includeToolContext
+      ? await Promise.all(
+          candidates.slice(0, 3).map(async (candidate) => {
+            const isCrypto = isCryptoSymbol(candidate.symbol, this.state.config.crypto_symbols || []);
+            const toolContext = await this.buildSymbolToolContext(candidate.symbol, isCrypto, broker);
+            return `- ${candidate.symbol}: ${this.formatToolContext(toolContext)}`;
+          })
+        )
+      : ["- Omitted in lean prompt mode"];
+    const memoryLessons = promptPolicy.includeMemory
+      ? this.getRelevantMemoryEpisodes(["analyst", "risk", "trade"], 4)
+          .map(
+            (episode) =>
+              `- ${episode.context} (${episode.outcome}, importance ${(episode.importance * 100).toFixed(0)}%)`
+          )
+          .join("\n")
+      : "- Skipped (lean prompt mode)";
 
     const prompt = `Current Time: ${new Date().toISOString()}
 
@@ -5989,15 +6589,16 @@ TRADING RULES:
 - Max position size: $${this.state.config.max_position_value}
 - Take profit target: ${this.state.config.take_profit_pct}%
 - Stop loss: ${this.state.config.stop_loss_pct}%
-- Min confidence to trade: ${this.state.config.min_analyst_confidence}
+- Min confidence to trade: ${minTradeConfidence.toFixed(2)}
 - Min hold time before selling: ${this.state.config.llm_min_hold_minutes ?? 30} minutes
 
 Analyze and provide BUY/SELL/HOLD recommendations:`;
 
     try {
       const temperature = 0;
-      const response = await this._llm.complete({
-        model: this.state.config.llm_analyst_model,
+      const { response, modelUsed } = await this.completeWithRouting(
+        "analyst",
+        {
         messages: [
           {
             role: "system",
@@ -6022,18 +6623,23 @@ Response format:
           },
           { role: "user", content: prompt },
         ],
-        max_tokens: 800,
+        max_tokens: promptPolicy.maxTokens,
         temperature,
         response_format: { type: "json_object" },
-      });
+        },
+        { stressFailed }
+      );
 
       const usage = response.usage;
       if (usage) {
-        this.trackLLMCost(
-          response.model || this.state.config.llm_analyst_model,
-          usage.prompt_tokens,
-          usage.completion_tokens
-        );
+        this.log("Analyst", "llm_usage", {
+          model: modelUsed,
+          routed_tier: promptPolicy.tier,
+          prompt_tokens: usage.prompt_tokens,
+          completion_tokens: usage.completion_tokens,
+          total_tokens: usage.total_tokens,
+          event_type: "api",
+        });
       }
 
       const content = response.content || "{}";
@@ -6048,10 +6654,14 @@ Response format:
         market_summary: string;
         high_conviction_plays?: string[];
       };
+      const normalizedRecommendations = (analysis.recommendations || []).map((rec) => ({
+        ...rec,
+        confidence: this.calibrateActionConfidence(this.clamp01(Number(rec.confidence) || 0), modelUsed),
+      }));
 
       this.log("Analyst", "analysis_complete", {
         candidates: candidates.length,
-        recommendations: analysis.recommendations?.length || 0,
+        recommendations: normalizedRecommendations.length,
       });
 
       this.rememberEpisode(
@@ -6061,8 +6671,8 @@ Response format:
         {
           impact: Math.min(1, candidates.length / 10),
           confidence: this.clamp01(
-            (analysis.recommendations || []).reduce((acc, rec) => acc + (Number(rec.confidence) || 0), 0) /
-              Math.max(1, (analysis.recommendations || []).length)
+            normalizedRecommendations.reduce((acc, rec) => acc + (Number(rec.confidence) || 0), 0) /
+              Math.max(1, normalizedRecommendations.length)
           ),
           novelty: 0.35,
           metadata: {
@@ -6078,7 +6688,7 @@ Response format:
         decisionId = await createDecision(db, {
           source: "harness",
           kind: "signal_batch_analysis",
-          model: this.state.config.llm_analyst_model,
+          model: modelUsed,
           temperature,
           input: {
             now: new Date().toISOString(),
@@ -6102,12 +6712,12 @@ Response format:
               max_position_value: this.state.config.max_position_value,
               take_profit_pct: this.state.config.take_profit_pct,
               stop_loss_pct: this.state.config.stop_loss_pct,
-              min_analyst_confidence: this.state.config.min_analyst_confidence,
+              min_analyst_confidence: minTradeConfidence,
               llm_min_hold_minutes: this.state.config.llm_min_hold_minutes ?? 30,
             },
           },
           output: {
-            recommendations: analysis.recommendations || [],
+            recommendations: normalizedRecommendations,
             market_summary: analysis.market_summary || "",
             high_conviction_plays: analysis.high_conviction_plays || [],
           },
@@ -6118,7 +6728,7 @@ Response format:
 
       return {
         decision_id: decisionId,
-        recommendations: analysis.recommendations || [],
+        recommendations: normalizedRecommendations,
         market_summary: analysis.market_summary || "",
         high_conviction: analysis.high_conviction_plays || [],
       };
@@ -6165,6 +6775,9 @@ Response format:
       this.runStressTest(account, positions);
     }
     const stressFailed = !!this.state.lastStressTest && !this.state.lastStressTest.passed;
+    const researchedBuyThreshold = this.getCalibratedConfidenceThreshold("research_buy", stressFailed);
+    const analystBuyThreshold = this.getCalibratedConfidenceThreshold("analyst_buy", stressFailed);
+    const analystSellThreshold = this.getCalibratedConfidenceThreshold("analyst_sell", stressFailed);
     this.log("Risk", "dynamic_profile", {
       regime: riskProfile.marketRegime,
       volatility: Number((riskProfile.realizedVolatility * 100).toFixed(2)),
@@ -6230,7 +6843,7 @@ Response format:
 
     if (positions.length < this.state.config.max_positions && this.state.signalCache.length > 0) {
       const researchedBuys = Object.values(this.state.signalResearch)
-        .filter((r) => r.verdict === "BUY" && r.confidence >= this.state.config.min_analyst_confidence)
+        .filter((r) => r.verdict === "BUY" && r.confidence >= researchedBuyThreshold)
         .filter((r) => !heldSymbols.has(r.symbol))
         .sort((a, b) => b.confidence - a.confidence);
 
@@ -6255,7 +6868,7 @@ Response format:
           originalSignal?.sentiment || finalConfidence
         );
 
-        if (finalConfidence < this.state.config.min_analyst_confidence) continue;
+        if (finalConfidence < researchedBuyThreshold) continue;
         if (stressFailed && finalConfidence < 0.85) {
           this.log("Risk", "buy_deferred_stress_regime", {
             symbol: research.symbol,
@@ -6307,6 +6920,7 @@ Response format:
             symbol: research.symbol,
             entry_time: Date.now(),
             entry_price: 0,
+            entry_confidence: finalConfidence,
             entry_sentiment: originalSignal?.sentiment || finalConfidence,
             entry_social_volume: originalSignal?.volume || 0,
             entry_sources: originalSignal?.subreddits || [originalSignal?.source || "research"],
@@ -6324,9 +6938,8 @@ Response format:
       const researchedSymbols = new Set(researchedBuys.map((r) => r.symbol));
 
       for (const rec of analysis.recommendations) {
-        if (rec.confidence < this.state.config.min_analyst_confidence) continue;
-
         if (rec.action === "SELL" && heldSymbols.has(rec.symbol)) {
+          if (rec.confidence < analystSellThreshold) continue;
           const entry = this.state.positionEntries[rec.symbol];
           const holdMinutes = entry ? (Date.now() - entry.entry_time) / (1000 * 60) : 0;
           const minHoldMinutes = this.state.config.llm_min_hold_minutes ?? 30;
@@ -6354,12 +6967,13 @@ Response format:
         }
 
         if (rec.action === "BUY") {
+          if (rec.confidence < analystBuyThreshold) continue;
           if (positions.length >= this.state.config.max_positions) continue;
           if (heldSymbols.has(rec.symbol)) continue;
           if (researchedSymbols.has(rec.symbol)) continue;
           const adjustedRecConfidence = this.applyRegimeConfidenceAdjustment(rec.confidence, rec.confidence);
           if (stressFailed && adjustedRecConfidence < 0.9) continue;
-          if (adjustedRecConfidence < this.state.config.min_analyst_confidence) continue;
+          if (adjustedRecConfidence < analystBuyThreshold) continue;
           const corrCheck = this.shouldBlockCorrelatedTrade(rec.symbol, heldSymbols);
           if (corrCheck.blocked) {
             this.log("Risk", "buy_deferred_signal_correlation", {
@@ -6387,6 +7001,7 @@ Response format:
               symbol: rec.symbol,
               entry_time: Date.now(),
               entry_price: 0,
+              entry_confidence: adjustedRecConfidence,
               entry_sentiment: originalSignal?.sentiment || rec.confidence,
               entry_social_volume: originalSignal?.volume || 0,
               entry_sources: originalSignal?.subreddits || [originalSignal?.source || "analyst"],
@@ -6463,7 +7078,7 @@ Response format:
 
     if (this.env.RISK_MANAGER) {
       try {
-        const id = this.env.RISK_MANAGER.idFromName("default");
+        const id = this.env.RISK_MANAGER.idFromName(this.serviceShardKey);
         const stub = this.env.RISK_MANAGER.get(id);
         const res = await stub.fetch("http://risk/validate", {
           method: "POST",
@@ -6645,6 +7260,9 @@ Response format:
         const returnPct = pos.market_value > 0 ? (pos.unrealized_pl / pos.market_value) * 100 : 0;
         const entry = this.state.positionEntries[pos.symbol];
         this.updatePredictiveModelFromTrade(pos.symbol, returnPct, entry);
+        if (typeof entry?.entry_confidence === "number") {
+          this.updateConfidenceCalibration(entry.entry_confidence, returnPct > 0 ? 1 : 0);
+        }
 
         delete this.state.positionEntries[pos.symbol];
         delete this.state.socialHistory[pos.symbol];
@@ -6667,7 +7285,7 @@ Response format:
 
         if (this.env.RISK_MANAGER) {
           const realizedPnl = pos.unrealized_pl ?? 0;
-          const id = this.env.RISK_MANAGER.idFromName("default");
+          const id = this.env.RISK_MANAGER.idFromName(this.serviceShardKey);
           const stub = this.env.RISK_MANAGER.get(id);
           stub
             .fetch("http://risk/update-loss", {
@@ -7097,6 +7715,9 @@ Response format:
     if (!account) return;
 
     const heldSymbols = new Set(positions.map((p) => p.symbol));
+    const stressFailed = !!this.state.lastStressTest && !this.state.lastStressTest.passed;
+    const analystSellThreshold = this.getCalibratedConfidenceThreshold("analyst_sell", stressFailed);
+    const premarketBuyThreshold = this.getCalibratedConfidenceThreshold("premarket_buy", stressFailed);
 
     this.log("System", "executing_premarket_plan", {
       recommendations: this.state.premarketPlan.recommendations.length,
@@ -7105,17 +7726,18 @@ Response format:
     const idempotencySuffix = `premarket:${this.state.premarketPlan.timestamp}`;
 
     for (const rec of this.state.premarketPlan.recommendations) {
-      if (rec.action === "SELL" && rec.confidence >= this.state.config.min_analyst_confidence) {
+      if (rec.action === "SELL" && rec.confidence >= analystSellThreshold) {
         await this.executeSell(broker, rec.symbol, `Pre-market plan: ${rec.reasoning}`, idempotencySuffix);
       }
     }
 
     for (const rec of this.state.premarketPlan.recommendations) {
-      if (rec.action === "BUY" && rec.confidence >= this.state.config.min_analyst_confidence) {
+      if (rec.action === "BUY" && rec.confidence >= premarketBuyThreshold) {
         if (heldSymbols.has(rec.symbol)) continue;
         if (positions.length >= this.state.config.max_positions) break;
         const adjustedConfidence = this.applyRegimeConfidenceAdjustment(rec.confidence, rec.confidence);
-        if (!this.state.lastStressTest?.passed && adjustedConfidence < 0.9) continue;
+        if (stressFailed && adjustedConfidence < 0.9) continue;
+        if (adjustedConfidence < premarketBuyThreshold) continue;
 
         const result = await this.executeBuy(broker, rec.symbol, adjustedConfidence, account, idempotencySuffix);
         if (result) {
@@ -7134,6 +7756,7 @@ Response format:
             symbol: rec.symbol,
             entry_time: Date.now(),
             entry_price: 0,
+            entry_confidence: adjustedConfidence,
             entry_sentiment: originalSignal?.sentiment || 0,
             entry_social_volume: originalSignal?.volume || 0,
             entry_sources: originalSignal?.subreddits || [originalSignal?.source || "premarket"],
@@ -7596,23 +8219,17 @@ Response format:
 
     const mustFlush = entry.severity === "error" || entry.severity === "critical" || entry.status === "failed";
     this.queueLogPersistence(mustFlush);
+    this.ctx.waitUntil(this.persistActivityLogToD1(entry));
+    this.invalidateL1ReadCacheByPrefix("cache:logs:");
 
     // Log NDJSON for wrangler tail / file redirection
     console.log(JSON.stringify(entry));
   }
 
   public trackLLMCost(model: string, tokensIn: number, tokensOut: number): number {
-    const pricing: Record<string, { input: number; output: number }> = {
-      "gpt-4o": { input: 2.5, output: 10 },
-      "gpt-4o-mini": { input: 0.15, output: 0.6 },
-      "deepseek-chat": { input: 0.27, output: 1.1 },
-      "deepseek-reasoner": { input: 0.55, output: 2.19 },
-    };
-
     const safeTokensIn = Number.isFinite(tokensIn) ? Math.max(0, tokensIn) : 0;
     const safeTokensOut = Number.isFinite(tokensOut) ? Math.max(0, tokensOut) : 0;
-    const normalizedModel = model.includes("/") ? (model.split("/", 2)[1] ?? model) : model;
-    const rates = pricing[normalizedModel] ?? pricing[model] ?? pricing["gpt-4o-mini"]!;
+    const rates = this.getModelPricingRates(model);
     const cost = (safeTokensIn * rates.input + safeTokensOut * rates.output) / 1_000_000;
 
     this.state.costTracker.total_usd += cost;
@@ -7750,12 +8367,175 @@ Response format:
     return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
+  private getD1ClientOrNull(): D1Client | null {
+    const dbCandidate = this.env.DB as unknown as { prepare?: unknown } | undefined;
+    if (!dbCandidate || typeof dbCandidate.prepare !== "function") {
+      return null;
+    }
+    try {
+      return createD1Client(this.env.DB);
+    } catch {
+      return null;
+    }
+  }
+
+  private getKVNamespaceOrNull(): KVNamespace | null {
+    const kv = this.env.CACHE as unknown as { get?: unknown; put?: unknown } | undefined;
+    if (!kv || typeof kv.get !== "function" || typeof kv.put !== "function") {
+      return null;
+    }
+    return this.env.CACHE;
+  }
+
+  private setL1ReadCache(key: string, payload: unknown, ttlMs: number): void {
+    this.l1ReadCache.set(key, { expiresAt: Date.now() + ttlMs, payload });
+
+    const overflow = this.l1ReadCache.size - this.maxL1ReadCacheEntries;
+    if (overflow <= 0) return;
+
+    const it = this.l1ReadCache.keys();
+    for (let i = 0; i < overflow; i++) {
+      const next = it.next();
+      if (next.done) break;
+      this.l1ReadCache.delete(next.value);
+    }
+  }
+
+  private getL1ReadCache<T>(key: string): T | null {
+    const hit = this.l1ReadCache.get(key);
+    if (!hit) return null;
+    if (Date.now() > hit.expiresAt) {
+      this.l1ReadCache.delete(key);
+      return null;
+    }
+    return hit.payload as T;
+  }
+
+  private invalidateL1ReadCacheByPrefix(prefix: string): void {
+    for (const key of this.l1ReadCache.keys()) {
+      if (key.startsWith(prefix)) {
+        this.l1ReadCache.delete(key);
+      }
+    }
+  }
+
+  private async readThroughCache<T>(
+    key: string,
+    options: { l1TtlMs: number; kvTtlSeconds: number },
+    loader: () => Promise<T>
+  ): Promise<T> {
+    const l1Hit = this.getL1ReadCache<T>(key);
+    if (l1Hit !== null) return l1Hit;
+
+    const inflight = this.inFlightReads.get(key);
+    if (inflight) {
+      return (await inflight) as T;
+    }
+
+    const pending = (async () => {
+      const kv = this.getKVNamespaceOrNull();
+      if (kv) {
+        try {
+          const cached = await kv.get(key, "text");
+          if (cached) {
+            const parsed = JSON.parse(cached) as T;
+            this.setL1ReadCache(key, parsed, options.l1TtlMs);
+            return parsed;
+          }
+        } catch {
+          // Ignore cache read errors and fall through.
+        }
+      }
+
+      const payload = await loader();
+      this.setL1ReadCache(key, payload, options.l1TtlMs);
+      if (kv) {
+        try {
+          await kv.put(key, JSON.stringify(payload), { expirationTtl: options.kvTtlSeconds });
+        } catch {
+          // Ignore cache write errors.
+        }
+      }
+      return payload;
+    })();
+
+    this.inFlightReads.set(key, pending as Promise<unknown>);
+    try {
+      return await pending;
+    } finally {
+      this.inFlightReads.delete(key);
+    }
+  }
+
+  private async persistActivityLogToD1(entry: LogEntry): Promise<void> {
+    const db = this.getD1ClientOrNull();
+    if (!db) return;
+
+    const metadataJson = JSON.stringify(entry.metadata ?? {});
+    const entryJson = JSON.stringify(entry);
+    const searchableText = `${entry.agent} ${entry.action} ${entry.description} ${metadataJson}`.toLowerCase();
+
+    try {
+      await insertActivityLog(db, {
+        id: entry.id,
+        timestamp_ms: entry.timestamp_ms,
+        event_type: entry.event_type,
+        severity: entry.severity,
+        status: entry.status,
+        agent: entry.agent,
+        action: entry.action,
+        description: entry.description,
+        metadata_json: metadataJson,
+        entry_json: entryJson,
+        searchable_text: searchableText,
+      });
+    } catch {
+      // D1 log persistence is best-effort; in-memory logs remain source of truth fallback.
+    }
+  }
+
+  private async persistPortfolioSnapshotToD1(timestampMs: number, equity: number): Promise<void> {
+    const db = this.getD1ClientOrNull();
+    if (!db) return;
+
+    try {
+      await insertPortfolioSnapshot(db, timestampMs, equity);
+    } catch {
+      // Portfolio snapshot persistence is best-effort fallback.
+    }
+  }
+
   get llm(): LLMProvider | null {
     return this._llm;
   }
 
   private discordCooldowns: Map<string, number> = new Map();
   private readonly DISCORD_COOLDOWN_MS = 30 * 60 * 1000;
+  private readonly DISCORD_COOLDOWN_TTL_MS = 6 * 60 * 60 * 1000;
+  private readonly MAX_DISCORD_COOLDOWN_ENTRIES = 1_000;
+
+  private pruneEphemeralCaches(): void {
+    this.pruneCompanyTickerCache();
+    this.pruneDiscordCooldowns();
+  }
+
+  private pruneDiscordCooldowns(now = Date.now()): void {
+    for (const [key, timestamp] of this.discordCooldowns.entries()) {
+      if (now - timestamp > this.DISCORD_COOLDOWN_TTL_MS) {
+        this.discordCooldowns.delete(key);
+      }
+    }
+
+    const overflow = this.discordCooldowns.size - this.MAX_DISCORD_COOLDOWN_ENTRIES;
+    if (overflow <= 0) return;
+
+    const it = this.discordCooldowns.keys();
+    for (let i = 0; i < overflow; i++) {
+      const next = it.next();
+      if (next.done) break;
+      this.discordCooldowns.delete(next.value);
+    }
+  }
 
   private async sendDiscordNotification(
     type: "signal" | "research",
@@ -7772,6 +8552,7 @@ Response format:
     }
   ): Promise<void> {
     if (!this.env.DISCORD_WEBHOOK_URL) return;
+    this.pruneDiscordCooldowns();
 
     const cacheKey = data.symbol;
     const lastNotification = this.discordCooldowns.get(cacheKey);
@@ -7854,7 +8635,7 @@ export function getHarnessStub(env: Env): DurableObjectStub {
   if (!env.OWOKX_HARNESS) {
     throw new Error("OWOKX_HARNESS binding not configured - check wrangler.toml");
   }
-  const id = env.OWOKX_HARNESS.idFromName("main");
+  const id = env.OWOKX_HARNESS.idFromName(resolveShardKey(env.OWOKX_HARNESS_SHARD_KEY, "main"));
   return env.OWOKX_HARNESS.get(id);
 }
 
