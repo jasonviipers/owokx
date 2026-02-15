@@ -90,7 +90,7 @@ export class OwokxMcpAgent extends McpAgent<Env> {
   }
 
   private registerAuthTools(db: ReturnType<typeof createD1Client>, broker: BrokerProviders) {
-    this.typedServer.tool("auth-verify", "Verify that broker API credentials are valid", {}, async () => {
+    this.typedServer.registerTool("auth-verify", { description: "Verify that broker API credentials are valid" }, async () => {
       const startTime = Date.now();
       try {
         const account = await broker.trading.getAccount();
@@ -124,7 +124,7 @@ export class OwokxMcpAgent extends McpAgent<Env> {
       }
     });
 
-    this.typedServer.tool("user-get", "Get user/session information and system configuration", {}, async () => {
+    this.typedServer.registerTool("user-get", { description: "Get user/session information and system configuration" }, async () => {
       const result = success({
         environment: this.env.ENVIRONMENT,
         paper_trading: this.env.ALPACA_PAPER === "true",
@@ -143,10 +143,9 @@ export class OwokxMcpAgent extends McpAgent<Env> {
   }
 
   private registerAccountTools(db: ReturnType<typeof createD1Client>, broker: BrokerProviders) {
-    this.typedServer.tool(
+    this.typedServer.registerTool(
       "accounts-get",
-      "Get detailed account information including buying power and equity",
-      {},
+      { description: "Get detailed account information including buying power and equity" },
       async () => {
         const startTime = Date.now();
         try {
@@ -175,10 +174,9 @@ export class OwokxMcpAgent extends McpAgent<Env> {
       }
     );
 
-    this.typedServer.tool(
+    this.typedServer.registerTool(
       "portfolio-get",
-      "Get comprehensive portfolio snapshot with positions and summary",
-      {},
+      { description: "Get comprehensive portfolio snapshot with positions and summary" },
       async () => {
         const startTime = Date.now();
         try {
@@ -240,10 +238,9 @@ export class OwokxMcpAgent extends McpAgent<Env> {
   }
 
   private registerPositionTools(db: ReturnType<typeof createD1Client>, broker: BrokerProviders) {
-    this.typedServer.tool(
+    this.typedServer.registerTool(
       "positions-list",
-      "List all current positions",
-      { symbol: z.string().optional() },
+      { description: "List all current positions", inputSchema: { symbol: z.string().optional() } },
       async ({ symbol }) => {
         try {
           const positions = await broker.trading.getPositions();
@@ -278,13 +275,15 @@ export class OwokxMcpAgent extends McpAgent<Env> {
       }
     );
 
-    this.typedServer.tool(
+    this.typedServer.registerTool(
       "positions-close",
-      "Close a position (bypasses preview/submit; allowed even during kill switch)",
       {
-        symbol: z.string(),
-        qty: z.number().positive().optional(),
-        percentage: z.number().min(0).max(100).optional(),
+        description: "Close a position (bypasses preview/submit; allowed even during kill switch)",
+        inputSchema: {
+          symbol: z.string(),
+          qty: z.number().positive().optional(),
+          percentage: z.number().min(0).max(100).optional(),
+        },
       },
       async ({ symbol, qty, percentage }) => {
         try {
@@ -317,18 +316,20 @@ export class OwokxMcpAgent extends McpAgent<Env> {
   }
 
   private registerOrderTools(db: ReturnType<typeof createD1Client>, broker: BrokerProviders) {
-    this.typedServer.tool(
+    this.typedServer.registerTool(
       "orders-preview",
-      "Preview order and get approval token. Does NOT execute. Use orders-submit with the token.",
       {
-        symbol: z.string().min(1).max(10),
-        side: z.enum(["buy", "sell"]),
-        qty: z.number().positive().optional(),
-        notional: z.number().positive().optional(),
-        order_type: z.enum(["market", "limit", "stop", "stop_limit"]),
-        limit_price: z.number().positive().optional(),
-        stop_price: z.number().positive().optional(),
-        time_in_force: z.enum(["day", "gtc", "ioc", "fok"]).default("day"),
+        description: "Preview order and get approval token. Does NOT execute. Use orders-submit with the token.",
+        inputSchema: {
+          symbol: z.string().min(1).max(10),
+          side: z.enum(["buy", "sell"]),
+          qty: z.number().positive().optional(),
+          notional: z.number().positive().optional(),
+          order_type: z.enum(["market", "limit", "stop", "stop_limit"]),
+          limit_price: z.number().positive().optional(),
+          stop_price: z.number().positive().optional(),
+          time_in_force: z.enum(["day", "gtc", "ioc", "fok"]).default("day"),
+        },
       },
       async (input) => {
         const startTime = Date.now();
@@ -513,10 +514,12 @@ export class OwokxMcpAgent extends McpAgent<Env> {
       }
     );
 
-    this.typedServer.tool(
+    this.typedServer.registerTool(
       "orders-submit",
-      "Execute order with valid approval token from orders-preview",
-      { approval_token: z.string().min(1) },
+      {
+        description: "Execute order with valid approval token from orders-preview",
+        inputSchema: { approval_token: z.string().min(1) },
+      },
       async ({ approval_token }) => {
         const startTime = Date.now();
         try {
@@ -674,12 +677,14 @@ export class OwokxMcpAgent extends McpAgent<Env> {
       }
     );
 
-    this.typedServer.tool(
+    this.typedServer.registerTool(
       "orders-list",
-      "List orders",
       {
-        status: z.enum(["open", "closed", "all"]).default("open"),
-        limit: z.number().min(1).max(500).default(50),
+        description: "List orders",
+        inputSchema: {
+          status: z.enum(["open", "closed", "all"]).default("open"),
+          limit: z.number().min(1).max(500).default(50),
+        },
       },
       async ({ status, limit }) => {
         try {
@@ -711,7 +716,7 @@ export class OwokxMcpAgent extends McpAgent<Env> {
       }
     );
 
-    this.typedServer.tool("orders-cancel", "Cancel an order by ID", { order_id: z.string() }, async ({ order_id }) => {
+    this.typedServer.registerTool("orders-cancel", { description: "Cancel an order by ID", inputSchema: { order_id: z.string() } }, async ({ order_id }) => {
       try {
         await broker.trading.cancelOrder(order_id);
         return {
@@ -737,7 +742,7 @@ export class OwokxMcpAgent extends McpAgent<Env> {
   }
 
   private registerRiskTools(db: ReturnType<typeof createD1Client>, broker: BrokerProviders) {
-    this.typedServer.tool("risk-status", "Get current risk status and limits", {}, async () => {
+    this.typedServer.registerTool("risk-status", { description: "Get current risk status and limits" }, async () => {
       try {
         const [riskState, account, positions] = await Promise.all([
           getRiskState(db),
@@ -774,10 +779,12 @@ export class OwokxMcpAgent extends McpAgent<Env> {
       }
     });
 
-    this.typedServer.tool(
+    this.typedServer.registerTool(
       "kill-switch-enable",
-      "Enable kill switch to halt all trading",
-      { reason: z.string().min(1) },
+      {
+        description: "Enable kill switch to halt all trading",
+        inputSchema: { reason: z.string().min(1) },
+      },
       async ({ reason }) => {
         try {
           await enableKillSwitch(db, reason);
@@ -804,12 +811,14 @@ export class OwokxMcpAgent extends McpAgent<Env> {
       }
     );
 
-    this.typedServer.tool(
+    this.typedServer.registerTool(
       "kill-switch-disable",
-      "Disable kill switch (requires secret verification)",
       {
-        confirmation: z.string(),
-        secret_hash: z.string(),
+        description: "Disable kill switch (requires secret verification)",
+        inputSchema: {
+          confirmation: z.string(),
+          secret_hash: z.string(),
+        },
       },
       async ({ confirmation, secret_hash }) => {
         try {
@@ -862,7 +871,7 @@ export class OwokxMcpAgent extends McpAgent<Env> {
   }
 
   private registerUtilityTools() {
-    this.typedServer.tool("help-usage", "Get help information about using Okx", {}, async () => {
+    this.typedServer.registerTool("help-usage", { description: "Get help information about using Okx" }, async () => {
       const result = success({
         name: "Okx MCP Trading Server",
         version: "0.1.0",
@@ -872,7 +881,7 @@ export class OwokxMcpAgent extends McpAgent<Env> {
       return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
     });
 
-    this.typedServer.tool("catalog-list", "List all available tools", {}, async () => {
+    this.typedServer.registerTool("catalog-list", { description: "List all available tools" }, async () => {
       const catalog = [
         { category: "Auth", tools: ["auth-verify", "user-get"] },
         { category: "Account", tools: ["accounts-get", "portfolio-get"] },
@@ -914,19 +923,21 @@ export class OwokxMcpAgent extends McpAgent<Env> {
   }
 
   private registerMemoryTools(db: D1Client) {
-    this.typedServer.tool(
+    this.typedServer.registerTool(
       "memory-log-trade",
-      "Log a trade entry to the journal for later analysis",
       {
-        symbol: z.string().min(1),
-        side: z.enum(["buy", "sell"]),
-        qty: z.number().positive(),
-        entry_price: z.number().positive().optional(),
-        trade_id: z.string().optional(),
-        signals: z.record(z.string(), z.unknown()).optional(),
-        technicals: z.record(z.string(), z.unknown()).optional(),
-        regime_tags: z.array(z.string()).optional(),
-        notes: z.string().optional(),
+        description: "Log a trade entry to the journal for later analysis",
+        inputSchema: {
+          symbol: z.string().min(1),
+          side: z.enum(["buy", "sell"]),
+          qty: z.number().positive(),
+          entry_price: z.number().positive().optional(),
+          trade_id: z.string().optional(),
+          signals: z.record(z.string(), z.unknown()).optional(),
+          technicals: z.record(z.string(), z.unknown()).optional(),
+          regime_tags: z.array(z.string()).optional(),
+          notes: z.string().optional(),
+        },
       },
       async (input) => {
         try {
@@ -963,17 +974,19 @@ export class OwokxMcpAgent extends McpAgent<Env> {
       }
     );
 
-    this.typedServer.tool(
+    this.typedServer.registerTool(
       "memory-log-outcome",
-      "Log the outcome of a previously logged trade",
       {
-        journal_id: z.string().min(1),
-        exit_price: z.number().positive(),
-        pnl_usd: z.number(),
-        pnl_pct: z.number(),
-        hold_duration_mins: z.number().nonnegative(),
-        outcome: z.enum(["win", "loss", "scratch"]),
-        lessons_learned: z.string().optional(),
+        description: "Log the outcome of a previously logged trade",
+        inputSchema: {
+          journal_id: z.string().min(1),
+          exit_price: z.number().positive(),
+          pnl_usd: z.number(),
+          pnl_pct: z.number(),
+          hold_duration_mins: z.number().nonnegative(),
+          outcome: z.enum(["win", "loss", "scratch"]),
+          lessons_learned: z.string().optional(),
+        },
       },
       async (input) => {
         try {
@@ -1003,15 +1016,17 @@ export class OwokxMcpAgent extends McpAgent<Env> {
       }
     );
 
-    this.typedServer.tool(
+    this.typedServer.registerTool(
       "memory-query",
-      "Query journal entries and trading statistics",
       {
-        symbol: z.string().optional(),
-        outcome: z.enum(["win", "loss", "scratch"]).optional(),
-        regime_tag: z.string().optional(),
-        days: z.number().min(1).max(365).default(30),
-        limit: z.number().min(1).max(100).default(20),
+        description: "Query journal entries and trading statistics",
+        inputSchema: {
+          symbol: z.string().optional(),
+          outcome: z.enum(["win", "loss", "scratch"]).optional(),
+          regime_tag: z.string().optional(),
+          days: z.number().min(1).max(365).default(30),
+          limit: z.number().min(1).max(100).default(20),
+        },
       },
       async (input) => {
         try {
@@ -1047,10 +1062,12 @@ export class OwokxMcpAgent extends McpAgent<Env> {
       }
     );
 
-    this.typedServer.tool(
+    this.typedServer.registerTool(
       "memory-summarize",
-      "Use LLM to analyze trading history and extract patterns (requires LLM feature)",
-      { days: z.number().min(1).max(365).default(30) },
+      {
+        description: "Use LLM to analyze trading history and extract patterns (requires LLM feature)",
+        inputSchema: { days: z.number().min(1).max(365).default(30) },
+      },
       async (_input) => {
         if (!this.llm) {
           return {
@@ -1101,10 +1118,12 @@ export class OwokxMcpAgent extends McpAgent<Env> {
       }
     );
 
-    this.typedServer.tool(
+    this.typedServer.registerTool(
       "memory-set-preferences",
-      "Store user trading preferences",
-      { preferences: z.record(z.string(), z.unknown()) },
+      {
+        description: "Store user trading preferences",
+        inputSchema: { preferences: z.record(z.string(), z.unknown()) },
+      },
       async ({ preferences }) => {
         try {
           await setPreferences(db, preferences);
@@ -1127,7 +1146,7 @@ export class OwokxMcpAgent extends McpAgent<Env> {
       }
     );
 
-    this.typedServer.tool("memory-get-preferences", "Get stored user trading preferences", {}, async () => {
+    this.typedServer.registerTool("memory-get-preferences", { description: "Get stored user trading preferences" }, async () => {
       try {
         const preferences = await getPreferences(db);
         return { content: [{ type: "text" as const, text: JSON.stringify(success({ preferences }), null, 2) }] };
@@ -1146,10 +1165,12 @@ export class OwokxMcpAgent extends McpAgent<Env> {
   }
 
   private registerMarketDataTools(db: D1Client, broker: BrokerProviders) {
-    this.typedServer.tool(
+    this.typedServer.registerTool(
       "symbol-overview",
-      "Get comprehensive overview of a symbol including price, position, and recent bars",
-      { symbol: z.string().min(1) },
+      {
+        description: "Get comprehensive overview of a symbol including price, position, and recent bars",
+        inputSchema: { symbol: z.string().min(1) },
+      },
       async ({ symbol }) => {
         const startTime = Date.now();
         try {
@@ -1200,13 +1221,15 @@ export class OwokxMcpAgent extends McpAgent<Env> {
       }
     );
 
-    this.typedServer.tool(
+    this.typedServer.registerTool(
       "prices-bars",
-      "Get historical price bars for a symbol",
       {
-        symbol: z.string().min(1),
-        timeframe: z.enum(["1Min", "5Min", "15Min", "1Hour", "1Day"]).default("1Day"),
-        limit: z.number().min(1).max(1000).default(100),
+        description: "Get historical price bars for a symbol",
+        inputSchema: {
+          symbol: z.string().min(1),
+          timeframe: z.enum(["1Min", "5Min", "15Min", "1Hour", "1Day"]).default("1Day"),
+          limit: z.number().min(1).max(1000).default(100),
+        },
       },
       async ({ symbol, timeframe, limit }) => {
         try {
@@ -1237,7 +1260,7 @@ export class OwokxMcpAgent extends McpAgent<Env> {
       }
     );
 
-    this.typedServer.tool("market-clock", "Get current market clock status", {}, async () => {
+    this.typedServer.registerTool("market-clock", { description: "Get current market clock status" }, async () => {
       try {
         const clock = await broker.trading.getClock();
         return { content: [{ type: "text" as const, text: JSON.stringify(success(clock), null, 2) }] };
@@ -1254,10 +1277,12 @@ export class OwokxMcpAgent extends McpAgent<Env> {
       }
     });
 
-    this.typedServer.tool(
+    this.typedServer.registerTool(
       "market-movers",
-      "Get top gainers and losers from watchlist symbols",
-      { symbols: z.array(z.string()).min(1).max(50) },
+      {
+        description: "Get top gainers and losers from watchlist symbols",
+        inputSchema: { symbols: z.array(z.string()).min(1).max(50) },
+      },
       async ({ symbols }) => {
         try {
           const snapshots = await broker.marketData.getSnapshots(symbols.map((s) => s.toUpperCase()));
@@ -1288,10 +1313,12 @@ export class OwokxMcpAgent extends McpAgent<Env> {
       }
     );
 
-    this.typedServer.tool(
+    this.typedServer.registerTool(
       "quotes-batch",
-      "Get latest quotes for multiple symbols",
-      { symbols: z.array(z.string()).min(1).max(100) },
+      {
+        description: "Get latest quotes for multiple symbols",
+        inputSchema: { symbols: z.array(z.string()).min(1).max(100) },
+      },
       async ({ symbols }) => {
         try {
           const quotes = await broker.marketData.getQuotes(symbols.map((s) => s.toUpperCase()));
@@ -1317,10 +1344,12 @@ export class OwokxMcpAgent extends McpAgent<Env> {
       }
     );
 
-    this.typedServer.tool(
+    this.typedServer.registerTool(
       "market-quote",
-      "Get a quote for a single symbol (stocks or crypto)",
-      { symbol: z.string().min(1) },
+      {
+        description: "Get a quote for a single symbol (stocks or crypto)",
+        inputSchema: { symbol: z.string().min(1) },
+      },
       async ({ symbol }) => {
         try {
           let isCrypto = symbol.includes("/");
@@ -1362,12 +1391,14 @@ export class OwokxMcpAgent extends McpAgent<Env> {
   }
 
   private registerTechnicalTools(_db: D1Client, broker: BrokerProviders) {
-    this.typedServer.tool(
+    this.typedServer.registerTool(
       "technicals-get",
-      "Calculate technical indicators for a symbol",
       {
-        symbol: z.string().min(1),
-        timeframe: z.enum(["1Min", "5Min", "15Min", "1Hour", "1Day"]).default("1Day"),
+        description: "Calculate technical indicators for a symbol",
+        inputSchema: {
+          symbol: z.string().min(1),
+          timeframe: z.enum(["1Min", "5Min", "15Min", "1Hour", "1Day"]).default("1Day"),
+        },
       },
       async ({ symbol, timeframe }) => {
         try {
@@ -1403,12 +1434,14 @@ export class OwokxMcpAgent extends McpAgent<Env> {
       }
     );
 
-    this.typedServer.tool(
+    this.typedServer.registerTool(
       "signals-get",
-      "Detect trading signals from technical indicators for a symbol",
       {
-        symbol: z.string().min(1),
-        timeframe: z.enum(["1Min", "5Min", "15Min", "1Hour", "1Day"]).default("1Day"),
+        description: "Detect trading signals from technical indicators for a symbol",
+        inputSchema: {
+          symbol: z.string().min(1),
+          timeframe: z.enum(["1Min", "5Min", "15Min", "1Hour", "1Day"]).default("1Day"),
+        },
       },
       async ({ symbol, timeframe }) => {
         try {
@@ -1456,12 +1489,14 @@ export class OwokxMcpAgent extends McpAgent<Env> {
       }
     );
 
-    this.typedServer.tool(
+    this.typedServer.registerTool(
       "signals-batch",
-      "Detect trading signals for multiple symbols at once",
       {
-        symbols: z.array(z.string()).min(1).max(20),
-        timeframe: z.enum(["1Min", "5Min", "15Min", "1Hour", "1Day"]).default("1Day"),
+        description: "Detect trading signals for multiple symbols at once",
+        inputSchema: {
+          symbols: z.array(z.string()).min(1).max(20),
+          timeframe: z.enum(["1Min", "5Min", "15Min", "1Hour", "1Day"]).default("1Day"),
+        },
       },
       async ({ symbols, timeframe }) => {
         try {
@@ -1499,13 +1534,15 @@ export class OwokxMcpAgent extends McpAgent<Env> {
   }
 
   private registerEventsTools(db: D1Client) {
-    this.typedServer.tool(
+    this.typedServer.registerTool(
       "events-ingest",
-      "Manually ingest a raw event for processing",
       {
-        source: z.string().min(1),
-        source_id: z.string().min(1),
-        content: z.string().min(1),
+        description: "Manually ingest a raw event for processing",
+        inputSchema: {
+          source: z.string().min(1),
+          source_id: z.string().min(1),
+          content: z.string().min(1),
+        },
       },
       async ({ source, source_id, content }) => {
         try {
@@ -1532,14 +1569,16 @@ export class OwokxMcpAgent extends McpAgent<Env> {
       }
     );
 
-    this.typedServer.tool(
+    this.typedServer.registerTool(
       "events-list",
-      "List structured events with optional filtering",
       {
-        event_type: z.string().optional(),
-        symbol: z.string().optional(),
-        validated: z.boolean().optional(),
-        limit: z.number().min(1).max(100).default(20),
+        description: "List structured events with optional filtering",
+        inputSchema: {
+          event_type: z.string().optional(),
+          symbol: z.string().optional(),
+          validated: z.boolean().optional(),
+          limit: z.number().min(1).max(100).default(20),
+        },
       },
       async (input) => {
         try {
@@ -1568,12 +1607,14 @@ export class OwokxMcpAgent extends McpAgent<Env> {
       }
     );
 
-    this.typedServer.tool(
+    this.typedServer.registerTool(
       "events-classify",
-      "Use LLM to classify raw content into structured event (requires LLM feature)",
       {
-        content: z.string().min(1),
-        store: z.boolean().default(true),
+        description: "Use LLM to classify raw content into structured event (requires LLM feature)",
+        inputSchema: {
+          content: z.string().min(1),
+          store: z.boolean().default(true),
+        },
       },
       async ({ content, store }) => {
         if (!this.llm) {
@@ -1626,13 +1667,15 @@ export class OwokxMcpAgent extends McpAgent<Env> {
   }
 
   private registerNewsTools(db: D1Client) {
-    this.typedServer.tool(
+    this.typedServer.registerTool(
       "news-list",
-      "List recent news items with optional filtering",
       {
-        symbol: z.string().optional(),
-        source: z.string().optional(),
-        limit: z.number().min(1).max(100).default(20),
+        description: "List recent news items with optional filtering",
+        inputSchema: {
+          symbol: z.string().optional(),
+          source: z.string().optional(),
+          limit: z.number().min(1).max(100).default(20),
+        },
       },
       async (input) => {
         try {
@@ -1658,17 +1701,19 @@ export class OwokxMcpAgent extends McpAgent<Env> {
       }
     );
 
-    this.typedServer.tool(
+    this.typedServer.registerTool(
       "news-index",
-      "Manually index a news item",
       {
-        source: z.string().min(1),
-        source_id: z.string().min(1),
-        headline: z.string().min(1),
-        summary: z.string().optional(),
-        url: z.string().url().optional(),
-        symbols: z.array(z.string()).default([]),
-        published_at: z.string().optional(),
+        description: "Manually index a news item",
+        inputSchema: {
+          source: z.string().min(1),
+          source_id: z.string().min(1),
+          headline: z.string().min(1),
+          summary: z.string().optional(),
+          url: z.string().url().optional(),
+          symbols: z.array(z.string()).default([]),
+          published_at: z.string().optional(),
+        },
       },
       async (input) => {
         try {
@@ -1705,10 +1750,12 @@ export class OwokxMcpAgent extends McpAgent<Env> {
   }
 
   private registerResearchTools(db: D1Client, broker: BrokerProviders) {
-    this.typedServer.tool(
+    this.typedServer.registerTool(
       "symbol-research",
-      "Generate comprehensive research report for a symbol (requires LLM feature)",
-      { symbol: z.string().min(1) },
+      {
+        description: "Generate comprehensive research report for a symbol (requires LLM feature)",
+        inputSchema: { symbol: z.string().min(1) },
+      },
       async ({ symbol }) => {
         const startTime = Date.now();
         if (!this.llm) {
@@ -1779,12 +1826,14 @@ export class OwokxMcpAgent extends McpAgent<Env> {
       }
     );
 
-    this.typedServer.tool(
+    this.typedServer.registerTool(
       "web-scrape-financial",
-      "Scrape financial data from allowed domains (finance.yahoo.com, sec.gov, stockanalysis.com, companiesmarketcap.com)",
       {
-        url: z.string().url(),
-        symbol: z.string().optional(),
+        description: "Scrape financial data from allowed domains (finance.yahoo.com, sec.gov, stockanalysis.com, companiesmarketcap.com)",
+        inputSchema: {
+          url: z.string().url(),
+          symbol: z.string().optional(),
+        },
       },
       async ({ url, symbol }) => {
         if (!isAllowedDomain(url)) {
@@ -1829,10 +1878,12 @@ export class OwokxMcpAgent extends McpAgent<Env> {
   }
 
   private registerOptionsTools() {
-    this.typedServer.tool(
+    this.typedServer.registerTool(
       "options-expirations",
-      "Get available option expiration dates for a symbol",
-      { underlying: z.string().min(1) },
+      {
+        description: "Get available option expiration dates for a symbol",
+        inputSchema: { underlying: z.string().min(1) },
+      },
       async ({ underlying }) => {
         if (!this.options || !this.options.isConfigured()) {
           return {
@@ -1873,12 +1924,14 @@ export class OwokxMcpAgent extends McpAgent<Env> {
       }
     );
 
-    this.typedServer.tool(
+    this.typedServer.registerTool(
       "options-chain",
-      "Get options chain for a symbol and expiration",
       {
-        underlying: z.string().min(1),
-        expiration: z.string().min(1),
+        description: "Get options chain for a symbol and expiration",
+        inputSchema: {
+          underlying: z.string().min(1),
+          expiration: z.string().min(1),
+        },
       },
       async ({ underlying, expiration }) => {
         if (!this.options || !this.options.isConfigured()) {
@@ -1913,10 +1966,12 @@ export class OwokxMcpAgent extends McpAgent<Env> {
       }
     );
 
-    this.typedServer.tool(
+    this.typedServer.registerTool(
       "options-snapshot",
-      "Get current snapshot for an options contract",
-      { contract_symbol: z.string().min(1) },
+      {
+        description: "Get current snapshot for an options contract",
+        inputSchema: { contract_symbol: z.string().min(1) },
+      },
       async ({ contract_symbol }) => {
         if (!this.options || !this.options.isConfigured()) {
           return {
@@ -1950,16 +2005,18 @@ export class OwokxMcpAgent extends McpAgent<Env> {
       }
     );
 
-    this.typedServer.tool(
+    this.typedServer.registerTool(
       "options-order-preview",
-      "Preview options order and get approval token. Does NOT execute. Use options-order-submit with the token.",
       {
-        contract_symbol: z.string().min(1),
-        side: z.enum(["buy", "sell"]),
-        qty: z.number().int().positive(),
-        order_type: z.enum(["market", "limit"]),
-        limit_price: z.number().positive().optional(),
-        time_in_force: z.enum(["day", "gtc"]).default("day"),
+        description: "Preview options order and get approval token. Does NOT execute. Use options-order-submit with the token.",
+        inputSchema: {
+          contract_symbol: z.string().min(1),
+          side: z.enum(["buy", "sell"]),
+          qty: z.number().int().positive(),
+          order_type: z.enum(["market", "limit"]),
+          limit_price: z.number().positive().optional(),
+          time_in_force: z.enum(["day", "gtc"]).default("day"),
+        },
       },
       async (input) => {
         const startTime = Date.now();
@@ -2111,10 +2168,12 @@ export class OwokxMcpAgent extends McpAgent<Env> {
       }
     );
 
-    this.typedServer.tool(
+    this.typedServer.registerTool(
       "options-order-submit",
-      "Execute options order with valid approval token from options-order-preview",
-      { approval_token: z.string().min(1) },
+      {
+        description: "Execute options order with valid approval token from options-order-preview",
+        inputSchema: { approval_token: z.string().min(1) },
+      },
       async ({ approval_token }) => {
         const startTime = Date.now();
         const db = createD1Client(this.env.DB);
