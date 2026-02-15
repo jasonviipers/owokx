@@ -90,56 +90,64 @@ export class OwokxMcpAgent extends McpAgent<Env> {
   }
 
   private registerAuthTools(db: ReturnType<typeof createD1Client>, broker: BrokerProviders) {
-    this.typedServer.registerTool("auth-verify", { description: "Verify that broker API credentials are valid" }, async () => {
-      const startTime = Date.now();
-      try {
-        const account = await broker.trading.getAccount();
+    this.typedServer.registerTool(
+      "auth-verify",
+      { description: "Verify that broker API credentials are valid" },
+      async () => {
+        const startTime = Date.now();
+        try {
+          const account = await broker.trading.getAccount();
+          const result = success({
+            verified: true,
+            broker: broker.broker,
+            account_id: account.id,
+            account_number: account.account_number,
+            status: account.status,
+            paper: broker.broker === "alpaca" ? this.env.ALPACA_PAPER === "true" : undefined,
+          });
+          await insertToolLog(db, {
+            request_id: this.requestId,
+            tool_name: "auth-verify",
+            input: {},
+            output: result,
+            latency_ms: Date.now() - startTime,
+            provider_calls: 1,
+          });
+          return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+        } catch (error) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: JSON.stringify(failure({ code: ErrorCode.UNAUTHORIZED, message: String(error) }), null, 2),
+              },
+            ],
+            isError: true,
+          };
+        }
+      }
+    );
+
+    this.typedServer.registerTool(
+      "user-get",
+      { description: "Get user/session information and system configuration" },
+      async () => {
         const result = success({
-          verified: true,
-          broker: broker.broker,
-          account_id: account.id,
-          account_number: account.account_number,
-          status: account.status,
-          paper: broker.broker === "alpaca" ? this.env.ALPACA_PAPER === "true" : undefined,
-        });
-        await insertToolLog(db, {
-          request_id: this.requestId,
-          tool_name: "auth-verify",
-          input: {},
-          output: result,
-          latency_ms: Date.now() - startTime,
-          provider_calls: 1,
+          environment: this.env.ENVIRONMENT,
+          paper_trading: this.env.ALPACA_PAPER === "true",
+          features: {
+            llm_research: this.env.FEATURE_LLM_RESEARCH === "true",
+            options: this.env.FEATURE_OPTIONS === "true",
+          },
+          policy: {
+            max_position_pct_equity: this.policyConfig!.max_position_pct_equity,
+            max_notional_per_trade: this.policyConfig!.max_notional_per_trade,
+            max_daily_loss_pct: this.policyConfig!.max_daily_loss_pct,
+          },
         });
         return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
-      } catch (error) {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: JSON.stringify(failure({ code: ErrorCode.UNAUTHORIZED, message: String(error) }), null, 2),
-            },
-          ],
-          isError: true,
-        };
       }
-    });
-
-    this.typedServer.registerTool("user-get", { description: "Get user/session information and system configuration" }, async () => {
-      const result = success({
-        environment: this.env.ENVIRONMENT,
-        paper_trading: this.env.ALPACA_PAPER === "true",
-        features: {
-          llm_research: this.env.FEATURE_LLM_RESEARCH === "true",
-          options: this.env.FEATURE_OPTIONS === "true",
-        },
-        policy: {
-          max_position_pct_equity: this.policyConfig!.max_position_pct_equity,
-          max_notional_per_trade: this.policyConfig!.max_notional_per_trade,
-          max_daily_loss_pct: this.policyConfig!.max_daily_loss_pct,
-        },
-      });
-      return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
-    });
+    );
   }
 
   private registerAccountTools(db: ReturnType<typeof createD1Client>, broker: BrokerProviders) {
@@ -716,29 +724,33 @@ export class OwokxMcpAgent extends McpAgent<Env> {
       }
     );
 
-    this.typedServer.registerTool("orders-cancel", { description: "Cancel an order by ID", inputSchema: { order_id: z.string() } }, async ({ order_id }) => {
-      try {
-        await broker.trading.cancelOrder(order_id);
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: JSON.stringify(success({ message: `Order ${order_id} cancelled` }), null, 2),
-            },
-          ],
-        };
-      } catch (error) {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: JSON.stringify(failure({ code: ErrorCode.PROVIDER_ERROR, message: String(error) }), null, 2),
-            },
-          ],
-          isError: true,
-        };
+    this.typedServer.registerTool(
+      "orders-cancel",
+      { description: "Cancel an order by ID", inputSchema: { order_id: z.string() } },
+      async ({ order_id }) => {
+        try {
+          await broker.trading.cancelOrder(order_id);
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: JSON.stringify(success({ message: `Order ${order_id} cancelled` }), null, 2),
+              },
+            ],
+          };
+        } catch (error) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: JSON.stringify(failure({ code: ErrorCode.PROVIDER_ERROR, message: String(error) }), null, 2),
+              },
+            ],
+            isError: true,
+          };
+        }
       }
-    });
+    );
   }
 
   private registerRiskTools(db: ReturnType<typeof createD1Client>, broker: BrokerProviders) {
@@ -1146,22 +1158,26 @@ export class OwokxMcpAgent extends McpAgent<Env> {
       }
     );
 
-    this.typedServer.registerTool("memory-get-preferences", { description: "Get stored user trading preferences" }, async () => {
-      try {
-        const preferences = await getPreferences(db);
-        return { content: [{ type: "text" as const, text: JSON.stringify(success({ preferences }), null, 2) }] };
-      } catch (error) {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: JSON.stringify(failure({ code: ErrorCode.INTERNAL_ERROR, message: String(error) }), null, 2),
-            },
-          ],
-          isError: true,
-        };
+    this.typedServer.registerTool(
+      "memory-get-preferences",
+      { description: "Get stored user trading preferences" },
+      async () => {
+        try {
+          const preferences = await getPreferences(db);
+          return { content: [{ type: "text" as const, text: JSON.stringify(success({ preferences }), null, 2) }] };
+        } catch (error) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: JSON.stringify(failure({ code: ErrorCode.INTERNAL_ERROR, message: String(error) }), null, 2),
+              },
+            ],
+            isError: true,
+          };
+        }
       }
-    });
+    );
   }
 
   private registerMarketDataTools(db: D1Client, broker: BrokerProviders) {
@@ -1829,7 +1845,8 @@ export class OwokxMcpAgent extends McpAgent<Env> {
     this.typedServer.registerTool(
       "web-scrape-financial",
       {
-        description: "Scrape financial data from allowed domains (finance.yahoo.com, sec.gov, stockanalysis.com, companiesmarketcap.com)",
+        description:
+          "Scrape financial data from allowed domains (finance.yahoo.com, sec.gov, stockanalysis.com, companiesmarketcap.com)",
         inputSchema: {
           url: z.string().url(),
           symbol: z.string().optional(),
@@ -2008,7 +2025,8 @@ export class OwokxMcpAgent extends McpAgent<Env> {
     this.typedServer.registerTool(
       "options-order-preview",
       {
-        description: "Preview options order and get approval token. Does NOT execute. Use options-order-submit with the token.",
+        description:
+          "Preview options order and get approval token. Does NOT execute. Use options-order-submit with the token.",
         inputSchema: {
           contract_symbol: z.string().min(1),
           side: z.enum(["buy", "sell"]),
