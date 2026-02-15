@@ -191,19 +191,33 @@ function parsePosition(raw: AccountPosition): Position {
   };
 }
 
-function parseAccount(raw: AccountBalance, defaultQuoteCcy: string): Account {
-  const preferredCcy = raw.details.find((detail) => detail.ccy === defaultQuoteCcy) ?? raw.details[0];
-  const equity = parseNumber(raw.totalEq, 0);
+const DEMO_VIRTUAL_CASH = 25_000;
+const DEMO_VIRTUAL_BUYING_POWER = 40_000;
+
+function parseAccount(raw: AccountBalance, defaultQuoteCcy: string, simulatedTrading: boolean = false): Account {
+  const details = Array.isArray(raw.details) ? raw.details : [];
+  const preferredCcy = details.find((detail) => detail.ccy === defaultQuoteCcy) ?? details[0];
+
+  const reportedCash = parseNumber(preferredCcy?.cashBal, 0);
+  const reportedEquity = parseNumber(raw.totalEq, 0);
+  const reportedBuyingPower = parseNumber(raw.adjEq, reportedEquity);
+
+  const isDemoWithEmptyQuoteBalance = simulatedTrading && reportedCash <= 0;
+  const equity = isDemoWithEmptyQuoteBalance ? Math.max(reportedEquity, DEMO_VIRTUAL_CASH) : reportedEquity;
+  const cash = isDemoWithEmptyQuoteBalance ? equity : reportedCash;
+  const buyingPower = isDemoWithEmptyQuoteBalance
+    ? Math.max(reportedBuyingPower, equity, DEMO_VIRTUAL_BUYING_POWER)
+    : reportedBuyingPower;
 
   return {
     id: "okx-account",
     account_number: "okx-account",
     status: "ACTIVE",
     currency: preferredCcy?.ccy ?? defaultQuoteCcy,
-    cash: parseNumber(preferredCcy?.cashBal, 0),
-    buying_power: parseNumber(raw.adjEq, equity),
-    regt_buying_power: parseNumber(raw.adjEq, equity),
-    daytrading_buying_power: parseNumber(raw.adjEq, equity),
+    cash,
+    buying_power: buyingPower,
+    regt_buying_power: buyingPower,
+    daytrading_buying_power: buyingPower,
     equity,
     last_equity: equity,
     long_market_value: 0,
@@ -482,7 +496,7 @@ export function createOkxTradingProvider(client: OkxClient): OkxTradingProvider 
           throw createError(ErrorCode.PROVIDER_ERROR, "No account balance data returned by OKX");
         }
 
-        return parseAccount(first, client.config.defaultQuoteCcy ?? "USDT");
+        return parseAccount(first, client.config.defaultQuoteCcy ?? "USDT", Boolean(client.config.simulatedTrading));
       } catch (error) {
         client.logger.error("Failed to fetch account", error);
         throw handleOkxError(error);
