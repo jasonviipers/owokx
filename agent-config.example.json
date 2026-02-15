@@ -15,5 +15,5 @@
   "llm_model": "gpt-4o-mini",
   "llm_analyst_model": "gpt-4o",
   
-  "starting_equity": 100000
+  "starting_equity": 200
 }

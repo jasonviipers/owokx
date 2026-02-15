@@ -12,6 +12,10 @@ export interface OkxProviders {
 export function createOkxProviders(env: Env): OkxProviders {
   const maxRequestsPerSecond = Number(env.OKX_MAX_REQUESTS_PER_SECOND ?? "5");
   const maxRetries = Number(env.OKX_MAX_RETRIES ?? "2");
+  const simulatedTrading = parseBoolean(env.OKX_SIMULATED_TRADING, false);
+  const enableDemoVirtualBalances = parseBoolean(env.OKX_DEMO_VIRTUAL_BALANCES, true);
+  const demoVirtualCashUsd = Number(env.OKX_DEMO_VIRTUAL_CASH_USD ?? "100000");
+  const demoVirtualBuyingPowerUsd = Number(env.OKX_DEMO_VIRTUAL_BUYING_POWER_USD ?? `${demoVirtualCashUsd}`);
 
   // DEBUG: Log OKX configuration (remove after troubleshooting)
   // console.log("🔍 OKX Config Debug:", {
@@ -31,7 +35,7 @@ export function createOkxProviders(env: Env): OkxProviders {
     secret: env.OKX_SECRET!,
     passphrase: env.OKX_PASSPHRASE!,
     baseUrl: env.OKX_BASE_URL ?? "https://eea.okx.com",
-    simulatedTrading: parseBoolean(env.OKX_SIMULATED_TRADING, false),
+    simulatedTrading,
     maxRequestsPerSecond: Number.isFinite(maxRequestsPerSecond) ? maxRequestsPerSecond : 5,
     maxRetries: Number.isFinite(maxRetries) ? maxRetries : 2,
     logger: {
@@ -48,7 +52,14 @@ export function createOkxProviders(env: Env): OkxProviders {
   const quote = env.OKX_DEFAULT_QUOTE_CCY ?? "USDT";
 
   return {
-    trading: createOkxTradingProvider(client, quote),
+    trading: createOkxTradingProvider(client, quote, {
+      simulatedTrading,
+      enableDemoVirtualBalances,
+      demoVirtualCashUsd: Number.isFinite(demoVirtualCashUsd) ? demoVirtualCashUsd : 100000,
+      demoVirtualBuyingPowerUsd: Number.isFinite(demoVirtualBuyingPowerUsd)
+        ? demoVirtualBuyingPowerUsd
+        : demoVirtualCashUsd,
+    }),
     marketData: createOkxMarketDataProvider(client, quote),
   };
 }

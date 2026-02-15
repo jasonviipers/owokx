@@ -23,6 +23,9 @@ export interface Env {
   OKX_PASSPHRASE?: string;
   OKX_BASE_URL?: string;
   OKX_SIMULATED_TRADING?: string;
+  OKX_DEMO_VIRTUAL_BALANCES?: string;
+  OKX_DEMO_VIRTUAL_CASH_USD?: string;
+  OKX_DEMO_VIRTUAL_BUYING_POWER_USD?: string;
   OKX_DEFAULT_QUOTE_CCY?: string;
   OKX_MAX_REQUESTS_PER_SECOND?: string;
   OKX_MAX_RETRIES?: string;

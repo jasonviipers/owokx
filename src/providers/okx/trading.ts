@@ -28,6 +28,13 @@ interface OkxBalanceEntry {
   details?: OkxBalanceDetails[];
 }
 
+export interface OkxTradingProviderOptions {
+  simulatedTrading?: boolean;
+  enableDemoVirtualBalances?: boolean;
+  demoVirtualCashUsd?: number;
+  demoVirtualBuyingPowerUsd?: number;
+}
+
 interface OkxOrderInfo {
   instId: string;
   ordId: string;
@@ -143,7 +150,8 @@ function parseOkxOrder(raw: OkxOrderInfo): Order {
 export class OkxTradingProvider implements BrokerProvider {
   constructor(
     private client: OkxClient,
-    private defaultQuote: string
+    private defaultQuote: string,
+    private options: OkxTradingProviderOptions = {}
   ) {}
 
   async getAccount(): Promise<Account> {
@@ -154,8 +162,34 @@ export class OkxTradingProvider implements BrokerProvider {
     const quote = this.defaultQuote.toUpperCase();
     const quoteRow = details.find((d) => d.ccy.toUpperCase() === quote);
 
-    const cash = parseNumber(quoteRow?.availBal ?? quoteRow?.cashBal);
-    const equity = parseNumber(root?.totalEq) || cash;
+    const availBal = parseNumber(quoteRow?.availBal);
+    const cashBal = parseNumber(quoteRow?.cashBal);
+    const quoteEq = parseNumber(quoteRow?.eq);
+    let cash = Math.max(availBal, cashBal, quoteEq);
+
+    const isDemoVirtualEnabled =
+      this.options.simulatedTrading === true && (this.options.enableDemoVirtualBalances ?? true) === true;
+    if (isDemoVirtualEnabled && cash <= 0) {
+      const defaultSeed = 100_000;
+      const configuredSeed = this.options.demoVirtualCashUsd;
+      const seed = Number.isFinite(configuredSeed) ? Math.max(0, configuredSeed as number) : defaultSeed;
+      cash = seed;
+    }
+
+    let buyingPower = cash;
+    if (isDemoVirtualEnabled && buyingPower <= 0) {
+      const configuredBuyingPower = this.options.demoVirtualBuyingPowerUsd;
+      const fallbackBuyingPower = this.options.demoVirtualCashUsd;
+      const seed = Number.isFinite(configuredBuyingPower)
+        ? Math.max(0, configuredBuyingPower as number)
+        : Number.isFinite(fallbackBuyingPower)
+          ? Math.max(0, fallbackBuyingPower as number)
+          : 100_000;
+      buyingPower = seed;
+    }
+
+    const exchangeEquity = parseNumber(root?.totalEq);
+    const equity = Math.max(exchangeEquity, cash);
 
     return {
       id: "okx",
@@ -163,9 +197,9 @@ export class OkxTradingProvider implements BrokerProvider {
       status: "ACTIVE",
       currency: quote,
       cash,
-      buying_power: cash,
-      regt_buying_power: cash,
-      daytrading_buying_power: cash,
+      buying_power: buyingPower,
+      regt_buying_power: buyingPower,
+      daytrading_buying_power: buyingPower,
       equity,
       last_equity: equity,
       long_market_value: Math.max(0, equity - cash),
@@ -449,6 +483,10 @@ export class OkxTradingProvider implements BrokerProvider {
   }
 }
 
-export function createOkxTradingProvider(client: OkxClient, defaultQuote: string): OkxTradingProvider {
-  return new OkxTradingProvider(client, defaultQuote);
+export function createOkxTradingProvider(
+  client: OkxClient,
+  defaultQuote: string,
+  options?: OkxTradingProviderOptions
+): OkxTradingProvider {
+  return new OkxTradingProvider(client, defaultQuote, options);
 }
