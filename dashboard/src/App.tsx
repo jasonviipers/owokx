@@ -16,6 +16,32 @@ import { MobileNav } from './components/Mobilenav'
 
 const API_BASE = '/api'
 declare const __OWOKX_API_URL__: string | undefined
+const OWOKX_BROWSER_TOKEN_KEY = 'OWOKX_BEARER_TOKEN'
+
+function getBrowserToken(): string | null {
+  if (typeof window === 'undefined') return null
+  try {
+    const token = window.sessionStorage.getItem(OWOKX_BROWSER_TOKEN_KEY)
+    if (!token) return null
+    const trimmed = token.trim()
+    return trimmed.length > 0 ? trimmed : null
+  } catch {
+    return null
+  }
+}
+
+function setBrowserToken(token: string | null): void {
+  if (typeof window === 'undefined') return
+  try {
+    if (!token || token.trim().length === 0) {
+      window.sessionStorage.removeItem(OWOKX_BROWSER_TOKEN_KEY)
+      return
+    }
+    window.sessionStorage.setItem(OWOKX_BROWSER_TOKEN_KEY, token.trim())
+  } catch {
+    // ignore browser storage errors
+  }
+}
 
 interface FinancialStreamPayload {
   account: Status['account']
@@ -40,18 +66,38 @@ interface SetupStatusData {
   }
 }
 
+interface SaveConfigResponse {
+  ok?: boolean
+  error?: string
+  details?: unknown
+  config?: Config
+  data?: Config
+  message?: string
+}
+
 function authFetch(url: string, options: RequestInit = {}): Promise<Response> {
   const headers = new Headers(options.headers)
   if (!headers.has('Content-Type') && options.body) {
     headers.set('Content-Type', 'application/json')
   }
+  if (!headers.has('Authorization')) {
+    const token = getBrowserToken()
+    if (token) {
+      headers.set('Authorization', `Bearer ${token}`)
+    }
+  }
   return fetch(url, { ...options, headers, credentials: 'include' })
 }
 
 async function saveSessionToken(token: string): Promise<Response> {
+  const headers = new Headers({ 'Content-Type': 'application/json' })
+  const trimmed = token.trim()
+  if (trimmed) {
+    headers.set('Authorization', `Bearer ${trimmed}`)
+  }
   return fetch('/auth/session', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers,
     credentials: 'include',
     body: JSON.stringify({ token }),
   })
@@ -428,6 +474,7 @@ export default function App() {
   const [statusStreamConnected, setStatusStreamConnected] = useState(false)
   const statusStreamRef = useRef<EventSource | null>(null)
   const statusStreamRetryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const configSaveInFlightRef = useRef(false)
   
   const [wasConnected, setWasConnected] = useState(false)
   useEffect(() => {
@@ -665,13 +712,52 @@ export default function App() {
   }
 
   const handleSaveConfig = async (config: Config) => {
-    const res = await authFetch(`${API_BASE}/config`, {
-      method: 'POST',
-      body: JSON.stringify(config),
-    })
-    const data = await res.json()
-    if (data.ok && status) {
-      setStatus({ ...status, config: data.data })
+    if (configSaveInFlightRef.current) {
+      throw new Error('A configuration save is already in progress. Please wait.')
+    }
+
+    const broker = config?.broker
+    if (broker !== 'alpaca' && broker !== 'okx') {
+      throw new Error('Invalid broker selection. Choose Alpaca or OKX.')
+    }
+
+    configSaveInFlightRef.current = true
+    setAgentMessage(null)
+
+    try {
+      const res = await authFetch(`${API_BASE}/config`, {
+        method: 'POST',
+        body: JSON.stringify(config),
+      })
+
+      const payload = (await res.json().catch(() => ({}))) as SaveConfigResponse
+      if (!res.ok || payload?.ok === false) {
+        const errorMessage =
+          payload?.error ||
+          (typeof payload?.details === 'string' ? payload.details : null) ||
+          `Failed to save configuration (HTTP ${res.status})`
+        throw new Error(errorMessage)
+      }
+
+      const savedConfig = payload.config ?? payload.data
+      if (!savedConfig || (savedConfig.broker !== 'alpaca' && savedConfig.broker !== 'okx')) {
+        throw new Error('Configuration saved but broker activation payload was invalid.')
+      }
+
+      setStatus(prev => (prev ? { ...prev, config: savedConfig } : prev))
+
+      // Refresh live broker/account state immediately after config save.
+      await fetchStatus()
+      setAgentMessage({
+        type: 'success',
+        text: `Configuration saved. Active broker switched to ${savedConfig.broker.toUpperCase()}.`,
+      })
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      setAgentMessage({ type: 'error', text: `Save failed: ${message}` })
+      throw error
+    } finally {
+      configSaveInFlightRef.current = false
     }
   }
 
@@ -891,6 +977,7 @@ export default function App() {
       if (!res.ok || data?.ok === false) {
         throw new Error(data?.error || 'Authentication failed')
       }
+      setBrowserToken(token)
       setAuthTokenInput('')
       setError(null)
       await fetchStatus()

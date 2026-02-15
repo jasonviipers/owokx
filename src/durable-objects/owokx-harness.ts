@@ -49,7 +49,15 @@ import {
 import { resolveShardKey } from "../lib/sharding";
 import { type BrokerProviders, createBrokerProviders } from "../providers/broker-factory";
 import { createLLMProvider } from "../providers/llm/factory";
-import type { Account, CompletionParams, CompletionResult, LLMProvider, MarketClock, Position, Snapshot } from "../providers/types";
+import type {
+  Account,
+  CompletionParams,
+  CompletionResult,
+  LLMProvider,
+  MarketClock,
+  Position,
+  Snapshot,
+} from "../providers/types";
 import { safeValidateAgentConfig } from "../schemas/agent-config";
 import type { D1Client } from "../storage/d1/client";
 import { createD1Client } from "../storage/d1/client";
@@ -265,6 +273,9 @@ interface MemoryEpisode {
 interface DynamicRiskProfile {
   timestamp: number;
   marketRegime: "trending" | "ranging" | "volatile";
+  regimeProbabilities: Record<"trending" | "ranging" | "volatile", number>;
+  bayesianWinProbability: number;
+  bayesianLossProbability: number;
   realizedVolatility: number;
   maxDrawdownPct: number;
   sharpeLike: number;
@@ -356,6 +367,35 @@ interface StressTestResult {
     projectedLoss: number;
     projectedDrawdownPct: number;
   }>;
+}
+
+interface RegimeForecastState {
+  transitionCounts: number[][];
+  probabilities: Record<"trending" | "ranging" | "volatile", number>;
+  lastObservedRegime: "trending" | "ranging" | "volatile" | null;
+  history: Array<{ timestamp: number; regime: "trending" | "ranging" | "volatile" }>;
+  lastUpdatedAt: number;
+}
+
+interface BayesianRiskState {
+  alpha: number;
+  beta: number;
+  samples: number;
+  expectedLossPctEma: number;
+  expectedGainPctEma: number;
+  lastUpdatedAt: number;
+}
+
+interface DriftDetectionState {
+  shortErrorEma: number;
+  longErrorEma: number;
+  ratio: number;
+  samples: number;
+  consecutiveBreaches: number;
+  retrainPending: boolean;
+  lastTriggerAt: number;
+  lastRetrainAt: number;
+  retrainCount: number;
 }
 
 interface OptimizationState {
@@ -458,6 +498,9 @@ interface AgentState {
   memoryEpisodes: MemoryEpisode[];
   lastRiskProfile: DynamicRiskProfile | null;
   marketRegime: MarketRegime;
+  regimeForecast: RegimeForecastState;
+  bayesianRisk: BayesianRiskState;
+  driftDetection: DriftDetectionState;
   predictiveModel: PredictiveModelState;
   lastStressTest: StressTestResult | null;
   optimization: OptimizationState;
@@ -614,6 +657,43 @@ const DEFAULT_MARKET_REGIME: MarketRegime = {
   since: 0,
 };
 
+const DEFAULT_REGIME_FORECAST: RegimeForecastState = {
+  transitionCounts: [
+    [1, 1, 1],
+    [1, 1, 1],
+    [1, 1, 1],
+  ],
+  probabilities: {
+    trending: 1 / 3,
+    ranging: 1 / 3,
+    volatile: 1 / 3,
+  },
+  lastObservedRegime: null,
+  history: [],
+  lastUpdatedAt: 0,
+};
+
+const DEFAULT_BAYESIAN_RISK: BayesianRiskState = {
+  alpha: 6,
+  beta: 6,
+  samples: 0,
+  expectedLossPctEma: 0,
+  expectedGainPctEma: 0,
+  lastUpdatedAt: 0,
+};
+
+const DEFAULT_DRIFT_DETECTION: DriftDetectionState = {
+  shortErrorEma: 0,
+  longErrorEma: 0,
+  ratio: 1,
+  samples: 0,
+  consecutiveBreaches: 0,
+  retrainPending: false,
+  lastTriggerAt: 0,
+  lastRetrainAt: 0,
+  retrainCount: 0,
+};
+
 const DEFAULT_PREDICTIVE_MODEL: PredictiveModelState = {
   bias: 0,
   learningRate: 0.05,
@@ -695,6 +775,14 @@ const DEFAULT_STATE: AgentState = {
   memoryEpisodes: [],
   lastRiskProfile: null,
   marketRegime: { ...DEFAULT_MARKET_REGIME },
+  regimeForecast: {
+    ...DEFAULT_REGIME_FORECAST,
+    transitionCounts: DEFAULT_REGIME_FORECAST.transitionCounts.map((row) => [...row]),
+    probabilities: { ...DEFAULT_REGIME_FORECAST.probabilities },
+    history: [],
+  },
+  bayesianRisk: { ...DEFAULT_BAYESIAN_RISK },
+  driftDetection: { ...DEFAULT_DRIFT_DETECTION },
   predictiveModel: { ...DEFAULT_PREDICTIVE_MODEL, weights: { ...DEFAULT_PREDICTIVE_MODEL.weights }, perSymbol: {} },
   lastStressTest: null,
   optimization: { ...DEFAULT_OPTIMIZATION_STATE },
@@ -1231,6 +1319,11 @@ export class OwokxHarness extends DurableObject<Env> {
   private readonly l1ReadCache = new Map<string, { expiresAt: number; payload: unknown }>();
   private readonly inFlightReads = new Map<string, Promise<unknown>>();
   private readonly maxL1ReadCacheEntries = 128;
+  private cacheReadHits = 0;
+  private cacheReadMisses = 0;
+  private cacheCoalescingHitCount = 0;
+  private readonly d1QueryLatencySamplesMs: number[] = [];
+  private readonly maxD1LatencySamples = 256;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -1275,6 +1368,29 @@ export class OwokxHarness extends DurableObject<Env> {
             ...DEFAULT_MARKET_REGIME.characteristics,
             ...(this.state.marketRegime?.characteristics ?? {}),
           },
+        };
+        this.state.regimeForecast = {
+          ...DEFAULT_REGIME_FORECAST,
+          ...(this.state.regimeForecast ?? {}),
+          transitionCounts:
+            this.state.regimeForecast?.transitionCounts?.length === 3
+              ? this.state.regimeForecast.transitionCounts.map((row) => [...row].slice(0, 3))
+              : DEFAULT_REGIME_FORECAST.transitionCounts.map((row) => [...row]),
+          probabilities: {
+            ...DEFAULT_REGIME_FORECAST.probabilities,
+            ...(this.state.regimeForecast?.probabilities ?? {}),
+          },
+          history: Array.isArray(this.state.regimeForecast?.history)
+            ? this.state.regimeForecast.history.slice(-240)
+            : [],
+        };
+        this.state.bayesianRisk = {
+          ...DEFAULT_BAYESIAN_RISK,
+          ...(this.state.bayesianRisk ?? {}),
+        };
+        this.state.driftDetection = {
+          ...DEFAULT_DRIFT_DETECTION,
+          ...(this.state.driftDetection ?? {}),
         };
         this.state.predictiveModel = {
           ...DEFAULT_PREDICTIVE_MODEL,
@@ -1997,6 +2113,9 @@ export class OwokxHarness extends DurableObject<Env> {
       TWITTER_BUCKET_CAPACITY,
       this.state.twitterReadTokens + elapsedSeconds * TWITTER_BUCKET_REFILL_PER_SECOND
     );
+    const cacheRequests = this.cacheReadHits + this.cacheReadMisses;
+    const cacheHitRate = cacheRequests > 0 ? this.cacheReadHits / cacheRequests : 0;
+    const d1LatencyP95Ms = this.percentile(this.d1QueryLatencySamplesMs, 95);
 
     return this.jsonResponse({
       ok: true,
@@ -2030,6 +2149,21 @@ export class OwokxHarness extends DurableObject<Env> {
         optimization: this.state.optimization,
         predictive_model_samples: this.state.predictiveModel.samples,
         predictive_model_hit_rate: this.state.predictiveModel.hitRate,
+        performance: {
+          cache: {
+            hit_rate: Number(cacheHitRate.toFixed(4)),
+            hits: this.cacheReadHits,
+            misses: this.cacheReadMisses,
+            requests: cacheRequests,
+          },
+          coalescing: {
+            hit_count: this.cacheCoalescingHitCount,
+          },
+          d1: {
+            query_latency_p95_ms: Number(d1LatencyP95Ms.toFixed(2)),
+            query_latency_samples: this.d1QueryLatencySamplesMs.length,
+          },
+        },
         swarm_role_health: this.state.swarmRoleHealth,
         swarm_role_sync_at: this.state.lastSwarmRoleSyncAt || null,
         now_ms: now,
@@ -2474,6 +2608,34 @@ export class OwokxHarness extends DurableObject<Env> {
       );
     }
 
+    try {
+      createBrokerProviders(this.env, parsedConfig.data.broker);
+    } catch (error) {
+      this.log("System", "config_update_rejected", {
+        reason: "broker_not_configured",
+        changed_keys: changedKeys,
+        broker: parsedConfig.data.broker,
+        message: String(error),
+        severity: "error",
+        status: "failed",
+        event_type: "api",
+      });
+      return new Response(
+        JSON.stringify(
+          {
+            ok: false,
+            error: `Broker '${parsedConfig.data.broker}' is not configured: ${String(error)}`,
+          },
+          null,
+          2
+        ),
+        {
+          status: 400,
+          headers: { "Content-Type": "application/json" },
+        }
+      );
+    }
+
     this.state.config = parsedConfig.data;
     this.enforceProductionSwarmGuard();
     this.state.optimization.adaptiveDataPollIntervalMs = this.state.config.data_poll_interval_ms;
@@ -2486,7 +2648,12 @@ export class OwokxHarness extends DurableObject<Env> {
     });
     this.initializeLLM();
     await this.persist();
-    return this.jsonResponse({ ok: true, config: this.state.config });
+    return this.jsonResponse({
+      ok: true,
+      message: `Configuration saved. Active broker: ${this.state.config.broker.toUpperCase()}`,
+      config: this.state.config,
+      data: this.state.config,
+    });
   }
 
   private async handleEnable(): Promise<Response> {
@@ -2545,16 +2712,18 @@ export class OwokxHarness extends DurableObject<Env> {
       const db = this.getD1ClientOrNull();
       if (db) {
         try {
-          const queried = await queryActivityLogs(db, {
-            since,
-            until,
-            eventTypes: [...eventTypes],
-            severities: [...severities],
-            statuses: [...statuses],
-            agents: [...agents],
-            search,
-            limit,
-          });
+          const queried = await this.trackD1Query(() =>
+            queryActivityLogs(db, {
+              since,
+              until,
+              eventTypes: [...eventTypes],
+              severities: [...severities],
+              statuses: [...statuses],
+              agents: [...agents],
+              search,
+              limit,
+            })
+          );
 
           const parsedLogs = queried.logs
             .map((value) => {
@@ -2671,7 +2840,7 @@ export class OwokxHarness extends DurableObject<Env> {
             const db = this.getD1ClientOrNull();
             if (!db) return [] as Array<{ timestamp_ms: number; equity: number }>;
             try {
-              return await queryPortfolioSnapshots(db, { since: cutoffMs || null, limit: 5000 });
+              return await this.trackD1Query(() => queryPortfolioSnapshots(db, { since: cutoffMs || null, limit: 5000 }));
             } catch {
               return [] as Array<{ timestamp_ms: number; equity: number }>;
             }
@@ -2742,7 +2911,7 @@ export class OwokxHarness extends DurableObject<Env> {
           const db = this.getD1ClientOrNull();
           if (!db) return [] as Array<{ timestamp_ms: number; equity: number }>;
           try {
-            return await queryPortfolioSnapshots(db, { since: cutoffMs || null, limit: 5000 });
+            return await this.trackD1Query(() => queryPortfolioSnapshots(db, { since: cutoffMs || null, limit: 5000 }));
           } catch {
             return [] as Array<{ timestamp_ms: number; equity: number }>;
           }
@@ -3685,18 +3854,18 @@ export class OwokxHarness extends DurableObject<Env> {
       const { response, modelUsed } = await this.completeWithRouting(
         "crypto",
         {
-        messages: [
-          {
-            role: "system",
-            content:
-              "You are a crypto analyst. Be skeptical of FOMO. Crypto is volatile - only recommend BUY for strong setups. Output valid JSON only.",
-          },
-          { role: "user", content: prompt },
-        ],
-        max_tokens: promptPolicy.maxTokens,
-        temperature: 0, // Task 2: Deterministic
-        seed: 42, // Task 2: Deterministic
-        response_format: { type: "json_object" },
+          messages: [
+            {
+              role: "system",
+              content:
+                "You are a crypto analyst. Be skeptical of FOMO. Crypto is volatile - only recommend BUY for strong setups. Output valid JSON only.",
+            },
+            { role: "user", content: prompt },
+          ],
+          max_tokens: promptPolicy.maxTokens,
+          temperature: 0, // Task 2: Deterministic
+          seed: 42, // Task 2: Deterministic
+          response_format: { type: "json_object" },
         },
         { stressFailed: !!this.state.lastStressTest && !this.state.lastStressTest.passed }
       );
@@ -4213,8 +4382,7 @@ export class OwokxHarness extends DurableObject<Env> {
     this.state.llmRouting.calibrationSamples += 1;
 
     const targetScale = Math.max(0.78, Math.min(1.04, 1 - Math.max(0, emaError - 0.18) * 0.42));
-    this.state.llmRouting.confidenceScale =
-      this.state.llmRouting.confidenceScale * 0.8 + targetScale * 0.2;
+    this.state.llmRouting.confidenceScale = this.state.llmRouting.confidenceScale * 0.8 + targetScale * 0.2;
   }
 
   private calibrateActionConfidence(rawConfidence: number, model: string): number {
@@ -4266,7 +4434,9 @@ export class OwokxHarness extends DurableObject<Env> {
     const candidatePressure = this.clamp01((context.candidateCount ?? 0) / 12);
     const signalStrength = this.clamp01(Math.abs(context.avgSignalStrength ?? 0));
     const stressPenalty = context.stressFailed ? 0.25 : 0;
-    const intensity = this.clamp01(volatility * 0.45 + candidatePressure * 0.25 + signalStrength * 0.15 + stressPenalty);
+    const intensity = this.clamp01(
+      volatility * 0.45 + candidatePressure * 0.25 + signalStrength * 0.15 + stressPenalty
+    );
 
     const tier: PromptTier = intensity > 0.72 ? "deep" : intensity > 0.42 ? "standard" : "lean";
 
@@ -4788,6 +4958,173 @@ export class OwokxHarness extends DurableObject<Env> {
     return this.clamp01(adjusted);
   }
 
+  private regimeToIndex(regime: "trending" | "ranging" | "volatile"): 0 | 1 | 2 {
+    if (regime === "trending") return 0;
+    if (regime === "ranging") return 1;
+    return 2;
+  }
+
+  private normalizeRegimeProbabilities(
+    values: Record<"trending" | "ranging" | "volatile", number>
+  ): Record<"trending" | "ranging" | "volatile", number> {
+    const trending = Math.max(0, values.trending);
+    const ranging = Math.max(0, values.ranging);
+    const volatile = Math.max(0, values.volatile);
+    const sum = trending + ranging + volatile;
+    if (sum <= 0) {
+      return { trending: 1 / 3, ranging: 1 / 3, volatile: 1 / 3 };
+    }
+    return {
+      trending: trending / sum,
+      ranging: ranging / sum,
+      volatile: volatile / sum,
+    };
+  }
+
+  private updateRegimeForecast(
+    current: "trending" | "ranging" | "volatile"
+  ): Record<"trending" | "ranging" | "volatile", number> {
+    const forecast = this.state.regimeForecast;
+    const now = Date.now();
+
+    if (forecast.lastObservedRegime) {
+      const from = this.regimeToIndex(forecast.lastObservedRegime);
+      const to = this.regimeToIndex(current);
+      const row = forecast.transitionCounts[from] ?? [1, 1, 1];
+      row[to] = (row[to] ?? 0) + 1;
+      forecast.transitionCounts[from] = row;
+    }
+
+    forecast.lastObservedRegime = current;
+    forecast.history.push({ timestamp: now, regime: current });
+    if (forecast.history.length > 240) {
+      forecast.history = forecast.history.slice(-240);
+    }
+
+    const row = forecast.transitionCounts[this.regimeToIndex(current)] ?? [1, 1, 1];
+    const smoothed = row.map((value) => Math.max(0, value) + 1);
+    const rowSum = smoothed.reduce((sum, value) => sum + value, 0) || 3;
+    const transitionProbs = {
+      trending: smoothed[0]! / rowSum,
+      ranging: smoothed[1]! / rowSum,
+      volatile: smoothed[2]! / rowSum,
+    };
+
+    const characteristics = this.state.marketRegime.characteristics || {};
+    const volatilityHint = this.clamp01((Number(characteristics.volatility) - 0.02) / 0.03);
+    const trendHint = this.clamp01(Math.abs(Number(characteristics.trend)) / 0.8);
+    const sharpeHint = this.clamp01(Math.abs(Number(characteristics.sharpe_like)) / 1.3);
+    const prior = this.normalizeRegimeProbabilities({
+      trending: trendHint * 0.6 + sharpeHint * 0.25 + (1 - volatilityHint) * 0.15,
+      ranging: (1 - trendHint) * 0.5 + (1 - volatilityHint) * 0.45,
+      volatile: volatilityHint * 0.75 + (1 - sharpeHint) * 0.15,
+    });
+
+    const blended = this.normalizeRegimeProbabilities({
+      trending: transitionProbs.trending * 0.7 + prior.trending * 0.3,
+      ranging: transitionProbs.ranging * 0.7 + prior.ranging * 0.3,
+      volatile: transitionProbs.volatile * 0.7 + prior.volatile * 0.3,
+    });
+
+    forecast.probabilities = blended;
+    forecast.lastUpdatedAt = now;
+    return blended;
+  }
+
+  private updateBayesianRiskFromOutcome(outcomeReturnPct: number): void {
+    const bayes = this.state.bayesianRisk;
+    const win = outcomeReturnPct > 0 ? 1 : 0;
+    const lossMagnitude = Math.max(0, -outcomeReturnPct);
+    const gainMagnitude = Math.max(0, outcomeReturnPct);
+    const alpha = 0.2;
+
+    bayes.alpha += win ? 1 : 0;
+    bayes.beta += win ? 0 : 1;
+    bayes.samples += 1;
+    bayes.expectedLossPctEma =
+      bayes.expectedLossPctEma <= 0 ? lossMagnitude : bayes.expectedLossPctEma * (1 - alpha) + lossMagnitude * alpha;
+    bayes.expectedGainPctEma =
+      bayes.expectedGainPctEma <= 0 ? gainMagnitude : bayes.expectedGainPctEma * (1 - alpha) + gainMagnitude * alpha;
+    bayes.lastUpdatedAt = Date.now();
+  }
+
+  private updateDriftDetection(errorAbs: number): void {
+    const drift = this.state.driftDetection;
+    const safeError = this.clamp01(errorAbs);
+    const shortAlpha = 0.25;
+    const longAlpha = 0.06;
+
+    drift.shortErrorEma =
+      drift.shortErrorEma <= 0 ? safeError : drift.shortErrorEma * (1 - shortAlpha) + safeError * shortAlpha;
+    drift.longErrorEma =
+      drift.longErrorEma <= 0 ? safeError : drift.longErrorEma * (1 - longAlpha) + safeError * longAlpha;
+    drift.samples += 1;
+    drift.ratio = drift.shortErrorEma / Math.max(0.01, drift.longErrorEma);
+
+    const breach = drift.samples >= 20 && drift.ratio > 1.55 && drift.shortErrorEma > 0.28;
+    drift.consecutiveBreaches = breach ? drift.consecutiveBreaches + 1 : Math.max(0, drift.consecutiveBreaches - 1);
+    if (!drift.retrainPending && drift.consecutiveBreaches >= 3) {
+      drift.retrainPending = true;
+      drift.lastTriggerAt = Date.now();
+    }
+  }
+
+  private performAutoRetrainingIfNeeded(now = Date.now()): boolean {
+    const drift = this.state.driftDetection;
+    if (!drift.retrainPending) return false;
+    if (drift.lastRetrainAt > 0 && now - drift.lastRetrainAt < 15 * 60_000) return false;
+
+    const model = this.state.predictiveModel;
+    const retrainStrength = Math.min(0.7, Math.max(0.35, (drift.ratio - 1) * 0.35));
+    const blend = (current: number, baseline: number) => current * (1 - retrainStrength) + baseline * retrainStrength;
+
+    model.bias = blend(model.bias, DEFAULT_PREDICTIVE_MODEL.bias);
+    model.weights.sentiment = blend(model.weights.sentiment, DEFAULT_PREDICTIVE_MODEL.weights.sentiment);
+    model.weights.freshness = blend(model.weights.freshness, DEFAULT_PREDICTIVE_MODEL.weights.freshness);
+    model.weights.sourceDiversity = blend(
+      model.weights.sourceDiversity,
+      DEFAULT_PREDICTIVE_MODEL.weights.sourceDiversity
+    );
+    model.weights.logVolume = blend(model.weights.logVolume, DEFAULT_PREDICTIVE_MODEL.weights.logVolume);
+    model.weights.regimeAlignment = blend(
+      model.weights.regimeAlignment,
+      DEFAULT_PREDICTIVE_MODEL.weights.regimeAlignment
+    );
+    model.learningRate = Math.max(0.05, Math.min(0.2, model.learningRate * 1.2));
+    model.lastUpdatedAt = now;
+    model.perSymbol = Object.fromEntries(
+      Object.entries(model.perSymbol).filter(
+        ([, stats]) => now - (stats.lastOutcomeAt || 0) <= 30 * 24 * 60 * 60 * 1000
+      )
+    );
+
+    drift.retrainPending = false;
+    drift.lastRetrainAt = now;
+    drift.retrainCount += 1;
+    drift.consecutiveBreaches = 0;
+
+    this.log("PredictiveModel", "auto_retrained", {
+      retrain_count: drift.retrainCount,
+      drift_ratio: Number(drift.ratio.toFixed(3)),
+      short_error_ema: Number(drift.shortErrorEma.toFixed(3)),
+      long_error_ema: Number(drift.longErrorEma.toFixed(3)),
+      retrain_strength: Number(retrainStrength.toFixed(3)),
+      learning_rate: Number(model.learningRate.toFixed(4)),
+    });
+    this.rememberEpisode(
+      `Predictive model auto-retrained after drift ratio ${drift.ratio.toFixed(2)}`,
+      "neutral",
+      ["predictive_model", "drift", "retrain"],
+      {
+        impact: this.clamp01((drift.ratio - 1) / 2),
+        confidence: this.clamp01(1 - drift.longErrorEma),
+        novelty: 0.45,
+        metadata: { retrainCount: drift.retrainCount, retrainStrength, ratio: drift.ratio },
+      }
+    );
+    return true;
+  }
+
   private predictSignalProbability(
     signal: Pick<Signal, "symbol" | "sentiment" | "freshness" | "volume"> & { sourceDiversity?: number }
   ): number {
@@ -4843,6 +5180,9 @@ export class OwokxHarness extends DurableObject<Env> {
         model.samples || 0;
     model.mse = (model.mse * Math.max(0, model.samples - 1) + error ** 2) / model.samples || 0;
     model.lastUpdatedAt = Date.now();
+    this.updateBayesianRiskFromOutcome(outcomeReturnPct);
+    this.updateDriftDetection(Math.abs(error));
+    this.performAutoRetrainingIfNeeded();
 
     const upper = symbol.toUpperCase();
     const stats = model.perSymbol[upper] ?? {
@@ -4997,8 +5337,14 @@ export class OwokxHarness extends DurableObject<Env> {
 
     const smooth = (current: number, target: number, alpha = 0.18) => current * (1 - alpha) + target * alpha;
 
-    routing.selectorWeights.quality = Math.max(0.42, Math.min(0.82, smooth(routing.selectorWeights.quality, targetQuality)));
-    routing.selectorWeights.latency = Math.max(0.08, Math.min(0.36, smooth(routing.selectorWeights.latency, targetLatency)));
+    routing.selectorWeights.quality = Math.max(
+      0.42,
+      Math.min(0.82, smooth(routing.selectorWeights.quality, targetQuality))
+    );
+    routing.selectorWeights.latency = Math.max(
+      0.08,
+      Math.min(0.36, smooth(routing.selectorWeights.latency, targetLatency))
+    );
     routing.selectorWeights.cost = Math.max(0.04, Math.min(0.34, smooth(routing.selectorWeights.cost, targetCost)));
     routing.selectorWeights.failurePenalty = Math.max(
       0.08,
@@ -5018,7 +5364,10 @@ export class OwokxHarness extends DurableObject<Env> {
     const targetParsePenaltyWeight = 0.06 + parseFailureRate * 0.2;
 
     routing.gating.baseBias = Math.max(0, Math.min(0.12, smooth(routing.gating.baseBias, targetBaseBias)));
-    routing.gating.stressPenalty = Math.max(0.04, Math.min(0.14, smooth(routing.gating.stressPenalty, targetStressPenalty)));
+    routing.gating.stressPenalty = Math.max(
+      0.04,
+      Math.min(0.14, smooth(routing.gating.stressPenalty, targetStressPenalty))
+    );
     routing.gating.volatilePenalty = Math.max(
       0.03,
       Math.min(0.12, smooth(routing.gating.volatilePenalty, targetVolatilePenalty))
@@ -5076,6 +5425,7 @@ export class OwokxHarness extends DurableObject<Env> {
     opt.adaptiveResearchIntervalMs = research;
     opt.adaptiveAnalystIntervalMs = analyst;
     this.tuneLLMPolicyFromTelemetry();
+    const retrained = this.performAutoRetrainingIfNeeded(now);
     opt.optimizationRuns += 1;
     opt.lastOptimizationAt = now;
 
@@ -5100,6 +5450,14 @@ export class OwokxHarness extends DurableObject<Env> {
         volatile_penalty: Number(this.state.llmRouting.gating.volatilePenalty.toFixed(3)),
         trending_relief: Number(this.state.llmRouting.gating.trendingRelief.toFixed(3)),
         sell_relief: Number(this.state.llmRouting.gating.sellRelief.toFixed(3)),
+      },
+      predictive_drift: {
+        ratio: Number(this.state.driftDetection.ratio.toFixed(3)),
+        short_error_ema: Number(this.state.driftDetection.shortErrorEma.toFixed(3)),
+        long_error_ema: Number(this.state.driftDetection.longErrorEma.toFixed(3)),
+        retrain_pending: this.state.driftDetection.retrainPending,
+        retrain_count: this.state.driftDetection.retrainCount,
+        retrained,
       },
       overloaded,
       healthy,
@@ -5228,6 +5586,10 @@ export class OwokxHarness extends DurableObject<Env> {
 
   private getDynamicRiskProfile(account: Account): DynamicRiskProfile {
     const metrics = this.computePortfolioRiskMetrics();
+    const regimeProbabilities = this.updateRegimeForecast(metrics.regime);
+    const bayes = this.state.bayesianRisk;
+    const bayesianWinProbability = bayes.alpha / Math.max(1, bayes.alpha + bayes.beta);
+    const bayesianLossProbability = 1 - bayesianWinProbability;
     const dailyPnlPct =
       Number.isFinite(account.last_equity) && account.last_equity > 0
         ? (account.equity - account.last_equity) / account.last_equity
@@ -5236,11 +5598,24 @@ export class OwokxHarness extends DurableObject<Env> {
     const volatilityPenalty = Math.max(0, (metrics.realizedVolatility - 0.01) * 12);
     const drawdownPenalty = Math.max(0, metrics.maxDrawdownPct * 3);
     const dailyLossPenalty = Math.max(0, -dailyPnlPct * 5);
-    const regimePenalty = metrics.regime === "volatile" ? 0.25 : metrics.regime === "trending" ? -0.05 : 0.05;
+    const regimePenalty =
+      regimeProbabilities.volatile * 0.26 + regimeProbabilities.ranging * 0.05 - regimeProbabilities.trending * 0.08;
     const stressPenalty = this.state.lastStressTest
       ? 1 - this.clamp01(this.state.lastStressTest.recommendedRiskMultiplier)
       : 0;
-    const rawMultiplier = 1 - volatilityPenalty - drawdownPenalty - dailyLossPenalty - regimePenalty - stressPenalty;
+    const bayesianPenalty = Math.max(0, (0.55 - bayesianWinProbability) * 0.5);
+    const driftPenalty = this.state.driftDetection.retrainPending
+      ? 0.08
+      : Math.max(0, (this.state.driftDetection.ratio - 1) * 0.04);
+    const rawMultiplier =
+      1 -
+      volatilityPenalty -
+      drawdownPenalty -
+      dailyLossPenalty -
+      regimePenalty -
+      stressPenalty -
+      bayesianPenalty -
+      driftPenalty;
     const multiplier = Math.max(0.25, Math.min(1.2, rawMultiplier));
 
     const basePct = this.state.config.position_size_pct_of_cash;
@@ -5249,6 +5624,9 @@ export class OwokxHarness extends DurableObject<Env> {
     const profile: DynamicRiskProfile = {
       timestamp: Date.now(),
       marketRegime: metrics.regime,
+      regimeProbabilities,
+      bayesianWinProbability,
+      bayesianLossProbability,
       realizedVolatility: metrics.realizedVolatility,
       maxDrawdownPct: metrics.maxDrawdownPct,
       sharpeLike: metrics.sharpeLike,
@@ -5925,16 +6303,16 @@ export class OwokxHarness extends DurableObject<Env> {
       const { response, modelUsed } = await this.completeWithRouting(
         "research",
         {
-        messages: [
-          {
-            role: "system",
-            content: "You are a stock research analyst. Be skeptical of hype. Output valid JSON only.",
-          },
-          { role: "user", content: prompt },
-        ],
-        max_tokens: promptPolicy.maxTokens,
-        temperature: 0,
-        response_format: { type: "json_object" },
+          messages: [
+            {
+              role: "system",
+              content: "You are a stock research analyst. Be skeptical of hype. Output valid JSON only.",
+            },
+            { role: "user", content: prompt },
+          ],
+          max_tokens: promptPolicy.maxTokens,
+          temperature: 0,
+          response_format: { type: "json_object" },
         },
         { stressFailed }
       );
@@ -6405,14 +6783,14 @@ Provide a brief risk assessment and recommendation (HOLD, SELL, or ADD). JSON fo
       const { response, modelUsed } = await this.completeWithRouting(
         "position",
         {
-        messages: [
-          { role: "system", content: "You are a position risk analyst. Be concise. Output valid JSON only." },
-          { role: "user", content: prompt },
-        ],
-        max_tokens: 200,
-        temperature: 0, // Task 2: Deterministic
-        seed: 42, // Task 2: Deterministic
-        response_format: { type: "json_object" },
+          messages: [
+            { role: "system", content: "You are a position risk analyst. Be concise. Output valid JSON only." },
+            { role: "user", content: prompt },
+          ],
+          max_tokens: 200,
+          temperature: 0, // Task 2: Deterministic
+          seed: 42, // Task 2: Deterministic
+          response_format: { type: "json_object" },
         },
         { stressFailed: !!this.state.lastStressTest && !this.state.lastStressTest.passed, urgent: true }
       );
@@ -6599,10 +6977,10 @@ Analyze and provide BUY/SELL/HOLD recommendations:`;
       const { response, modelUsed } = await this.completeWithRouting(
         "analyst",
         {
-        messages: [
-          {
-            role: "system",
-            content: `You are a senior trading analyst AI. Make the FINAL trading decisions based on social sentiment signals.
+          messages: [
+            {
+              role: "system",
+              content: `You are a senior trading analyst AI. Make the FINAL trading decisions based on social sentiment signals.
 
 Rules:
 - Only recommend BUY for symbols with strong conviction from multiple data points
@@ -6620,12 +6998,12 @@ Response format:
   "market_summary": "overall market read and sentiment",
   "high_conviction_plays": ["symbols you feel strongest about"]
 }`,
-          },
-          { role: "user", content: prompt },
-        ],
-        max_tokens: promptPolicy.maxTokens,
-        temperature,
-        response_format: { type: "json_object" },
+            },
+            { role: "user", content: prompt },
+          ],
+          max_tokens: promptPolicy.maxTokens,
+          temperature,
+          response_format: { type: "json_object" },
         },
         { stressFailed }
       );
@@ -6780,6 +7158,13 @@ Response format:
     const analystSellThreshold = this.getCalibratedConfidenceThreshold("analyst_sell", stressFailed);
     this.log("Risk", "dynamic_profile", {
       regime: riskProfile.marketRegime,
+      regime_probabilities: {
+        trending: Number((riskProfile.regimeProbabilities.trending * 100).toFixed(1)),
+        ranging: Number((riskProfile.regimeProbabilities.ranging * 100).toFixed(1)),
+        volatile: Number((riskProfile.regimeProbabilities.volatile * 100).toFixed(1)),
+      },
+      bayesian_win_probability: Number((riskProfile.bayesianWinProbability * 100).toFixed(1)),
+      bayesian_loss_probability: Number((riskProfile.bayesianLossProbability * 100).toFixed(1)),
       volatility: Number((riskProfile.realizedVolatility * 100).toFixed(2)),
       drawdown_pct: Number((riskProfile.maxDrawdownPct * 100).toFixed(2)),
       multiplier: Number(riskProfile.multiplier.toFixed(3)),
@@ -8425,10 +8810,14 @@ Response format:
     loader: () => Promise<T>
   ): Promise<T> {
     const l1Hit = this.getL1ReadCache<T>(key);
-    if (l1Hit !== null) return l1Hit;
+    if (l1Hit !== null) {
+      this.cacheReadHits += 1;
+      return l1Hit;
+    }
 
     const inflight = this.inFlightReads.get(key);
     if (inflight) {
+      this.cacheCoalescingHitCount += 1;
       return (await inflight) as T;
     }
 
@@ -8440,6 +8829,7 @@ Response format:
           if (cached) {
             const parsed = JSON.parse(cached) as T;
             this.setL1ReadCache(key, parsed, options.l1TtlMs);
+            this.cacheReadHits += 1;
             return parsed;
           }
         } catch {
@@ -8447,6 +8837,7 @@ Response format:
         }
       }
 
+      this.cacheReadMisses += 1;
       const payload = await loader();
       this.setL1ReadCache(key, payload, options.l1TtlMs);
       if (kv) {
@@ -8465,6 +8856,30 @@ Response format:
     } finally {
       this.inFlightReads.delete(key);
     }
+  }
+
+  private recordD1QueryLatencySample(durationMs: number): void {
+    if (!Number.isFinite(durationMs) || durationMs < 0) return;
+    this.d1QueryLatencySamplesMs.push(durationMs);
+    if (this.d1QueryLatencySamplesMs.length > this.maxD1LatencySamples) {
+      this.d1QueryLatencySamplesMs.splice(0, this.d1QueryLatencySamplesMs.length - this.maxD1LatencySamples);
+    }
+  }
+
+  private async trackD1Query<T>(query: () => Promise<T>): Promise<T> {
+    const startedAt = Date.now();
+    try {
+      return await query();
+    } finally {
+      this.recordD1QueryLatencySample(Date.now() - startedAt);
+    }
+  }
+
+  private percentile(values: number[], percentile: number): number {
+    if (!Array.isArray(values) || values.length === 0) return 0;
+    const sorted = [...values].sort((a, b) => a - b);
+    const rank = Math.max(0, Math.min(sorted.length - 1, Math.ceil((percentile / 100) * sorted.length) - 1));
+    return sorted[rank] ?? 0;
   }
 
   private async persistActivityLogToD1(entry: LogEntry): Promise<void> {

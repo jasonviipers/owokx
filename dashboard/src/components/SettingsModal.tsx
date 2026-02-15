@@ -1,6 +1,20 @@
 import { useState } from 'react'
 import type { Config } from '../types'
 import { Panel } from './Panel'
+const OWOKX_BROWSER_TOKEN_KEY = 'OWOKX_BEARER_TOKEN'
+
+function setBrowserToken(token: string | null): void {
+  if (typeof window === 'undefined') return
+  try {
+    if (!token || token.trim().length === 0) {
+      window.sessionStorage.removeItem(OWOKX_BROWSER_TOKEN_KEY)
+      return
+    }
+    window.sessionStorage.setItem(OWOKX_BROWSER_TOKEN_KEY, token.trim())
+  } catch {
+    // ignore browser storage errors
+  }
+}
 
 interface SettingsModalProps {
   config: Config
@@ -12,6 +26,8 @@ interface SettingsModalProps {
 export function SettingsModal({ config, onSave, onClose, onReset }: SettingsModalProps) {
   const [localConfig, setLocalConfig] = useState<Config>(config)
   const [saving, setSaving] = useState(false)
+  const [saveMessage, setSaveMessage] = useState<string | null>(null)
+  const [saveMessageType, setSaveMessageType] = useState<'success' | 'error'>('success')
   const [resetting, setResetting] = useState(false)
   const [showResetConfirm, setShowResetConfirm] = useState(false)
   const [resetError, setResetError] = useState<string | null>(null)
@@ -32,6 +48,7 @@ export function SettingsModal({ config, onSave, onClose, onReset }: SettingsModa
           method: 'DELETE',
           credentials: 'include',
         })
+        setBrowserToken(null)
         setAuthMessage('Session cleared')
         return
       }
@@ -46,6 +63,7 @@ export function SettingsModal({ config, onSave, onClose, onReset }: SettingsModa
       if (!response.ok || data?.ok === false) {
         throw new Error(data?.error || 'Failed to save session')
       }
+      setBrowserToken(token)
       setApiToken('')
       setAuthMessage('Session saved')
     } catch (error) {
@@ -60,6 +78,7 @@ export function SettingsModal({ config, onSave, onClose, onReset }: SettingsModa
   }
 
   const handleBrokerChange = (broker: 'alpaca' | 'okx') => {
+    setSaveMessage(null)
     setLocalConfig(prev => {
       const next: Config = { ...prev, broker }
       if (broker === 'okx') {
@@ -73,12 +92,35 @@ export function SettingsModal({ config, onSave, onClose, onReset }: SettingsModa
   }
 
   const handleSave = async () => {
+    if (saving) return
+    setSaveMessage(null)
+
+    if (localConfig.broker !== 'alpaca' && localConfig.broker !== 'okx') {
+      setSaveMessageType('error')
+      setSaveMessage('Invalid broker selection. Choose Alpaca or OKX.')
+      return
+    }
+
+    if (localConfig.broker === 'okx') {
+      const symbols = (localConfig.crypto_symbols || []).map(s => s.trim()).filter(Boolean)
+      if (symbols.length === 0) {
+        setSaveMessageType('error')
+        setSaveMessage('OKX requires at least one crypto symbol (example: BTC/USDT).')
+        return
+      }
+    }
+
     setSaving(true)
     try {
       await onSave(localConfig)
+      setSaveMessageType('success')
+      setSaveMessage(`Configuration saved. Active broker: ${(localConfig.broker || 'alpaca').toUpperCase()}.`)
       onClose()
     } catch (error) {
       console.error('Failed to save config:', error)
+      setSaveMessageType('error')
+      const message = error instanceof Error ? error.message : String(error)
+      setSaveMessage(message || 'Failed to save configuration. Please try again.')
     } finally {
       setSaving(false)
     }
@@ -138,7 +180,7 @@ export function SettingsModal({ config, onSave, onClose, onReset }: SettingsModa
               <p className="text-[10px] text-hud-text mt-1">{authMessage}</p>
             )}
             <p className="text-[9px] text-hud-text-dim mt-1">
-              Sets an HttpOnly session cookie for API access. Token is not stored in browser storage.
+              Sets an HttpOnly session cookie and session-scoped bearer for cross-origin API mutations.
             </p>
           </div>
 
@@ -712,6 +754,11 @@ export function SettingsModal({ config, onSave, onClose, onReset }: SettingsModa
 
           {/* Actions */}
           <div className="flex justify-end gap-4 pt-4 border-t border-hud-line">
+            {saveMessage && (
+              <div className={saveMessageType === 'error' ? 'text-xs text-hud-error mr-auto' : 'text-xs text-hud-success mr-auto'}>
+                {saveMessage}
+              </div>
+            )}
             <button className="hud-button" onClick={onClose}>
               Cancel
             </button>
