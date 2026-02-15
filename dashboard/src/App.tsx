@@ -1,18 +1,19 @@
 import { useState, useEffect, useMemo, useCallback, useRef } from 'react'
-import { motion, AnimatePresence } from 'motion/react'
+import { motion } from 'motion/react'
 import clsx from 'clsx'
 import { Panel } from './components/Panel'
 import { Metric, MetricInline } from './components/Metric'
 import { StatusIndicator, StatusBar } from './components/StatusIndicator'
-import { SettingsModal } from './components/SettingsModal'
 import { SetupWizard } from './components/SetupWizard'
 import { LineChart, Sparkline } from './components/LineChart'
 import { NotificationBell } from './components/NotificationBell'
 import { Tooltip, TooltipContent } from './components/Tooltip'
 import { AgentControls } from './components/AgentControls'
-import { SwarmDashboard } from './components/SwarmDashboard'
 import type { Status, Config, LogEntry, Signal, Position, SignalResearch, PortfolioSnapshot } from './types'
 import { MobileNav } from './components/Mobilenav'
+import { OverviewPage } from './pages/OverviewPage'
+import { SettingsPage } from './pages/SettingsPage'
+import { SwarmPage } from './pages/SwarmPage'
 
 const API_BASE = '/api'
 declare const __OWOKX_API_URL__: string | undefined
@@ -943,6 +944,7 @@ export default function App() {
           <MobileNav view={mobileView} onViewChange={setMobileView} />
         </header>
 
+        <OverviewPage>
         {/* Desktop Grid Layout */}
         <div className="hidden md:grid grid-cols-4 md:grid-cols-8 lg:grid-cols-12 gap-4">
           {/* Row 1: Account, Positions, LLM Costs */}
@@ -1171,9 +1173,7 @@ export default function App() {
             </Panel>
           </div>
 
-          <div className="col-span-4 md:col-span-8 lg:col-span-12">
-             <SwarmDashboard swarm={status?.swarm} />
-          </div>
+          <SwarmPage swarm={status?.swarm} />
 
           <div className="col-span-4 md:col-span-8 lg:col-span-12">
             <Panel title="RISK & SIGNAL QUALITY" className="h-full">
@@ -1730,6 +1730,7 @@ export default function App() {
             </>
           )}
         </div>
+        </OverviewPage>
       </div>
 
       <footer className="mt-auto w-full border-t border-hud-line bg-hud-bg">
@@ -1762,22 +1763,13 @@ export default function App() {
         </div>
       </footer>
 
-      <AnimatePresence>
-        {showSettings && config && (
-          <motion.div
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
-          >
-            <SettingsModal
-              config={config}
-              onSave={handleSaveConfig}
-              onClose={() => setShowSettings(false)}
-              onReset={handleResetAgent}
-            />
-          </motion.div>
-        )}
-      </AnimatePresence>
+      <SettingsPage
+        show={showSettings}
+        config={config}
+        onSave={handleSaveConfig}
+        onClose={() => setShowSettings(false)}
+        onReset={handleResetAgent}
+      />
     </div>
   )
 }
