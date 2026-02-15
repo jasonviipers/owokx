@@ -41,10 +41,12 @@ export async function hmacSign(data: string, secret: string): Promise<string> {
 
 export async function hmacVerify(data: string, signature: string, secret: string): Promise<boolean> {
   const expected = await hmacSign(data, secret);
-  if (expected.length !== signature.length) return false;
-  let mismatch = 0;
-  for (let i = 0; i < expected.length; i++) {
-    mismatch |= expected.charCodeAt(i) ^ signature.charCodeAt(i);
+  const maxLength = Math.max(expected.length, signature.length);
+  let mismatch = expected.length ^ signature.length;
+  for (let i = 0; i < maxLength; i++) {
+    const ec = i < expected.length ? expected.charCodeAt(i) : 0;
+    const sc = i < signature.length ? signature.charCodeAt(i) : 0;
+    mismatch |= ec ^ sc;
   }
   return mismatch === 0;
 }

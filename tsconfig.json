@@ -24,6 +24,6 @@
     },
     "baseUrl": "."
   },
-  "include": ["src/**/*", "src/.test"],
+  "include": ["src/**/*", "src/.test", "src/.test/auth.test.ts"],
   "exclude": ["node_modules", "dist"]
 }

@@ -1595,10 +1595,12 @@ export class OwokxHarness extends DurableObject<Env> {
   // ============================================================================
 
   private constantTimeCompare(a: string, b: string): boolean {
-    if (a.length !== b.length) return false;
-    let mismatch = 0;
-    for (let i = 0; i < a.length; i++) {
-      mismatch |= a.charCodeAt(i) ^ b.charCodeAt(i);
+    const maxLength = Math.max(a.length, b.length);
+    let mismatch = a.length ^ b.length;
+    for (let i = 0; i < maxLength; i++) {
+      const ac = i < a.length ? a.charCodeAt(i) : 0;
+      const bc = i < b.length ? b.charCodeAt(i) : 0;
+      mismatch |= ac ^ bc;
     }
     return mismatch === 0;
   }
@@ -1643,6 +1645,7 @@ export class OwokxHarness extends DurableObject<Env> {
       "stress-test",
     ];
     const tradeActions = ["enable", "disable", "trigger", "reset"];
+    const method = request.method.toUpperCase();
     let requiredScope: "read" | "trade" | null = null;
 
     if (readActions.includes(action)) {
@@ -1671,18 +1674,42 @@ export class OwokxHarness extends DurableObject<Env> {
           return this.handleSetupStatus(request);
 
         case "config":
+          if (method !== "GET" && method !== "POST") {
+            return new Response(JSON.stringify({ error: "Method not allowed. Use: GET, POST" }), {
+              status: 405,
+              headers: { "Content-Type": "application/json", Allow: "GET, POST" },
+            });
+          }
           if (request.method === "POST") {
             return this.handleUpdateConfig(request);
           }
           return this.jsonResponse({ ok: true, data: this.state.config });
 
         case "enable":
+          if (method !== "POST") {
+            return new Response(JSON.stringify({ error: "Method not allowed. Use: POST" }), {
+              status: 405,
+              headers: { "Content-Type": "application/json", Allow: "POST" },
+            });
+          }
           return this.handleEnable();
 
         case "disable":
+          if (method !== "POST") {
+            return new Response(JSON.stringify({ error: "Method not allowed. Use: POST" }), {
+              status: 405,
+              headers: { "Content-Type": "application/json", Allow: "POST" },
+            });
+          }
           return this.handleDisable();
 
         case "reset":
+          if (method !== "POST") {
+            return new Response(JSON.stringify({ error: "Method not allowed. Use: POST" }), {
+              status: 405,
+              headers: { "Content-Type": "application/json", Allow: "POST" },
+            });
+          }
           return this.handleReset();
 
         case "logs":
@@ -1719,10 +1746,22 @@ export class OwokxHarness extends DurableObject<Env> {
           return this.handleStressTest();
 
         case "trigger":
+          if (method !== "POST") {
+            return new Response(JSON.stringify({ error: "Method not allowed. Use: POST" }), {
+              status: 405,
+              headers: { "Content-Type": "application/json", Allow: "POST" },
+            });
+          }
           await this.alarm();
           return this.jsonResponse({ ok: true, message: "Alarm triggered" });
 
         case "kill":
+          if (method !== "POST") {
+            return new Response(JSON.stringify({ error: "Method not allowed. Use: POST" }), {
+              status: 405,
+              headers: { "Content-Type": "application/json", Allow: "POST" },
+            });
+          }
           if (!this.isKillSwitchAuthorized(request)) {
             return new Response(
               JSON.stringify({ error: "Forbidden. Requires: Authorization: Bearer <KILL_SWITCH_SECRET>" }),
@@ -1735,7 +1774,15 @@ export class OwokxHarness extends DurableObject<Env> {
           return new Response("Not found", { status: 404 });
       }
     } catch (error) {
-      return new Response(JSON.stringify({ error: String(error) }), {
+      this.log("System", "api_error", {
+        action,
+        method: request.method,
+        message: String(error),
+        event_type: "api",
+        severity: "error",
+        status: "failed",
+      });
+      return new Response(JSON.stringify({ error: "Internal server error" }), {
         status: 500,
         headers: { "Content-Type": "application/json" },
       });
@@ -1793,14 +1840,14 @@ export class OwokxHarness extends DurableObject<Env> {
         },
         commands: {
           enable: {
-            method: "GET",
+            method: "POST",
             path: "/agent/enable",
-            curl: `curl -H "Authorization: Bearer $${tokenEnvVar}" ${apiOrigin}/agent/enable`,
+            curl: `curl -X POST -H "Authorization: Bearer $${tokenEnvVar}" ${apiOrigin}/agent/enable`,
           },
           disable: {
-            method: "GET",
+            method: "POST",
             path: "/agent/disable",
-            curl: `curl -H "Authorization: Bearer $${tokenEnvVar}" ${apiOrigin}/agent/disable`,
+            curl: `curl -X POST -H "Authorization: Bearer $${tokenEnvVar}" ${apiOrigin}/agent/disable`,
           },
           trigger: {
             method: "POST",
@@ -3106,14 +3153,18 @@ export class OwokxHarness extends DurableObject<Env> {
     const signals: Signal[] = [];
 
     try {
-      const response = await fetch(
-        "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=8-K&company=&dateb=&owner=include&count=40&output=atom",
-        {
-          headers: {
-            "User-Agent": "Owokx Trading Bot (contact@example.com)",
-            Accept: "application/atom+xml",
-          },
-        }
+      const response = await this.withTimeout(
+        fetch(
+          "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=8-K&company=&dateb=&owner=include&count=40&output=atom",
+          {
+            headers: {
+              "User-Agent": "Owokx Trading Bot (contact@example.com)",
+              Accept: "application/atom+xml",
+            },
+          }
+        ),
+        8_000,
+        "sec_feed_fetch_timeout"
       );
 
       if (!response.ok) {
@@ -3222,9 +3273,13 @@ export class OwokxHarness extends DurableObject<Env> {
     }
 
     try {
-      const response = await fetch("https://www.sec.gov/files/company_tickers.json", {
-        headers: { "User-Agent": "Owokx Trading Bot" },
-      });
+      const response = await this.withTimeout(
+        fetch("https://www.sec.gov/files/company_tickers.json", {
+          headers: { "User-Agent": "Owokx Trading Bot" },
+        }),
+        8_000,
+        "sec_ticker_lookup_timeout"
+      );
 
       if (!response.ok) return null;
 
@@ -7811,10 +7866,10 @@ export async function getHarnessStatus(env: Env): Promise<unknown> {
 
 export async function enableHarness(env: Env): Promise<void> {
   const stub = getHarnessStub(env);
-  await stub.fetch(new Request("http://harness/enable"));
+  await stub.fetch(new Request("http://harness/enable", { method: "POST" }));
 }
 
 export async function disableHarness(env: Env): Promise<void> {
   const stub = getHarnessStub(env);
-  await stub.fetch(new Request("http://harness/disable"));
+  await stub.fetch(new Request("http://harness/disable", { method: "POST" }));
 }

@@ -4,21 +4,26 @@ export type AuthScope = "read" | "trade" | "admin";
 const SESSION_COOKIE_NAME = "OWOKX_SESSION";
 
 function constantTimeCompare(a: string, b: string): boolean {
-  if (a.length !== b.length) return false;
-  let mismatch = 0;
-  for (let i = 0; i < a.length; i++) {
-    mismatch |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  const maxLength = Math.max(a.length, b.length);
+  let mismatch = a.length ^ b.length;
+  for (let i = 0; i < maxLength; i++) {
+    const ac = i < a.length ? a.charCodeAt(i) : 0;
+    const bc = i < b.length ? b.charCodeAt(i) : 0;
+    mismatch |= ac ^ bc;
   }
   return mismatch === 0;
 }
 
-function getBearerToken(request: Request): string | null {
+function getBearerAuthorizationToken(request: Request): string | null {
   const authHeader = request.headers.get("Authorization");
-  if (authHeader?.startsWith("Bearer ")) {
-    const token = authHeader.slice(7);
-    if (token.length > 0) return token;
+  if (!authHeader?.startsWith("Bearer ")) {
+    return null;
   }
+  const token = authHeader.slice(7);
+  return token.length > 0 ? token : null;
+}
 
+function getSessionCookieToken(request: Request): string | null {
   const cookieHeader = request.headers.get("Cookie");
   if (!cookieHeader) return null;
   for (const part of cookieHeader.split(";")) {
@@ -34,6 +39,33 @@ function getBearerToken(request: Request): string | null {
     }
   }
   return null;
+}
+
+function getBearerToken(request: Request): string | null {
+  const authorizationToken = getBearerAuthorizationToken(request);
+  if (authorizationToken) return authorizationToken;
+  return getSessionCookieToken(request);
+}
+
+export function hasAuthorizationBearer(request: Request): boolean {
+  return getBearerAuthorizationToken(request) !== null;
+}
+
+function isSameOriginRequest(request: Request): boolean {
+  const originHeader = request.headers.get("Origin");
+  if (!originHeader) return false;
+  try {
+    const requestOrigin = new URL(request.url).origin;
+    const origin = new URL(originHeader).origin;
+    return constantTimeCompare(origin, requestOrigin);
+  } catch {
+    return false;
+  }
+}
+
+export function isSessionTokenMutationAllowed(request: Request, scope: AuthScope): boolean {
+  if (scope === "read" || hasAuthorizationBearer(request)) return true;
+  return isSameOriginRequest(request);
 }
 
 export function isTokenAuthorized(token: string, env: Env, scope: AuthScope): boolean {

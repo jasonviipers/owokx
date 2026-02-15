@@ -1,7 +1,8 @@
 import { getHarnessStub } from "./durable-objects/owokx-harness";
 import type { Env } from "./env.d";
 import { handleCronEvent } from "./jobs/cron";
-import { isRequestAuthorized, isTokenAuthorized } from "./lib/auth";
+import { isRequestAuthorized, isSessionTokenMutationAllowed, isTokenAuthorized } from "./lib/auth";
+import { validateAgentMethod } from "./lib/http-guards";
 import { OwokxMcpAgent } from "./mcp/agent";
 
 export { SessionDO } from "./durable-objects/session";
@@ -18,6 +19,20 @@ function unauthorizedResponse(): Response {
   return new Response(JSON.stringify({ error: "Unauthorized. Requires: Authorization: Bearer <token>" }), {
     status: 401,
     headers: { "Content-Type": "application/json" },
+  });
+}
+
+function forbiddenResponse(message: string): Response {
+  return new Response(JSON.stringify({ error: message }), {
+    status: 403,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+function methodNotAllowedResponse(allowed: string[]): Response {
+  return new Response(JSON.stringify({ error: `Method not allowed. Use: ${allowed.join(", ")}` }), {
+    status: 405,
+    headers: { "Content-Type": "application/json", Allow: allowed.join(", ") },
   });
 }
 
@@ -133,8 +148,17 @@ export default {
     }
 
     if (url.pathname.startsWith("/agent")) {
-      const stub = getHarnessStub(env);
       const agentPath = url.pathname.replace("/agent", "") || "/status";
+      const methodGuard = validateAgentMethod(agentPath, request.method);
+      if (!methodGuard.ok) {
+        return methodNotAllowedResponse(methodGuard.allowed ?? ["GET"]);
+      }
+
+      if (methodGuard.isMutation && !isSessionTokenMutationAllowed(request, "trade")) {
+        return forbiddenResponse("Cross-origin mutation blocked. Use Authorization Bearer token.");
+      }
+
+      const stub = getHarnessStub(env);
       const agentUrl = new URL(agentPath, "http://harness");
       agentUrl.search = url.search;
       const headers = new Headers(request.headers);

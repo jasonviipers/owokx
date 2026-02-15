@@ -121,7 +121,7 @@ $env:OWOKX_TOKEN="<your token>"
 Enable the agent:
 
 ```bash
-curl -H "Authorization: Bearer $OWOKX_TOKEN" http://127.0.0.1:8787/agent/enable
+curl -X POST -H "Authorization: Bearer $OWOKX_TOKEN" http://127.0.0.1:8787/agent/enable
 ```
 
 ## API Endpoints
@@ -130,14 +130,14 @@ curl -H "Authorization: Bearer $OWOKX_TOKEN" http://127.0.0.1:8787/agent/enable
 |---|---|
 | `/agent/status` | Full runtime status |
 | `/agent/config` | Read/update config |
-| `/agent/enable` | Enable scheduler |
-| `/agent/disable` | Disable scheduler |
-| `/agent/trigger` | Trigger one alarm cycle |
+| `/agent/enable` (POST) | Enable scheduler |
+| `/agent/disable` (POST) | Disable scheduler |
+| `/agent/trigger` (POST) | Trigger one alarm cycle |
 | `/agent/logs` | Query activity logs with filters |
 | `/agent/history` | Portfolio history |
 | `/agent/metrics` | Runtime metrics |
 | `/agent/costs` | LLM usage/cost totals |
-| `/agent/reset` | Reset durable state |
+| `/agent/reset` (POST) | Reset durable state |
 | `/agent/kill` | Emergency kill switch (`KILL_SWITCH_SECRET`) |
 | `/swarm/*` | Swarm health/metrics/queue endpoints |
 | `/mcp` | MCP server endpoint |
