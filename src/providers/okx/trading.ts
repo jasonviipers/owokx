@@ -1,17 +1,4 @@
 import type {
-  Account,
-  Asset,
-  BrokerProvider,
-  ListOrdersParams,
-  MarketClock,
-  MarketDay,
-  Order,
-  OrderParams,
-  PortfolioHistory,
-  PortfolioHistoryParams,
-  Position,
-} from "../types";
-import type {
   AccountBalance,
   AccountBill,
   AccountLeverageResult,
@@ -27,6 +14,19 @@ import type {
   PositionSide,
 } from "okx-api";
 import { createError, ErrorCode } from "../../lib/errors";
+import type {
+  Account,
+  Asset,
+  BrokerProvider,
+  ListOrdersParams,
+  MarketClock,
+  MarketDay,
+  Order,
+  OrderParams,
+  PortfolioHistory,
+  PortfolioHistoryParams,
+  Position,
+} from "../types";
 import type { OkxClient } from "./client";
 import { handleOkxError } from "./client";
 import { normalizeOkxSymbol } from "./symbols";

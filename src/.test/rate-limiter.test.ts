@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { OkxRateLimitedClient, RetryWithBackoff } from "./rate-limiter";
+import { OkxRateLimitedClient, RetryWithBackoff } from "../providers/okx/rate-limiter";
 
 describe("OKX rate limiter", () => {
   it("retries retryable failures and eventually resolves", async () => {

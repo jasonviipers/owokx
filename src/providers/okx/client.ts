@@ -1,7 +1,7 @@
 import type { APIMarket, RestClientOptions } from "okx-api";
 import { RestClient, WebsocketClient } from "okx-api";
 import { createError, ErrorCode } from "../../lib/errors";
-import { createOkxLogger, type OkxLogLevel, type OkxLogger } from "./logger";
+import { createOkxLogger, type OkxLogger, type OkxLogLevel } from "./logger";
 import { OkxRateLimitedClient } from "./rate-limiter";
 
 const OKX_ERROR_CODE_MAP: Record<

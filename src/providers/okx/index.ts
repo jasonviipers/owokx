@@ -1,11 +1,11 @@
 import type { Env } from "../../env.d";
 import { parseBoolean, parseNumber } from "../../lib/utils";
-import { type OkxClientConfig, createOkxClient } from "./client";
+import { createOkxClient, type OkxClientConfig } from "./client";
 import type { OkxLogLevel } from "./logger";
-import { type OkxMarketDataProvider, createOkxMarketDataProvider } from "./market-data";
-import { type OkxTradingProvider, createOkxTradingProvider } from "./trading";
-import { type OkxOptionsProvider, createOkxOptionsProvider } from "./options";
-import { type OkxWebSocketProvider, createOkxWebSocketProvider } from "./websocket";
+import { createOkxMarketDataProvider, type OkxMarketDataProvider } from "./market-data";
+import { createOkxOptionsProvider, type OkxOptionsProvider } from "./options";
+import { createOkxTradingProvider, type OkxTradingProvider } from "./trading";
+import { createOkxWebSocketProvider, type OkxWebSocketProvider } from "./websocket";
 
 export interface OkxProviders {
   trading: OkxTradingProvider;
@@ -102,6 +102,6 @@ export function createOkxProviders(env: Env): OkxProviders {
 export type { OkxClient } from "./client";
 export { createOkxClient } from "./client";
 export type { OkxMarketDataProvider } from "./market-data";
-export type { OkxTradingProvider } from "./trading";
 export type { OkxOptionsProvider } from "./options";
+export type { OkxTradingProvider } from "./trading";
 export type { OkxWebSocketProvider } from "./websocket";

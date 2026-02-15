@@ -2,12 +2,12 @@ import type {
   AccountPosition,
   Candle,
   Instrument,
+  OptionTrades,
   OrderBook,
   OrderDetails,
   OrderHistoryRequest,
   OrderRequest,
   OrderResult,
-  OptionTrades,
   PositionSide,
   Ticker,
 } from "okx-api";

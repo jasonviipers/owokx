@@ -2,7 +2,7 @@ import type { Candle, Instrument, InstrumentType, OrderBook, Ticker, Trade } fro
 import { ErrorCode } from "../../lib/errors";
 import type { Bar, BarsParams, MarketDataProvider, Quote, Snapshot } from "../types";
 import type { OkxClient } from "./client";
-import { OkxClientError, handleOkxError } from "./client";
+import { handleOkxError, OkxClientError } from "./client";
 import { normalizeOkxSymbol } from "./symbols";
 
 function parseNumber(value: string | number | undefined, fallback: number = 0): number {
@@ -160,7 +160,8 @@ export interface OkxMarketDataProvider extends MarketDataProvider {
 }
 
 export function createOkxMarketDataProvider(client: OkxClient): OkxMarketDataProvider {
-  const toInstId = (symbol: string): string => normalizeOkxSymbol(symbol, client.config.defaultQuoteCcy ?? "USDT").instId;
+  const toInstId = (symbol: string): string =>
+    normalizeOkxSymbol(symbol, client.config.defaultQuoteCcy ?? "USDT").instId;
   const unsupportedInstIds = new Set<string>();
 
   const ensureInstrumentSupported = (symbol: string, instId: string): void => {

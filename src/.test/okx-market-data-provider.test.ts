@@ -62,4 +62,3 @@ describe("OKX Market Data Provider", () => {
     expect(mockLoggerError).not.toHaveBeenCalled();
   });
 });
-

@@ -64,4 +64,3 @@ describe("OKX Trading Provider", () => {
     expect(asset?.tradable).toBe(true);
   });
 });
-
