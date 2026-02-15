@@ -54,6 +54,9 @@ export interface RiskStateRow {
   daily_loss_usd: number;
   daily_loss_reset_at: string | null;
   daily_equity_start: number | null;
+  max_symbol_exposure_pct: number | null;
+  max_correlated_exposure_pct: number | null;
+  max_portfolio_drawdown_pct: number | null;
   last_loss_at: string | null;
   cooldown_until: string | null;
   updated_at: string;
