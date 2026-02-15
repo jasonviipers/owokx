@@ -24,6 +24,7 @@
     "hooks:install": "node scripts/setup-git-hooks.mjs",
     "test": "vitest",
     "test:run": "vitest run",
+    "test:ci": "node scripts/ci-test-runner.mjs",
     "setup:access": "npx tsx scripts/setup-access.ts"
   },
   "dependencies": {

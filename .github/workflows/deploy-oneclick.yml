@@ -80,8 +80,18 @@ jobs:
       - name: Run typecheck, tests, and lint
         run: |
           pnpm run typecheck
-          pnpm run test:run
+          pnpm run test:ci
           pnpm run check
+
+      - name: Upload test artifacts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: oneclick-tests-${{ inputs.environment }}-${{ github.sha }}
+          path: |
+            reports/**
+            coverage/**
+          if-no-files-found: warn
 
       - name: Install dashboard dependencies
         if: inputs.components == 'all' || inputs.components == 'dashboard'
