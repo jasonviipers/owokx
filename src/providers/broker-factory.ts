@@ -1,7 +1,6 @@
 import type { Env } from "../env.d";
 import { createError, ErrorCode } from "../lib/errors";
 import { createAlpacaProviders } from "./alpaca";
-import { createNullOptionsProvider } from "./null-options";
 import { createOkxProviders } from "./okx";
 import type { BrokerProvider, MarketDataProvider, OptionsProvider } from "./types";
 
@@ -37,7 +36,7 @@ export function createBrokerProviders(env: Env, preferred?: string | null): Brok
       broker,
       trading: okx.trading,
       marketData: okx.marketData,
-      options: createNullOptionsProvider(),
+      options: okx.options,
     };
   }
 

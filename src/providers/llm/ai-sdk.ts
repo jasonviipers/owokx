@@ -47,6 +47,9 @@ type ProviderFactory =
   | ReturnType<typeof createXai>
   | ReturnType<typeof createDeepSeek>;
 
+// Shared across provider instances in a running process to avoid repeated auth-failure retries.
+const runtimeDisabledProviders = new Set<SupportedProvider>();
+
 function isAuthFailure(error: unknown): boolean {
   const message = String(error).toLowerCase();
   return (
@@ -78,6 +81,30 @@ function parseModelSpec(spec: string): { provider: SupportedProvider; modelId: s
   return { provider: "openai", modelId: normalized };
 }
 
+function supportsTemperature(provider: SupportedProvider, modelId: string): boolean {
+  const normalized = modelId.toLowerCase();
+
+  if (provider === "openai") {
+    // OpenAI reasoning models reject temperature (e.g., gpt-5.*, o1/o3/o4 families).
+    return !(
+      normalized.startsWith("gpt-5") ||
+      normalized.startsWith("o1") ||
+      normalized.startsWith("o3") ||
+      normalized.startsWith("o4")
+    );
+  }
+
+  if (provider === "deepseek") {
+    return !normalized.includes("reasoner");
+  }
+
+  if (provider === "xai") {
+    return !normalized.includes("reasoning");
+  }
+
+  return true;
+}
+
 /**
  * AI SDK Provider - Supports multiple AI providers via Vercel AI SDK
  *
@@ -86,6 +113,7 @@ function parseModelSpec(spec: string): { provider: SupportedProvider; modelId: s
  */
 export class AISDKProvider implements LLMProvider {
   private providers: Partial<Record<SupportedProvider, ProviderFactory>>;
+  private disabledProviders = runtimeDisabledProviders;
   private defaultModel: string;
 
   constructor(config: AISDKConfig) {
@@ -127,6 +155,10 @@ export class AISDKProvider implements LLMProvider {
     return Object.keys(this.providers) as SupportedProvider[];
   }
 
+  private getEnabledProviders(): SupportedProvider[] {
+    return this.getAvailableProviders().filter((provider) => !this.disabledProviders.has(provider));
+  }
+
   async complete(params: CompletionParams): Promise<CompletionResult> {
     const startedAt = Date.now();
     let providerNameForLog = "unknown";
@@ -151,13 +183,14 @@ export class AISDKProvider implements LLMProvider {
           );
         }
 
+        const includeTemperature = supportsTemperature(selectedProvider, selectedModelId);
         const result = await generateText({
           model: provider(selectedModelId),
           messages: params.messages.map((msg) => ({
             role: msg.role,
             content: msg.content,
           })),
-          temperature: params.temperature ?? 0.7,
+          ...(includeTemperature ? { temperature: params.temperature ?? 0.7 } : {}),
           maxOutputTokens: params.max_tokens ?? 1024,
         });
 
@@ -177,19 +210,43 @@ export class AISDKProvider implements LLMProvider {
         };
       };
 
-      const availableProviders = this.getAvailableProviders();
-      const fallbackQueue: SupportedProvider[] = [
-        providerName,
-        ...availableProviders.filter((provider) => provider !== providerName),
-      ];
+      const availableProviders = this.getEnabledProviders();
+      if (availableProviders.length === 0) {
+        throw createError(
+          ErrorCode.INVALID_INPUT,
+          "No enabled providers are available. Verify API keys or restart after updating credentials."
+        );
+      }
+
       let selectedProvider = providerName;
       let selectedModelId = modelId;
+
+      const fallbackQueue: Array<{ provider: SupportedProvider; modelId: string }> = [];
+      if (availableProviders.includes(providerName)) {
+        fallbackQueue.push({ provider: providerName, modelId: selectedModelId });
+      }
+      for (const provider of availableProviders) {
+        if (provider === providerName) continue;
+        fallbackQueue.push({
+          provider,
+          modelId: PROVIDER_MODELS[provider]?.[0] ?? selectedModelId,
+        });
+      }
+
+      if (fallbackQueue.length === 0) {
+        throw createError(
+          ErrorCode.INVALID_INPUT,
+          "No provider is available for the requested model. Verify configured API keys."
+        );
+      }
+
       let attempt: { completion: CompletionResult; provider: SupportedProvider; model: string } | null = null;
       let lastError: unknown = null;
 
       for (let i = 0; i < fallbackQueue.length; i += 1) {
-        const candidateProvider = fallbackQueue[i]!;
-        const candidateModel = i === 0 ? selectedModelId : (PROVIDER_MODELS[candidateProvider]?.[0] ?? selectedModelId);
+        const candidate = fallbackQueue[i]!;
+        const candidateProvider = candidate.provider;
+        const candidateModel = candidate.modelId;
 
         try {
           attempt = await runAttempt(candidateProvider, candidateModel);
@@ -198,12 +255,18 @@ export class AISDKProvider implements LLMProvider {
           break;
         } catch (error) {
           lastError = error;
-          if (!isAuthFailure(error) && !isProviderConfigFailure(error)) {
+          const authFailure = isAuthFailure(error);
+          if (authFailure) {
+            this.disabledProviders.add(candidateProvider);
+          }
+
+          if (!authFailure && !isProviderConfigFailure(error)) {
             throw error;
           }
           if (i < fallbackQueue.length - 1) {
-            const nextProvider = fallbackQueue[i + 1]!;
-            const nextModel = PROVIDER_MODELS[nextProvider]?.[0] ?? selectedModelId;
+            const next = fallbackQueue[i + 1]!;
+            const nextProvider = next.provider;
+            const nextModel = next.modelId;
             providerNameForLog = nextProvider;
             modelId = nextModel;
             try {

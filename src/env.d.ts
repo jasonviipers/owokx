@@ -26,6 +26,7 @@ export interface Env {
   OKX_DEFAULT_QUOTE_CCY?: string;
   OKX_MAX_REQUESTS_PER_SECOND?: string;
   OKX_MAX_RETRIES?: string;
+  OKX_LOG_LEVEL?: "debug" | "info" | "warn" | "error" | "silent";
 
   OPENAI_API_KEY?: string;
   OPENAI_BASE_URL?: string;
