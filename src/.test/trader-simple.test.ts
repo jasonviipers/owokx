@@ -9,6 +9,7 @@ const { executeOrderMock, createBrokerProvidersMock, createD1ClientMock } = vi.h
 
 vi.mock("../execution/execute-order", () => ({
   executeOrder: executeOrderMock,
+  isAcceptedSubmissionState: (state: string) => state === "SUBMITTED" || state === "SUBMITTING",
 }));
 
 vi.mock("../providers/broker-factory", () => ({
@@ -185,6 +186,8 @@ describe("TraderSimple risk gating", () => {
 
     expect(payload.success).toBe(true);
     expect(executeOrderMock).toHaveBeenCalledTimes(1);
+    const firstCall = executeOrderMock.mock.calls[0]?.[0] as { idempotency_key?: string } | undefined;
+    expect(firstCall?.idempotency_key).toMatch(/^trader:buy:MSFT:\d+$/);
   });
 
   it("blocks analysis-driven BUY recommendations when risk manager rejects", async () => {

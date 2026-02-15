@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, useCallback, useRef } from 'react'
+import { useState, useEffect, useMemo, useCallback } from 'react'
 import { motion } from 'motion/react'
 import clsx from 'clsx'
 import { Panel } from './components/Panel'
@@ -9,44 +9,27 @@ import { LineChart, Sparkline } from './components/LineChart'
 import { NotificationBell } from './components/NotificationBell'
 import { Tooltip, TooltipContent } from './components/Tooltip'
 import { AgentControls } from './components/AgentControls'
-import type { Status, Config, LogEntry, Signal, Position, SignalResearch, PortfolioSnapshot } from './types'
+import type { Config, LogEntry, Signal, Position, SignalResearch, PortfolioSnapshot } from './types'
 import { MobileNav } from './components/Mobilenav'
+import { ErrorBoundary } from './components/ErrorBoundary'
 import { OverviewPage } from './pages/OverviewPage'
 import { SettingsPage } from './pages/SettingsPage'
 import { SwarmPage } from './pages/SwarmPage'
+import { useAgentStatus } from './hooks/useAgentStatus'
+import { useLogs } from './hooks/useLogs'
+import { useSwarmMetrics } from './hooks/useSwarmMetrics'
+import {
+  clearSessionToken,
+  fetchPortfolioHistory,
+  fetchSetupStatus,
+  resetAgent,
+  saveSessionToken,
+  setAgentEnabled,
+  type SetupStatusData,
+  updateAgentConfig,
+} from './lib/api'
 
-const API_BASE = '/api'
 declare const __OWOKX_API_URL__: string | undefined
-
-interface SetupStatusData {
-  configured?: boolean
-  api_origin?: string
-  auth?: {
-    token_env_var?: string
-  }
-  commands?: {
-    enable?: {
-      curl?: string
-    }
-  }
-}
-
-function authFetch(url: string, options: RequestInit = {}): Promise<Response> {
-  const headers = new Headers(options.headers)
-  if (!headers.has('Content-Type') && options.body) {
-    headers.set('Content-Type', 'application/json')
-  }
-  return fetch(url, { ...options, headers, credentials: 'include' })
-}
-
-async function saveSessionToken(token: string): Promise<Response> {
-  return fetch('/auth/session', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    credentials: 'include',
-    body: JSON.stringify({ token }),
-  })
-}
 
 function resolveConfiguredApiOrigin(): string | null {
   const candidate = typeof __OWOKX_API_URL__ === 'string' ? __OWOKX_API_URL__.trim() : ''
@@ -361,21 +344,6 @@ function getSentimentColor(score: unknown): string {
   return 'text-hud-warning'
 }
 
-async function fetchPortfolioHistory(period: string = '1D'): Promise<PortfolioSnapshot[]> {
-  try {
-    const timeframe = period === '1D' ? '15Min' : '1D'
-    const intraday = period === '1D' ? '&intraday_reporting=extended_hours' : ''
-    const res = await authFetch(`${API_BASE}/history?period=${period}&timeframe=${timeframe}${intraday}`)
-    const data = await res.json()
-    if (data.ok && data.data?.snapshots) {
-      return data.data.snapshots
-    }
-    return []
-  } catch {
-    return []
-  }
-}
-
 function generateMockPriceHistory(currentPrice: number, unrealizedPl: number, points: number = 20): number[] {
   if (!Number.isFinite(currentPrice) || currentPrice <= 0) return []
   const prices: number[] = []
@@ -393,10 +361,9 @@ function generateMockPriceHistory(currentPrice: number, unrealizedPl: number, po
 }
 
 export default function App() {
-  const [status, setStatus] = useState<Status | null>(null)
-  const [error, setError] = useState<string | null>(null)
   const [authTokenInput, setAuthTokenInput] = useState('')
   const [authSaving, setAuthSaving] = useState(false)
+  const [authError, setAuthError] = useState<string | null>(null)
   const [showSettings, setShowSettings] = useState(false)
   const [showSetup, setShowSetup] = useState(false)
   const [enableCommandHint, setEnableCommandHint] = useState(() =>
@@ -408,14 +375,26 @@ export default function App() {
   const [portfolioPeriod, setPortfolioPeriod] = useState<'1D' | '1W' | '1M'>('1D')
   const [agentBusy, setAgentBusy] = useState(false)
   const [agentMessage, setAgentMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
-  const [activityFeed, setActivityFeed] = useState<LogEntry[]>([])
-  const [activityFeedReady, setActivityFeedReady] = useState(false)
   const [activityEventTypeFilter, setActivityEventTypeFilter] = useState<ActivityEventTypeFilter>('all')
   const [activitySeverityFilter, setActivitySeverityFilter] = useState<ActivitySeverityFilter>('all')
   const [activityTimeRangeFilter, setActivityTimeRangeFilter] = useState<ActivityTimeRange>('24h')
   const [activityExpandedRows, setActivityExpandedRows] = useState<Record<string, boolean>>({})
-  const lastActivitySinceRef = useRef<number | null>(null)
   const [mobileView, setMobileView] = useState<'overview' | 'positions' | 'activity' | 'signals'>('overview')
+
+  const statusPollingEnabled = setupChecked && !showSetup
+  const { status, error, refresh: refreshStatus, setStatus } = useAgentStatus({
+    enabled: statusPollingEnabled,
+    pollMs: 5000,
+  })
+  const activityWindowMs = useMemo(() => timeRangeToMs(activityTimeRangeFilter), [activityTimeRangeFilter])
+  const { logs: activityFeed, ready: activityFeedReady } = useLogs({
+    enabled: statusPollingEnabled,
+    eventType: activityEventTypeFilter,
+    severity: activitySeverityFilter,
+    timeRangeMs: activityWindowMs,
+    pollMs: 10000,
+  })
+  const { metrics: swarmMetrics } = useSwarmMetrics({ enabled: statusPollingEnabled, pollMs: 10000 })
   
   const [wasConnected, setWasConnected] = useState(false)
   useEffect(() => {
@@ -428,8 +407,7 @@ export default function App() {
 
   const checkSetup = useCallback(async () => {
     try {
-      const res = await authFetch(`${API_BASE}/setup/status`)
-      const data = await res.json()
+      const data = await fetchSetupStatus()
       const setupData = (data?.data ?? {}) as SetupStatusData
       const backendEnableCommand = setupData.commands?.enable?.curl
       if (typeof backendEnableCommand === 'string' && backendEnableCommand.trim().length > 0) {
@@ -454,82 +432,14 @@ export default function App() {
     checkSetup()
   }, [checkSetup])
 
-  const fetchStatus = useCallback(async () => {
-    try {
-      const res = await authFetch(`${API_BASE}/status`)
-      const data = await res.json()
-      if (data.ok) {
-        setStatus(data.data)
-        setError(null)
-      } else {
-        setStatus(data.data || null)
-        setError(data.error || 'Failed to fetch status')
-      }
-    } catch {
-      setError('Connection failed - is the agent running?')
-    }
-  }, [])
-
   useEffect(() => {
-    if (setupChecked && !showSetup) {
-      fetchStatus()
-      const interval = setInterval(fetchStatus, 5000)
-      const timeInterval = setInterval(() => setTime(new Date()), 1000)
-
-      return () => {
-        clearInterval(interval)
-        clearInterval(timeInterval)
-      }
-    }
-  }, [setupChecked, showSetup, fetchStatus])
-
-  const fetchActivityFeed = useCallback(async () => {
-    if (!setupChecked || showSetup) return
-
-    try {
-      const params = new URLSearchParams()
-      params.set('limit', activityTimeRangeFilter === 'all' ? '250' : '120')
-      if (activityEventTypeFilter !== 'all') {
-        params.set('event_type', activityEventTypeFilter)
-      }
-      if (activitySeverityFilter !== 'all') {
-        params.set('severity', activitySeverityFilter)
-      }
-
-      const windowMs = timeRangeToMs(activityTimeRangeFilter)
-      if (windowMs !== null) {
-        const windowStart = Date.now() - windowMs
-        const incrementalStart = lastActivitySinceRef.current
-        params.set('since', String(incrementalStart ? Math.max(windowStart, incrementalStart) : windowStart))
-      }
-
-      const res = await authFetch(`${API_BASE}/logs?${params.toString()}`)
-      const data = await res.json()
-      const logs = Array.isArray(data?.logs) ? data.logs as LogEntry[] : []
-      const sorted = [...logs].sort((a, b) => getActivityTimestampMs(b) - getActivityTimestampMs(a))
-      setActivityFeed(sorted)
-      setActivityFeedReady(true)
-      if (sorted.length > 0) {
-        const newestMs = getActivityTimestampMs(sorted[0]!)
-        if (Number.isFinite(newestMs)) {
-          lastActivitySinceRef.current = newestMs + 1
-        }
-      }
-    } catch {
-      // Fallback stays on status payload logs when dedicated feed fetch fails.
-    }
-  }, [setupChecked, showSetup, activityEventTypeFilter, activitySeverityFilter, activityTimeRangeFilter])
-
-  useEffect(() => {
-    if (!setupChecked || showSetup) return
-    fetchActivityFeed()
-    const interval = setInterval(fetchActivityFeed, 10000)
-    return () => clearInterval(interval)
-  }, [setupChecked, showSetup, fetchActivityFeed])
+    if (!statusPollingEnabled) return
+    const timeInterval = setInterval(() => setTime(new Date()), 1000)
+    return () => clearInterval(timeInterval)
+  }, [statusPollingEnabled])
 
   useEffect(() => {
     setActivityExpandedRows({})
-    lastActivitySinceRef.current = null
   }, [activityEventTypeFilter, activitySeverityFilter, activityTimeRangeFilter])
 
   useEffect(() => {
@@ -539,31 +449,33 @@ export default function App() {
   }, [agentMessage])
 
   useEffect(() => {
-    if (!setupChecked || showSetup) return
+    if (!statusPollingEnabled) return
 
     const loadPortfolioHistory = async () => {
-      const history = await fetchPortfolioHistory(portfolioPeriod)
-      if (history.length > 0) {
-        setPortfolioHistory(history)
+      try {
+        const history = await fetchPortfolioHistory(portfolioPeriod)
+        if (history.length > 0) {
+          setPortfolioHistory(history)
+        }
+      } catch {
+        // Keep existing chart data when history endpoint is temporarily unavailable.
       }
     }
 
-    loadPortfolioHistory()
+    void loadPortfolioHistory()
     const historyInterval = setInterval(loadPortfolioHistory, 60000)
     return () => clearInterval(historyInterval)
-  }, [setupChecked, showSetup, portfolioPeriod])
+  }, [statusPollingEnabled, portfolioPeriod])
 
   const handleResetAgent = async () => {
     setAgentMessage(null)
     try {
-      const res = await authFetch(`${API_BASE}/reset`, { method: 'POST' })
-      const data = await res.json()
-      
-      if (!res.ok) {
+      const data = await resetAgent()
+      if (data.ok === false) {
         throw new Error(data.error || 'Reset failed')
       }
       
-      await fetchStatus()
+      await refreshStatus()
       setAgentMessage({ type: 'success', text: 'Agent reset successfully' })
       setPortfolioHistory([])
       setStatus(null)
@@ -575,13 +487,9 @@ export default function App() {
   }
 
   const handleSaveConfig = async (config: Config) => {
-    const res = await authFetch(`${API_BASE}/config`, {
-      method: 'POST',
-      body: JSON.stringify(config),
-    })
-    const data = await res.json()
+    const data = await updateAgentConfig(config)
     if (data.ok && status) {
-      setStatus({ ...status, config: data.data })
+      setStatus({ ...status, config: data.data ?? config })
     }
   }
 
@@ -670,28 +578,20 @@ export default function App() {
     setAgentBusy(true)
     setAgentMessage(null)
     try {
-      const endpoint = nextEnabled ? 'enable' : 'disable'
-      const res = await authFetch(`${API_BASE}/${endpoint}`, { method: 'POST' })
-      const data = await res.json().catch(() => null)
-
-      if (!res.ok) {
-        const msg = typeof data?.error === 'string' ? data.error : `Request failed (${res.status})`
-        throw new Error(msg)
-      }
-
-      if (data && typeof data === 'object' && data.ok === false) {
+      const data = await setAgentEnabled(nextEnabled)
+      if (data.ok === false) {
         const msg = typeof data.error === 'string' ? data.error : 'Request failed'
         throw new Error(msg)
       }
 
-      await fetchStatus()
+      await refreshStatus()
       setAgentMessage({ type: 'success', text: nextEnabled ? 'Agent enabled' : 'Agent disabled' })
     } catch (e) {
       setAgentMessage({ type: 'error', text: String(e) })
     } finally {
       setAgentBusy(false)
     }
-  }, [agentBusy, fetchStatus])
+  }, [agentBusy, refreshStatus])
 
   const configuredStartingEquity =
     Number.isFinite(config?.starting_equity) && (config?.starting_equity ?? 0) > 0
@@ -787,38 +687,48 @@ export default function App() {
   const handleAuthTokenSave = useCallback(async () => {
     const token = authTokenInput.trim()
     if (!token) {
-      setError('Token is required')
+      setAuthSaving(true)
+      try {
+        await clearSessionToken()
+        setAuthError('Session cleared')
+        await refreshStatus()
+      } catch (e) {
+        setAuthError(String(e))
+      } finally {
+        setAuthSaving(false)
+      }
       return
     }
     setAuthSaving(true)
     try {
-      const res = await saveSessionToken(token)
-      const data = await res.json().catch(() => ({}))
-      if (!res.ok || data?.ok === false) {
-        throw new Error(data?.error || 'Authentication failed')
-      }
+      await saveSessionToken(token)
       setAuthTokenInput('')
-      setError(null)
-      await fetchStatus()
+      setAuthError(null)
+      await refreshStatus()
     } catch (e) {
-      setError(String(e))
+      setAuthError(String(e))
     } finally {
       setAuthSaving(false)
     }
-  }, [authTokenInput, fetchStatus])
+  }, [authTokenInput, refreshStatus])
 
   if (showSetup) {
-    return <SetupWizard onComplete={() => setShowSetup(false)} />
+    return (
+      <ErrorBoundary title="SETUP PANEL ERROR">
+        <SetupWizard onComplete={() => setShowSetup(false)} />
+      </ErrorBoundary>
+    )
   }
 
-  if (error && !status) {
-    const isAuthError = error.includes('Unauthorized')
+  const blockingError = authError ?? error
+  if (blockingError && !status) {
+    const isAuthError = blockingError.includes('Unauthorized')
     return (
       <div className="min-h-screen bg-hud-bg flex items-center justify-center p-4 md:p-6">
         <Panel title={isAuthError ? "AUTHENTICATION REQUIRED" : "CONNECTION ERROR"} className="max-w-md w-full">
           <div className="text-center py-8">
             <div className="text-hud-error text-2xl mb-4">{isAuthError ? "NO TOKEN" : "OFFLINE"}</div>
-            <p className="text-hud-text-dim text-sm mb-6">{error}</p>
+            <p className="text-hud-text-dim text-sm mb-6">{blockingError}</p>
             {isAuthError ? (
               <div className="space-y-4">
                 <div className="text-left bg-hud-panel p-4 border border-hud-line">
@@ -1173,7 +1083,9 @@ export default function App() {
             </Panel>
           </div>
 
-          <SwarmPage swarm={status?.swarm} />
+          <ErrorBoundary title="SWARM PANEL ERROR">
+            <SwarmPage swarm={status?.swarm} metrics={swarmMetrics} />
+          </ErrorBoundary>
 
           <div className="col-span-4 md:col-span-8 lg:col-span-12">
             <Panel title="RISK & SIGNAL QUALITY" className="h-full">
@@ -1763,13 +1675,15 @@ export default function App() {
         </div>
       </footer>
 
-      <SettingsPage
-        show={showSettings}
-        config={config}
-        onSave={handleSaveConfig}
-        onClose={() => setShowSettings(false)}
-        onReset={handleResetAgent}
-      />
+      <ErrorBoundary title="SETTINGS PANEL ERROR">
+        <SettingsPage
+          show={showSettings}
+          config={config}
+          onSave={handleSaveConfig}
+          onClose={() => setShowSettings(false)}
+          onReset={handleResetAgent}
+        />
+      </ErrorBoundary>
     </div>
   )
 }

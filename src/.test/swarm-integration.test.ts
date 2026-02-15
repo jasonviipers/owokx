@@ -16,6 +16,7 @@ vi.mock("../providers/llm/factory", () => ({
 
 vi.mock("../execution/execute-order", () => ({
   executeOrder: executeOrderMock,
+  isAcceptedSubmissionState: (state: string) => state === "SUBMITTED" || state === "SUBMITTING",
 }));
 
 vi.mock("../providers/broker-factory", () => ({

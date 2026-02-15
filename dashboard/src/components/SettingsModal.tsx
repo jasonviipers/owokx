@@ -1,6 +1,7 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import type { Config } from '../types'
 import { Panel } from './Panel'
+import { clearSessionToken, saveSessionToken } from '../lib/api'
 
 interface SettingsModalProps {
   config: Config
@@ -11,6 +12,7 @@ interface SettingsModalProps {
 
 export function SettingsModal({ config, onSave, onClose, onReset }: SettingsModalProps) {
   const [localConfig, setLocalConfig] = useState<Config>(config)
+  const [isDirty, setIsDirty] = useState(false)
   const [saving, setSaving] = useState(false)
   const [resetting, setResetting] = useState(false)
   const [showResetConfirm, setShowResetConfirm] = useState(false)
@@ -19,8 +21,11 @@ export function SettingsModal({ config, onSave, onClose, onReset }: SettingsModa
   const [authMessage, setAuthMessage] = useState<string | null>(null)
   const [authSaving, setAuthSaving] = useState(false)
 
-  // Note: We intentionally do NOT sync localConfig with the config prop after initial mount.
-  // This prevents the parent's polling (every 5s) from overwriting user's unsaved changes.
+  useEffect(() => {
+    if (!isDirty) {
+      setLocalConfig(config)
+    }
+  }, [config, isDirty])
 
   const handleTokenSave = async () => {
     setAuthSaving(true)
@@ -28,24 +33,12 @@ export function SettingsModal({ config, onSave, onClose, onReset }: SettingsModa
     try {
       const token = apiToken.trim()
       if (token.length === 0) {
-        await fetch('/auth/session', {
-          method: 'DELETE',
-          credentials: 'include',
-        })
+        await clearSessionToken()
         setAuthMessage('Session cleared')
         return
       }
 
-      const response = await fetch('/auth/session', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        credentials: 'include',
-        body: JSON.stringify({ token }),
-      })
-      const data = await response.json().catch(() => ({}))
-      if (!response.ok || data?.ok === false) {
-        throw new Error(data?.error || 'Failed to save session')
-      }
+      await saveSessionToken(token)
       setApiToken('')
       setAuthMessage('Session saved')
     } catch (error) {
@@ -56,10 +49,12 @@ export function SettingsModal({ config, onSave, onClose, onReset }: SettingsModa
   }
 
   const handleChange = <K extends keyof Config>(key: K, value: Config[K]) => {
+    setIsDirty(true)
     setLocalConfig(prev => ({ ...prev, [key]: value }))
   }
 
   const handleBrokerChange = (broker: 'alpaca' | 'okx') => {
+    setIsDirty(true)
     setLocalConfig(prev => {
       const next: Config = { ...prev, broker }
       if (broker === 'okx') {
@@ -76,6 +71,7 @@ export function SettingsModal({ config, onSave, onClose, onReset }: SettingsModa
     setSaving(true)
     try {
       await onSave(localConfig)
+      setIsDirty(false)
       onClose()
     } catch (error) {
       console.error('Failed to save config:', error)

@@ -2,13 +2,15 @@ import { motion } from 'motion/react'
 import clsx from 'clsx'
 import { Panel } from './Panel'
 import { StatusIndicator } from './StatusIndicator'
+import type { SwarmMetricsData } from '../lib/api'
 import type { SwarmStatus } from '../types'
 
 interface SwarmDashboardProps {
   swarm?: SwarmStatus
+  metrics?: SwarmMetricsData | null
 }
 
-export function SwarmDashboard({ swarm }: SwarmDashboardProps) {
+export function SwarmDashboard({ swarm, metrics }: SwarmDashboardProps) {
   if (!swarm) {
     return (
       <Panel title="SWARM NETWORK" className="h-full">
@@ -37,6 +39,23 @@ export function SwarmDashboard({ swarm }: SwarmDashboardProps) {
       }
       className="h-full"
     >
+      {metrics && (
+        <div className="mb-3 grid grid-cols-1 sm:grid-cols-3 gap-2 text-xs">
+          <div className="border border-hud-line/30 rounded p-2 bg-hud-panel/30">
+            <div className="text-hud-text-dim">Queued</div>
+            <div className="text-hud-text">{metrics.queue?.queued ?? 0}</div>
+          </div>
+          <div className="border border-hud-line/30 rounded p-2 bg-hud-panel/30">
+            <div className="text-hud-text-dim">Dead Letter</div>
+            <div className="text-hud-warning">{metrics.queue?.deadLettered ?? 0}</div>
+          </div>
+          <div className="border border-hud-line/30 rounded p-2 bg-hud-panel/30">
+            <div className="text-hud-text-dim">Stale Agents</div>
+            <div className="text-hud-text">{metrics.agents?.stale ?? 0}</div>
+          </div>
+        </div>
+      )}
+
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3">
         {agents.map((agent) => {
           const isAlive = Date.now() - agent.lastHeartbeat < 300_000 // 5 min

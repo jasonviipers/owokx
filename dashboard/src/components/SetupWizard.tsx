@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { Panel } from './Panel'
+import { saveSetupKeys } from '../lib/api'
 
 interface SetupWizardProps {
   onComplete: () => void
@@ -27,20 +28,14 @@ export function SetupWizard({ onComplete }: SetupWizardProps) {
     setError(null)
 
     try {
-      const res = await fetch('/api/setup/keys', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          alpaca_key: alpacaKey,
-          alpaca_secret: alpacaSecret,
-          openai_key: openaiKey || undefined,
-          paper_mode: paperMode,
-          starting_equity: startingEquity,
-        }),
+      const data = await saveSetupKeys({
+        alpaca_key: alpacaKey,
+        alpaca_secret: alpacaSecret,
+        openai_key: openaiKey || undefined,
+        paper_mode: paperMode,
+        starting_equity: startingEquity,
       })
-      
-      const data = await res.json()
-      
+
       if (data.ok) {
         setStep(3)
       } else {

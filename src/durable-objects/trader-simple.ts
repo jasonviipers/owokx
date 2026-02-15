@@ -5,7 +5,7 @@
  */
 
 import type { Env } from "../env.d";
-import { executeOrder } from "../execution/execute-order";
+import { executeOrder, isAcceptedSubmissionState } from "../execution/execute-order";
 import { AgentBase, type AgentBaseState } from "../lib/agents/base";
 import type { AgentMessage, AgentType } from "../lib/agents/protocol";
 import { createBrokerProviders } from "../providers/broker-factory";
@@ -316,7 +316,7 @@ export class TraderSimple extends AgentBase<TraderState> {
     try {
       const broker = createBrokerProviders(this.env, "alpaca");
       const db = createD1Client(this.env.DB);
-      const idempotency_key = `trader:buy:${symbol}:${Date.now()}`;
+      const idempotency_key = this.buildIdempotencyKey("buy", symbol);
 
       const execution = await executeOrder({
         env: this.env,
@@ -334,7 +334,7 @@ export class TraderSimple extends AgentBase<TraderState> {
         },
       });
 
-      const success = execution.submission.state === "SUBMITTED" || execution.submission.state === "SUBMITTING";
+      const success = isAcceptedSubmissionState(execution.submission.state);
 
       this.recordTrade(symbol, "buy", positionSize, success, undefined);
 
@@ -396,7 +396,7 @@ export class TraderSimple extends AgentBase<TraderState> {
       }
 
       const db = createD1Client(this.env.DB);
-      const idempotency_key = `trader:sell:${symbol}:${Date.now()}`;
+      const idempotency_key = this.buildIdempotencyKey("sell", symbol);
 
       const execution = await executeOrder({
         env: this.env,
@@ -414,7 +414,7 @@ export class TraderSimple extends AgentBase<TraderState> {
         },
       });
 
-      const success = execution.submission.state === "SUBMITTED" || execution.submission.state === "SUBMITTING";
+      const success = isAcceptedSubmissionState(execution.submission.state);
 
       this.recordTrade(position.symbol, "sell", position.market_value, success, undefined);
 
@@ -622,6 +622,15 @@ export class TraderSimple extends AgentBase<TraderState> {
     } catch (error) {
       return { approved: false, reason: `Risk manager error: ${String(error)}` };
     }
+  }
+
+  private buildIdempotencyKey(action: "buy" | "sell", symbol: string, suffix?: string): string {
+    const normalizedSymbol = symbol
+      .trim()
+      .toUpperCase()
+      .replace(/[^A-Z0-9/_:-]/g, "_");
+    const bucket = suffix ?? String(Math.floor(Date.now() / 300_000));
+    return `trader:${action}:${normalizedSymbol}:${bucket}`;
   }
 
   private async publishTradeOutcome(outcome: {

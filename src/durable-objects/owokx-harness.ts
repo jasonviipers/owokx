@@ -37,7 +37,6 @@
 
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "../env.d";
-import { executeOrder } from "../execution/execute-order";
 import { isRequestAuthorized } from "../lib/auth";
 import { ErrorCode } from "../lib/errors";
 import {
@@ -53,6 +52,7 @@ import { safeValidateAgentConfig } from "../schemas/agent-config";
 import { createD1Client } from "../storage/d1/client";
 import { createDecision } from "../storage/d1/queries/decisions";
 import { createHarnessContext } from "./harness/context";
+import { createExecutionService, type ExecutionService } from "./harness/execution-service";
 import { createResearchService, type ResearchService } from "./harness/research-service";
 import { createSignalService, type SignalService } from "./harness/signal-service";
 import type { HarnessContext } from "./harness/types";
@@ -1156,6 +1156,7 @@ export class OwokxHarness extends DurableObject<Env> {
   private readonly harnessContext: HarnessContext<AgentState>;
   private readonly signalService: SignalService;
   private readonly researchService: ResearchService<ResearchResult>;
+  private readonly executionService: ExecutionService;
   private lastLogPersistAt = 0;
   private logPersistTimerArmed = false;
   private lastSwarmBypassLogAt = 0;
@@ -1173,6 +1174,7 @@ export class OwokxHarness extends DurableObject<Env> {
     this.researchService = createResearchService<ResearchResult>(this.harnessContext, {
       researchTopSignals: (limit?: number) => this.researchTopSignals(limit),
     });
+    this.executionService = createExecutionService(this.harnessContext);
 
     this._llm = createLLMProvider(env);
     if (this._llm) {
@@ -3404,14 +3406,10 @@ export class OwokxHarness extends DurableObject<Env> {
 
     try {
       const notional = Math.round(positionSize * 100) / 100;
-      const db = createD1Client(this.env.DB);
       const suffix = idempotencySuffix ?? String(Math.floor(Date.now() / 300_000));
       const idempotency_key = `harness:buy:${symbol}:${suffix}`;
-      const execution = await executeOrder({
-        env: this.env,
-        db,
+      const execution = await this.executionService.submitOrder({
         broker,
-        source: "harness",
         idempotency_key,
         order: {
           symbol,
@@ -3429,7 +3427,7 @@ export class OwokxHarness extends DurableObject<Env> {
         submission_state: execution.submission.state,
         broker_order_id: execution.broker_order_id ?? null,
       });
-      return execution.submission.state === "SUBMITTED" || execution.submission.state === "SUBMITTING";
+      return execution.accepted;
     } catch (error) {
       this.log("Crypto", "buy_failed", { symbol, error: String(error) });
       return false;
@@ -6455,14 +6453,10 @@ Response format:
       }
 
       const notional = Math.round(positionSize * 100) / 100;
-      const db = createD1Client(this.env.DB);
       const suffix = idempotencySuffix ?? String(Math.floor(Date.now() / 300_000));
       const idempotency_key = `harness:buy:${orderSymbol}:${suffix}`;
-      const execution = await executeOrder({
-        env: this.env,
-        db,
+      const execution = await this.executionService.submitOrder({
         broker,
-        source: "harness",
         idempotency_key,
         order: {
           symbol: orderSymbol,
@@ -6501,7 +6495,7 @@ Response format:
           },
         }
       );
-      return execution.submission.state === "SUBMITTED" || execution.submission.state === "SUBMITTING";
+      return execution.accepted;
     } catch (error) {
       this.log("Executor", "buy_failed", { symbol, error: String(error) });
       this.rememberEpisode(`Buy failed for ${symbol}`, "failure", ["trade", "buy", symbol, "error"], {
@@ -6541,15 +6535,11 @@ Response format:
       const timeInForce = isCrypto ? "gtc" : "day";
 
       const entry = this.state.positionEntries[pos.symbol];
-      const db = createD1Client(this.env.DB);
       const suffix = idempotencySuffix ?? String(entry?.entry_time ?? Math.floor(Date.now() / 300_000));
       const idempotency_key = `harness:sell:${pos.symbol}:${suffix}`;
 
-      const execution = await executeOrder({
-        env: this.env,
-        db,
+      const execution = await this.executionService.submitOrder({
         broker,
-        source: "harness",
         idempotency_key,
         order: {
           symbol: pos.symbol,
@@ -6608,7 +6598,7 @@ Response format:
         }
       }
 
-      return execution.submission.state === "SUBMITTED" || execution.submission.state === "SUBMITTING";
+      return execution.accepted;
     } catch (error) {
       this.log("Executor", "sell_failed", { symbol, error: String(error) });
       this.rememberEpisode(`Sell failed for ${symbol}`, "failure", ["trade", "sell", symbol, "error"], {

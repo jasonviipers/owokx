@@ -49,6 +49,32 @@ export interface OptionsPolicyContext {
   riskState: RiskState;
 }
 
+function getPositionExposureValue(position: Position): number {
+  if (Number.isFinite(position.market_value)) {
+    return Math.abs(position.market_value);
+  }
+  const qty = Number.isFinite(position.qty) ? Math.abs(position.qty) : 0;
+  const price = Number.isFinite(position.current_price)
+    ? position.current_price
+    : Number.isFinite(position.avg_entry_price)
+      ? position.avg_entry_price
+      : 0;
+  return qty * price;
+}
+
+function getCorrelationBucket(symbol: string, assetClass: string): string {
+  if (assetClass === "crypto" || symbol.includes("/")) return "crypto";
+  if (assetClass === "us_option") {
+    const underlying = symbol.match(/^[A-Z]+/)?.[0] ?? symbol;
+    return `option:${underlying}`;
+  }
+  return "us_equity";
+}
+
+function resolveRiskLimit(runtimeValue: number | null | undefined, configValue: number): number {
+  return typeof runtimeValue === "number" && runtimeValue > 0 ? Math.min(runtimeValue, configValue) : configValue;
+}
+
 export class PolicyEngine {
   constructor(public config: PolicyConfig) {}
 
@@ -59,11 +85,14 @@ export class PolicyEngine {
     this.checkKillSwitch(ctx, violations);
     this.checkCooldown(ctx, violations);
     this.checkDailyLossLimit(ctx, violations);
+    this.checkPortfolioDrawdown(ctx, violations, warnings);
     this.checkTradingHours(ctx, violations, warnings);
     this.checkSymbolFilters(ctx, violations);
     this.checkOrderType(ctx, violations);
     this.checkNotionalLimit(ctx, violations);
     this.checkPositionSize(ctx, violations, warnings);
+    this.checkSymbolExposure(ctx, violations, warnings);
+    this.checkCorrelatedExposure(ctx, violations, warnings);
     this.checkOpenPositionsLimit(ctx, violations);
     this.checkShortSelling(ctx, violations);
     this.checkBuyingPower(ctx, violations);
@@ -121,6 +150,42 @@ export class PolicyEngine {
         message: `Daily loss limit reached: ${(dailyLossPct * 100).toFixed(2)}% of equity`,
         current_value: dailyLossPct,
         limit_value: this.config.max_daily_loss_pct,
+      });
+    }
+  }
+
+  private checkPortfolioDrawdown(ctx: PolicyContext, violations: PolicyViolation[], warnings: PolicyWarning[]): void {
+    const startingEquityCandidate =
+      (typeof ctx.riskState.daily_equity_start === "number" && ctx.riskState.daily_equity_start > 0
+        ? ctx.riskState.daily_equity_start
+        : null) ??
+      (Number.isFinite(ctx.account.last_equity) && ctx.account.last_equity > 0 ? ctx.account.last_equity : null) ??
+      (Number.isFinite(ctx.account.equity) && ctx.account.equity > 0 ? ctx.account.equity : null);
+
+    if (!startingEquityCandidate || !Number.isFinite(ctx.account.equity) || ctx.account.equity <= 0) {
+      return;
+    }
+
+    const effectiveLimit = resolveRiskLimit(
+      ctx.riskState.max_portfolio_drawdown_pct,
+      this.config.max_portfolio_drawdown_pct
+    );
+    const drawdownPct = Math.max(0, (startingEquityCandidate - ctx.account.equity) / startingEquityCandidate);
+
+    if (drawdownPct >= effectiveLimit) {
+      violations.push({
+        rule: "max_portfolio_drawdown",
+        message: `Portfolio drawdown ${(drawdownPct * 100).toFixed(2)}% exceeds limit ${(effectiveLimit * 100).toFixed(2)}%`,
+        current_value: drawdownPct,
+        limit_value: effectiveLimit,
+      });
+      return;
+    }
+
+    if (drawdownPct >= effectiveLimit * 0.8) {
+      warnings.push({
+        rule: "portfolio_drawdown_warning",
+        message: `Portfolio drawdown ${(drawdownPct * 100).toFixed(2)}% is approaching the ${(effectiveLimit * 100).toFixed(2)}% limit`,
       });
     }
   }
@@ -218,6 +283,68 @@ export class PolicyEngine {
       warnings.push({
         rule: "position_size_warning",
         message: `Position will be ${(positionPct * 100).toFixed(2)}% of equity, approaching limit`,
+      });
+    }
+  }
+
+  private checkSymbolExposure(ctx: PolicyContext, violations: PolicyViolation[], warnings: PolicyWarning[]): void {
+    if (ctx.order.side !== "buy") return;
+    if (!Number.isFinite(ctx.account.equity) || ctx.account.equity <= 0) return;
+
+    const symbol = ctx.order.symbol.toUpperCase();
+    const estimatedNotional = this.estimateNotional(ctx.order);
+    const currentExposure = ctx.positions
+      .filter((position) => position.symbol.toUpperCase() === symbol)
+      .reduce((sum, position) => sum + getPositionExposureValue(position), 0);
+    const projectedExposurePct = (currentExposure + estimatedNotional) / ctx.account.equity;
+    const effectiveLimit = resolveRiskLimit(ctx.riskState.max_symbol_exposure_pct, this.config.max_symbol_exposure_pct);
+
+    if (projectedExposurePct > effectiveLimit) {
+      violations.push({
+        rule: "max_symbol_exposure",
+        message: `Projected ${symbol} exposure ${(projectedExposurePct * 100).toFixed(2)}% exceeds limit ${(effectiveLimit * 100).toFixed(2)}%`,
+        current_value: projectedExposurePct,
+        limit_value: effectiveLimit,
+      });
+      return;
+    }
+
+    if (projectedExposurePct > effectiveLimit * 0.8) {
+      warnings.push({
+        rule: "symbol_exposure_warning",
+        message: `${symbol} exposure ${(projectedExposurePct * 100).toFixed(2)}% is approaching the ${(effectiveLimit * 100).toFixed(2)}% limit`,
+      });
+    }
+  }
+
+  private checkCorrelatedExposure(ctx: PolicyContext, violations: PolicyViolation[], warnings: PolicyWarning[]): void {
+    if (ctx.order.side !== "buy") return;
+    if (!Number.isFinite(ctx.account.equity) || ctx.account.equity <= 0) return;
+
+    const orderBucket = getCorrelationBucket(ctx.order.symbol.toUpperCase(), ctx.order.asset_class);
+    const currentBucketExposure = ctx.positions
+      .filter((position) => getCorrelationBucket(position.symbol.toUpperCase(), position.asset_class) === orderBucket)
+      .reduce((sum, position) => sum + getPositionExposureValue(position), 0);
+    const projectedExposurePct = (currentBucketExposure + this.estimateNotional(ctx.order)) / ctx.account.equity;
+    const effectiveLimit = resolveRiskLimit(
+      ctx.riskState.max_correlated_exposure_pct,
+      this.config.max_correlated_exposure_pct
+    );
+
+    if (projectedExposurePct > effectiveLimit) {
+      violations.push({
+        rule: "max_correlated_exposure",
+        message: `Projected correlated exposure ${(projectedExposurePct * 100).toFixed(2)}% exceeds limit ${(effectiveLimit * 100).toFixed(2)}%`,
+        current_value: projectedExposurePct,
+        limit_value: effectiveLimit,
+      });
+      return;
+    }
+
+    if (projectedExposurePct > effectiveLimit * 0.8) {
+      warnings.push({
+        rule: "correlated_exposure_warning",
+        message: `Correlated exposure ${(projectedExposurePct * 100).toFixed(2)}% is approaching the ${(effectiveLimit * 100).toFixed(2)}% limit`,
       });
     }
   }
