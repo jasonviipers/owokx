@@ -17,6 +17,16 @@ import { MobileNav } from './components/Mobilenav'
 const API_BASE = '/api'
 declare const __OWOKX_API_URL__: string | undefined
 
+interface FinancialStreamPayload {
+  account: Status['account']
+  positions: Position[]
+  clock: Status['clock']
+  total_unrealized_pl: number
+  total_pl: number | null
+  total_pl_pct: number | null
+  generated_at: string
+}
+
 interface SetupStatusData {
   configured?: boolean
   api_origin?: string
@@ -415,6 +425,9 @@ export default function App() {
   const [activityExpandedRows, setActivityExpandedRows] = useState<Record<string, boolean>>({})
   const lastActivitySinceRef = useRef<number | null>(null)
   const [mobileView, setMobileView] = useState<'overview' | 'positions' | 'activity' | 'signals'>('overview')
+  const [statusStreamConnected, setStatusStreamConnected] = useState(false)
+  const statusStreamRef = useRef<EventSource | null>(null)
+  const statusStreamRetryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   
   const [wasConnected, setWasConnected] = useState(false)
   useEffect(() => {
@@ -472,7 +485,7 @@ export default function App() {
   useEffect(() => {
     if (setupChecked && !showSetup) {
       fetchStatus()
-      const interval = setInterval(fetchStatus, 5000)
+      const interval = setInterval(fetchStatus, statusStreamConnected ? 30000 : 5000)
       const timeInterval = setInterval(() => setTime(new Date()), 1000)
 
       return () => {
@@ -480,7 +493,84 @@ export default function App() {
         clearInterval(timeInterval)
       }
     }
-  }, [setupChecked, showSetup, fetchStatus])
+  }, [setupChecked, showSetup, fetchStatus, statusStreamConnected])
+
+  useEffect(() => {
+    if (!setupChecked || showSetup) return
+
+    let disposed = false
+    let retryMs = 1000
+
+    const closeStream = () => {
+      if (statusStreamRef.current) {
+        statusStreamRef.current.close()
+        statusStreamRef.current = null
+      }
+    }
+
+    const scheduleReconnect = () => {
+      if (disposed) return
+      if (statusStreamRetryTimerRef.current) {
+        clearTimeout(statusStreamRetryTimerRef.current)
+      }
+      const waitMs = retryMs
+      retryMs = Math.min(retryMs * 2, 15000)
+      statusStreamRetryTimerRef.current = setTimeout(connect, waitMs)
+    }
+
+    const connect = () => {
+      if (disposed) return
+      closeStream()
+
+      const stream = new EventSource(`${API_BASE}/status/stream`, { withCredentials: true })
+      statusStreamRef.current = stream
+
+      stream.addEventListener('open', () => {
+        if (disposed) return
+        retryMs = 1000
+        setStatusStreamConnected(true)
+      })
+
+      stream.addEventListener('financial_update', (event) => {
+        if (disposed) return
+        const messageEvent = event as MessageEvent<string>
+        try {
+          const payload = JSON.parse(messageEvent.data) as FinancialStreamPayload
+          setStatus((prev) => {
+            if (!prev) return prev
+            return {
+              ...prev,
+              account: payload.account ?? prev.account,
+              positions: Array.isArray(payload.positions) ? payload.positions : prev.positions,
+              clock: payload.clock ?? prev.clock,
+            }
+          })
+          setError(null)
+        } catch {
+          // Ignore malformed stream payloads and keep current state.
+        }
+      })
+
+      stream.addEventListener('error', () => {
+        if (disposed) return
+        setStatusStreamConnected(false)
+        closeStream()
+        scheduleReconnect()
+      })
+    }
+
+    connect()
+
+    return () => {
+      disposed = true
+      setStatusStreamConnected(false)
+      closeStream()
+      if (statusStreamRetryTimerRef.current) {
+        clearTimeout(statusStreamRetryTimerRef.current)
+        statusStreamRetryTimerRef.current = null
+      }
+    }
+  }, [setupChecked, showSetup])
 
   const fetchActivityFeed = useCallback(async () => {
     if (!setupChecked || showSetup) return
@@ -663,6 +753,10 @@ export default function App() {
   const costs = status?.costs || { total_usd: 0, calls: 0, tokens_in: 0, tokens_out: 0 }
   const config = status?.config
   const isMarketOpen = status?.clock?.is_open ?? false
+  const streamBadgeLabel = statusStreamConnected ? 'LIVE STREAM' : 'POLLING'
+  const streamBadgeClass = statusStreamConnected
+    ? 'text-hud-success border-hud-success/40 bg-hud-success/10'
+    : 'text-hud-warning border-hud-warning/40 bg-hud-warning/10'
 
   const setAgentEnabledRemote = useCallback(async (nextEnabled: boolean) => {
     if (agentBusy) return
@@ -884,6 +978,9 @@ export default function App() {
                 { label: 'API CALLS', value: costs.calls.toString() },
               ]}
             />
+            <span className={clsx('hud-label border rounded px-2 py-1', streamBadgeClass)}>
+              {streamBadgeLabel}
+            </span>
             <NotificationBell
               overnightActivity={status?.overnightActivity}
               premarketPlan={status?.premarketPlan}
@@ -915,6 +1012,9 @@ export default function App() {
               <span className="hud-label text-xs">v2</span>
             </div>
             <div className="flex items-center gap-2">
+              <span className={clsx('hud-label border rounded px-2 py-1', streamBadgeClass)}>
+                {streamBadgeLabel}
+              </span>
               <NotificationBell
                 overnightActivity={status?.overnightActivity}
                 premarketPlan={status?.premarketPlan}

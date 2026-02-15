@@ -1632,6 +1632,7 @@ export class OwokxHarness extends DurableObject<Env> {
 
     const readActions = [
       "status",
+      "status/stream",
       "logs",
       "costs",
       "signals",
@@ -1662,6 +1663,9 @@ export class OwokxHarness extends DurableObject<Env> {
       switch (action) {
         case "status":
           return this.handleStatus();
+
+        case "status/stream":
+          return this.handleStatusStream();
 
         case "setup/status":
           return this.handleSetupStatus(request);
@@ -2073,6 +2077,111 @@ export class OwokxHarness extends DurableObject<Env> {
         signalQuality,
         signalPerformance,
         swarm,
+      },
+    });
+  }
+
+  private async readFinancialSnapshot(): Promise<{
+    account: Account | null;
+    positions: Position[];
+    clock: MarketClock | null;
+    total_unrealized_pl: number;
+    total_pl: number | null;
+    total_pl_pct: number | null;
+    generated_at: string;
+  }> {
+    const broker = createBrokerProviders(this.env, this.state.config.broker);
+    const [account, positions, clock] = await Promise.all([
+      broker.trading.getAccount(),
+      broker.trading.getPositions(),
+      broker.trading.getClock(),
+    ]);
+
+    const totalUnrealizedPl = positions.reduce(
+      (sum, pos) => sum + (Number.isFinite(pos.unrealized_pl) ? pos.unrealized_pl : 0),
+      0
+    );
+    const startingEquity = this.state.config.starting_equity;
+    const hasStartingEquity =
+      typeof startingEquity === "number" && Number.isFinite(startingEquity) && startingEquity > 0;
+    const totalPl = hasStartingEquity ? account.equity - startingEquity : null;
+    const totalPlPct = hasStartingEquity ? (totalPl! / startingEquity) * 100 : null;
+
+    return {
+      account,
+      positions,
+      clock,
+      total_unrealized_pl: totalUnrealizedPl,
+      total_pl: totalPl,
+      total_pl_pct: totalPlPct,
+      generated_at: new Date().toISOString(),
+    };
+  }
+
+  private async handleStatusStream(): Promise<Response> {
+    const encoder = new TextEncoder();
+    const snapshotIntervalMs = 1_000;
+    const heartbeatIntervalMs = 15_000;
+    let closed = false;
+    let pushing = false;
+    let lastPayload = "";
+    let snapshotTimer: ReturnType<typeof setInterval> | null = null;
+    let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+
+    const stream = new ReadableStream<Uint8Array>({
+      start: (controller) => {
+        const send = (event: string, payload: unknown) => {
+          if (closed) return;
+          controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`));
+        };
+
+        const sendError = (error: unknown) => {
+          send("error", { message: String(error), at: new Date().toISOString() });
+        };
+
+        const pushSnapshot = async () => {
+          if (closed || pushing) return;
+          pushing = true;
+          try {
+            const snapshot = await this.readFinancialSnapshot();
+            const payload = JSON.stringify(snapshot);
+            if (payload !== lastPayload) {
+              lastPayload = payload;
+              send("financial_update", snapshot);
+            }
+          } catch (error) {
+            sendError(error);
+          } finally {
+            pushing = false;
+          }
+        };
+
+        void (async () => {
+          send("ready", { ok: true, connected_at: new Date().toISOString() });
+          await pushSnapshot();
+        })();
+
+        snapshotTimer = setInterval(() => {
+          void pushSnapshot();
+        }, snapshotIntervalMs);
+
+        heartbeatTimer = setInterval(() => {
+          send("heartbeat", { t: Date.now() });
+        }, heartbeatIntervalMs);
+      },
+      cancel: () => {
+        closed = true;
+        if (snapshotTimer) clearInterval(snapshotTimer);
+        if (heartbeatTimer) clearInterval(heartbeatTimer);
+      },
+    });
+
+    return new Response(stream, {
+      headers: {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache, no-transform",
+        Connection: "keep-alive",
+        "X-Accel-Buffering": "no",
       },
     });
   }
