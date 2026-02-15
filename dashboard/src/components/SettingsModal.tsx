@@ -100,7 +100,8 @@ export function SettingsModal({ config, onSave, onClose, onReset }: SettingsModa
       onClose()
     } catch (error) {
       console.error('Failed to reset agent:', error)
-      setResetError('Failed to reset agent. Please try again.')
+      const message = error instanceof Error ? error.message : String(error)
+      setResetError(message && message.length > 0 ? message : 'Failed to reset agent. Please try again.')
     } finally {
       setResetting(false)
     }

@@ -646,10 +646,10 @@ export default function App() {
     setAgentMessage(null)
     try {
       const res = await authFetch(`${API_BASE}/reset`, { method: 'POST' })
-      const data = await res.json()
+      const data = await res.json().catch(() => ({} as { error?: string }))
       
       if (!res.ok) {
-        throw new Error(data.error || 'Reset failed')
+        throw new Error(data.error || `Reset failed (HTTP ${res.status})`)
       }
       
       await fetchStatus()
@@ -658,7 +658,8 @@ export default function App() {
       setStatus(null)
       
     } catch (e) {
-      setAgentMessage({ type: 'error', text: `Reset failed: ${String(e)}` })
+      const message = e instanceof Error ? e.message : String(e)
+      setAgentMessage({ type: 'error', text: `Reset failed: ${message}` })
       throw e
     }
   }
