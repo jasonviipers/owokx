@@ -18,7 +18,6 @@ on:
 permissions:
   contents: read
   deployments: write
-  packages: write
 
 concurrency:
   group: deploy-${{ github.ref }}-${{ inputs.environment }}
@@ -28,23 +27,29 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     environment: ${{ inputs.environment }}
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      WORKER_CONFIG: wrangler.jsonc
+      DASHBOARD_CONFIG: dashboard/wrangler.container.jsonc
+      D1_DATABASE_NAME: owokx_db
     steps:
       - name: Create GitHub deployment record
         id: gh_deploy
         uses: actions/github-script@f28e40c71b31f280037facc361f47a9f3d669158 # v7.1.0
         with:
           script: |
-            const env = core.getInput('environment') || '${{ inputs.environment }}';
+            const envName = '${{ inputs.environment }}';
             const res = await github.rest.repos.createDeployment({
               owner: context.repo.owner,
               repo: context.repo.repo,
               ref: context.sha,
-              environment: env,
+              environment: envName,
               required_contexts: [],
               auto_merge: false,
-              transient_environment: env !== 'production',
-              production_environment: env === 'production',
-              description: `One-click deploy (${env})`,
+              transient_environment: envName !== 'production',
+              production_environment: envName === 'production',
+              description: `Cloudflare one-click deploy (${envName})`,
             });
             core.setOutput('deployment_id', String(res.data.id));
 
@@ -67,27 +72,31 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: "20"
+          node-version: '20'
 
       - name: Setup pnpm
         uses: pnpm/action-setup@41ff72655975bd51cab0327fa583b6e92b6d3061 # v4.2.0
         with:
           version: 10
 
-      - name: Install dependencies
+      - name: Verify Cloudflare credentials
+        run: |
+          test -n "$CLOUDFLARE_API_TOKEN"
+
+      - name: Install worker dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Run typecheck, tests, and lint
+      - name: Run worker quality gates
         run: |
           pnpm run typecheck
           pnpm run test:ci
           pnpm run check
 
-      - name: Upload test artifacts
+      - name: Upload worker test artifacts
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: oneclick-tests-${{ inputs.environment }}-${{ github.sha }}
+          name: oneclick-worker-tests-${{ inputs.environment }}-${{ github.sha }}
           path: |
             reports/**
             coverage/**
@@ -101,114 +110,101 @@ jobs:
         if: inputs.components == 'all' || inputs.components == 'dashboard'
         run: pnpm --dir dashboard run check
 
+      - name: Verify Docker runtime
+        if: inputs.components == 'all' || inputs.components == 'dashboard'
+        run: docker version
+
+      - name: Resolve deployment names
+        id: names
+        run: |
+          if [ "${{ inputs.environment }}" = "production" ]; then
+            echo "worker_name=owokx-production" >> "$GITHUB_OUTPUT"
+            echo "dashboard_name=owokx-dashboard-production" >> "$GITHUB_OUTPUT"
+          else
+            echo "worker_name=owokx" >> "$GITHUB_OUTPUT"
+            echo "dashboard_name=owokx-dashboard" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Capture current Worker deployment version
         id: worker_prev
         if: inputs.components == 'all' || inputs.components == 'worker'
         env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          SCRIPT_NAME: ${{ steps.names.outputs.worker_name }}
         run: |
-          node -e "const {execSync}=require('node:child_process'); const out=execSync('npx wrangler deployments list --name owokx --json',{stdio:['ignore','pipe','inherit']}).toString(); const data=JSON.parse(out); const current=data?.[0]?.id || ''; process.stdout.write(current);" > worker_prev_version.txt
-          echo "version_id=$(cat worker_prev_version.txt)" >> $GITHUB_OUTPUT
+          : > worker_prev_version.txt
+          if npx wrangler deployments list --name "$SCRIPT_NAME" --json > worker_deployments.json; then
+            node -e "const fs=require('node:fs'); const d=JSON.parse(fs.readFileSync('worker_deployments.json','utf8')); process.stdout.write(d?.[0]?.id || '');" > worker_prev_version.txt
+          fi
+          echo "version_id=$(cat worker_prev_version.txt)" >> "$GITHUB_OUTPUT"
 
-      - name: Apply database migrations (staging)
-        if: (inputs.components == 'all' || inputs.components == 'worker') && inputs.environment == 'staging'
+      - name: Capture current dashboard deployment version
+        id: dashboard_prev
+        if: inputs.components == 'all' || inputs.components == 'dashboard'
         env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-        run: npx wrangler d1 migrations apply Okx-db --remote
+          SCRIPT_NAME: ${{ steps.names.outputs.dashboard_name }}
+        run: |
+          : > dashboard_prev_version.txt
+          if npx wrangler deployments list --name "$SCRIPT_NAME" --json > dashboard_deployments.json; then
+            node -e "const fs=require('node:fs'); const d=JSON.parse(fs.readFileSync('dashboard_deployments.json','utf8')); process.stdout.write(d?.[0]?.id || '');" > dashboard_prev_version.txt
+          fi
+          echo "version_id=$(cat dashboard_prev_version.txt)" >> "$GITHUB_OUTPUT"
 
-      - name: Apply database migrations (production)
-        if: (inputs.components == 'all' || inputs.components == 'worker') && inputs.environment == 'production'
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-        run: npx wrangler d1 migrations apply Okx-db --remote --env production
-
-      - name: Deploy Worker (staging)
-        if: (inputs.components == 'all' || inputs.components == 'worker') && inputs.environment == 'staging'
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-        run: npx wrangler deploy
-
-      - name: Deploy Worker (production)
-        if: (inputs.components == 'all' || inputs.components == 'worker') && inputs.environment == 'production'
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-        run: npx wrangler deploy --env production
-
-      - name: Pre-deploy health check (Worker)
+      - name: Apply D1 migrations
         if: inputs.components == 'all' || inputs.components == 'worker'
+        run: |
+          if [ "${{ inputs.environment }}" = "production" ]; then
+            npx wrangler d1 migrations apply "$D1_DATABASE_NAME" --remote --env production --config "$WORKER_CONFIG"
+          else
+            npx wrangler d1 migrations apply "$D1_DATABASE_NAME" --remote --config "$WORKER_CONFIG"
+          fi
+
+      - name: Deploy Worker backend
+        if: inputs.components == 'all' || inputs.components == 'worker'
+        run: |
+          if [ "${{ inputs.environment }}" = "production" ]; then
+            npx wrangler deploy --env production --config "$WORKER_CONFIG"
+          else
+            npx wrangler deploy --config "$WORKER_CONFIG"
+          fi
+
+      - name: Deploy dashboard container Worker
+        if: inputs.components == 'all' || inputs.components == 'dashboard'
+        run: |
+          if [ "${{ inputs.environment }}" = "production" ]; then
+            npx wrangler deploy --env production --config "$DASHBOARD_CONFIG"
+          else
+            npx wrangler deploy --config "$DASHBOARD_CONFIG"
+          fi
+
+      - name: Verify deployed services
+        if: success()
         env:
+          COMPONENTS: ${{ inputs.components }}
           WORKER_URL: ${{ vars.OWOKX_WORKER_URL }}
-        run: |
-          test -n "$WORKER_URL"
-          curl -fsS "$WORKER_URL/health" | head -c 200
-
-      - name: Set up Docker Buildx
-        if: inputs.components == 'all' || inputs.components == 'dashboard'
-        uses: docker/setup-buildx-action@v3
-
-      - name: Log in to GHCR
-        if: inputs.components == 'all' || inputs.components == 'dashboard'
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build and push dashboard image
-        if: inputs.components == 'all' || inputs.components == 'dashboard'
-        id: dashboard_image
-        uses: docker/build-push-action@v6
-        with:
-          context: ./dashboard
-          file: ./dashboard/Dockerfile
-          push: true
-          tags: |
-            ghcr.io/${{ github.repository_owner }}/owokx-dashboard:${{ github.sha }}
-
-      - name: Setup kubectl
-        if: inputs.components == 'all' || inputs.components == 'dashboard'
-        uses: azure/setup-kubectl@776406b8848f4cc87c7547066f2f6e865edb0a51 # v4.0.1
-        with:
-          version: v1.30.0
-
-      - name: Configure kubeconfig
-        if: inputs.components == 'all' || inputs.components == 'dashboard'
-        env:
-          KUBE_CONFIG: ${{ secrets.KUBE_CONFIG }}
-        run: |
-          test -n "$KUBE_CONFIG"
-          mkdir -p ~/.kube
-          echo "$KUBE_CONFIG" | base64 -d > ~/.kube/config
-
-      - name: Apply Kubernetes manifests
-        if: inputs.components == 'all' || inputs.components == 'dashboard'
-        run: |
-          kubectl apply -k deploy/k8s/dashboard/overlays/${{ inputs.environment }}
-
-      - name: Blue-green deploy dashboard
-        if: inputs.components == 'all' || inputs.components == 'dashboard'
-        env:
-          NS: ${{ inputs.environment == 'production' && 'owokx-prod' || 'owokx-staging' }}
-          IMAGE: ghcr.io/${{ github.repository_owner }}/owokx-dashboard:${{ github.sha }}
-        run: |
-          ACTIVE_TRACK=$(kubectl -n "$NS" get svc owokx-dashboard -o jsonpath='{.spec.selector.track}')
-          if [ "$ACTIVE_TRACK" = "blue" ]; then TARGET_TRACK="green"; else TARGET_TRACK="blue"; fi
-          echo "Active track: $ACTIVE_TRACK"
-          echo "Target track: $TARGET_TRACK"
-
-          kubectl -n "$NS" set image deployment/owokx-dashboard-$TARGET_TRACK dashboard="$IMAGE"
-          kubectl -n "$NS" rollout status deployment/owokx-dashboard-$TARGET_TRACK --timeout=5m
-
-          kubectl -n "$NS" patch svc owokx-dashboard --type merge -p "{\"spec\":{\"selector\":{\"app\":\"owokx-dashboard\",\"track\":\"$TARGET_TRACK\"}}}"
-          kubectl -n "$NS" get svc owokx-dashboard -o wide
-
-      - name: Post-deploy health check (Dashboard)
-        if: inputs.components == 'all' || inputs.components == 'dashboard'
-        env:
           DASHBOARD_URL: ${{ vars.OWOKX_DASHBOARD_URL }}
+          VERIFY_TOKEN: ${{ secrets.OWOKX_VERIFY_TOKEN }}
         run: |
-          test -n "$DASHBOARD_URL"
-          curl -fsS "$DASHBOARD_URL/health" | head -c 200
+          VERIFY_ARGS="--json-output deploy-verification.json"
+
+          if [ "$COMPONENTS" = "all" ] || [ "$COMPONENTS" = "worker" ]; then
+            test -n "$WORKER_URL"
+            VERIFY_ARGS="$VERIFY_ARGS --worker-url $WORKER_URL"
+          else
+            VERIFY_ARGS="$VERIFY_ARGS --skip-worker true"
+          fi
+
+          if [ "$COMPONENTS" = "all" ] || [ "$COMPONENTS" = "dashboard" ]; then
+            test -n "$DASHBOARD_URL"
+            VERIFY_ARGS="$VERIFY_ARGS --dashboard-url $DASHBOARD_URL"
+          else
+            VERIFY_ARGS="$VERIFY_ARGS --skip-dashboard true"
+          fi
+
+          if [ -n "$VERIFY_TOKEN" ]; then
+            VERIFY_ARGS="$VERIFY_ARGS --token $VERIFY_TOKEN --strict-auth true"
+          fi
+
+          node scripts/verify-deployment.mjs $VERIFY_ARGS
 
       - name: Generate deployment report
         if: always()
@@ -216,25 +212,42 @@ jobs:
           ENVIRONMENT: ${{ inputs.environment }}
           COMPONENTS: ${{ inputs.components }}
           DEPLOYMENT_ID: ${{ steps.gh_deploy.outputs.deployment_id }}
+          WORKER_NAME: ${{ steps.names.outputs.worker_name }}
+          DASHBOARD_NAME: ${{ steps.names.outputs.dashboard_name }}
           WORKER_PREV_VERSION_ID: ${{ steps.worker_prev.outputs.version_id }}
+          DASHBOARD_PREV_VERSION_ID: ${{ steps.dashboard_prev.outputs.version_id }}
         run: |
-          node -e "const fs=require('node:fs'); const report={repo:process.env.GITHUB_REPOSITORY, sha:process.env.GITHUB_SHA, run_id:process.env.GITHUB_RUN_ID, environment:process.env.ENVIRONMENT, components:process.env.COMPONENTS, github_deployment_id:process.env.DEPLOYMENT_ID, worker_prev_version_id:process.env.WORKER_PREV_VERSION_ID || null, created_at:new Date().toISOString()}; fs.writeFileSync('deploy-report.json', JSON.stringify(report, null, 2));"
+          node -e "const fs=require('node:fs'); const report={repo:process.env.GITHUB_REPOSITORY, sha:process.env.GITHUB_SHA, run_id:process.env.GITHUB_RUN_ID, environment:process.env.ENVIRONMENT, components:process.env.COMPONENTS, github_deployment_id:process.env.DEPLOYMENT_ID, worker_name:process.env.WORKER_NAME, dashboard_name:process.env.DASHBOARD_NAME, worker_prev_version_id:process.env.WORKER_PREV_VERSION_ID || null, dashboard_prev_version_id:process.env.DASHBOARD_PREV_VERSION_ID || null, created_at:new Date().toISOString()}; fs.writeFileSync('deploy-report.json', JSON.stringify(report, null, 2));"
 
-      - name: Upload deployment report
+      - name: Publish deployment summary
+        if: always()
+        env:
+          COMPONENTS: ${{ inputs.components }}
+          ENVIRONMENT: ${{ inputs.environment }}
+          WORKER_NAME: ${{ steps.names.outputs.worker_name }}
+          DASHBOARD_NAME: ${{ steps.names.outputs.dashboard_name }}
+        run: |
+          {
+            echo "### Cloudflare Deployment Summary"
+            echo ""
+            echo "- Environment: $ENVIRONMENT"
+            echo "- Components: $COMPONENTS"
+            echo "- Worker script: $WORKER_NAME"
+            echo "- Dashboard script: $DASHBOARD_NAME"
+            echo "- Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload deployment artifacts
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: deploy-report-${{ inputs.environment }}-${{ github.sha }}
-          path: deploy-report.json
-
-      - name: Notify Slack (success)
-        if: success() && secrets.SLACK_WEBHOOK_URL != ''
-        env:
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-        run: |
-          curl -fsS -X POST -H 'Content-Type: application/json' \
-            --data "{\"text\":\"[OK] Deploy succeeded: ${{ github.repository }} @ ${{ github.sha }} -> ${{ inputs.environment }}\"}" \
-            "$SLACK_WEBHOOK_URL"
+          name: deploy-cloudflare-${{ inputs.environment }}-${{ github.sha }}
+          path: |
+            deploy-report.json
+            deploy-verification.json
+            worker_deployments.json
+            dashboard_deployments.json
+          if-no-files-found: warn
 
       - name: Mark deployment success
         if: success()
@@ -251,48 +264,20 @@ jobs:
             });
 
       - name: Rollback dashboard on failure
-        if: failure() && (inputs.components == 'all' || inputs.components == 'dashboard')
+        if: failure() && (inputs.components == 'all' || inputs.components == 'dashboard') && steps.dashboard_prev.outputs.version_id && steps.dashboard_prev.outputs.version_id != ''
         env:
-          NS: ${{ inputs.environment == 'production' && 'owokx-prod' || 'owokx-staging' }}
+          SCRIPT_NAME: ${{ steps.names.outputs.dashboard_name }}
+          PREV_VERSION_ID: ${{ steps.dashboard_prev.outputs.version_id }}
         run: |
-          ACTIVE_TRACK=$(kubectl -n "$NS" get svc owokx-dashboard -o jsonpath='{.spec.selector.track}')
-          if [ "$ACTIVE_TRACK" = "blue" ]; then PREV_TRACK="green"; else PREV_TRACK="blue"; fi
-          kubectl -n "$NS" patch svc owokx-dashboard --type merge -p "{\"spec\":{\"selector\":{\"app\":\"owokx-dashboard\",\"track\":\"$PREV_TRACK\"}}}"
-          kubectl -n "$NS" rollout status deployment/owokx-dashboard-$PREV_TRACK --timeout=3m || true
+          npx wrangler rollback "$PREV_VERSION_ID" --name "$SCRIPT_NAME" || true
 
       - name: Rollback Worker on failure
-        if: failure() && (inputs.components == 'all' || inputs.components == 'worker') && steps.worker_prev.outputs.version_id != ''
+        if: failure() && (inputs.components == 'all' || inputs.components == 'worker') && steps.worker_prev.outputs.version_id && steps.worker_prev.outputs.version_id != ''
         env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-        run: npx wrangler rollback ${{ steps.worker_prev.outputs.version_id }}
-
-      - name: Notify Slack (failure)
-        if: failure() && secrets.SLACK_WEBHOOK_URL != ''
-        env:
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SCRIPT_NAME: ${{ steps.names.outputs.worker_name }}
+          PREV_VERSION_ID: ${{ steps.worker_prev.outputs.version_id }}
         run: |
-          curl -fsS -X POST -H 'Content-Type: application/json' \
-            --data "{\"text\":\"[FAIL] Deploy failed: ${{ github.repository }} @ ${{ github.sha }} -> ${{ inputs.environment }}. Rolled back where possible.\"}" \
-            "$SLACK_WEBHOOK_URL"
-
-      - name: Notify email (failure)
-        if: failure() && secrets.SMTP_SERVER != '' && secrets.NOTIFY_EMAIL_TO != '' && secrets.NOTIFY_EMAIL_FROM != ''
-        uses: dawidd6/action-send-mail@6118791332e603d34fcd7508e33217a8c8c5f73f # v4.0.1
-        with:
-          server_address: ${{ secrets.SMTP_SERVER }}
-          server_port: ${{ secrets.SMTP_PORT }}
-          username: ${{ secrets.SMTP_USERNAME }}
-          password: ${{ secrets.SMTP_PASSWORD }}
-          secure: true
-          to: ${{ secrets.NOTIFY_EMAIL_TO }}
-          from: ${{ secrets.NOTIFY_EMAIL_FROM }}
-          subject: Deploy failed (${{ github.repository }} -> ${{ inputs.environment }})
-          body: |
-            Deploy failed.
-            Repo: ${{ github.repository }}
-            SHA: ${{ github.sha }}
-            Environment: ${{ inputs.environment }}
-            Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          npx wrangler rollback "$PREV_VERSION_ID" --name "$SCRIPT_NAME" || true
 
       - name: Mark deployment failure
         if: failure()
@@ -305,6 +290,5 @@ jobs:
               repo: context.repo.repo,
               deployment_id,
               state: 'failure',
-              description: 'Deployment failed',
+              description: 'Deployment failed (rollback attempted)',
             });
-

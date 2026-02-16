@@ -1,0 +1,58 @@
+{
+  "$schema": "https://raw.githubusercontent.com/cloudflare/workers-sdk/main/packages/wrangler/config-schema.json",
+  "name": "owokx-dashboard",
+  "main": "./worker/index.ts",
+  "compatibility_date": "2025-03-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": {
+    "enabled": true
+  },
+  "containers": [
+    {
+      "class_name": "DashboardUi",
+      "image": "./Dockerfile",
+      "max_instances": 4,
+      "instance_type": "basic",
+      "rollout_step_percentage": [25, 100],
+      "rollout_active_grace_period": 90
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "DASHBOARD_UI",
+        "class_name": "DashboardUi"
+      }
+    ]
+  },
+  "services": [
+    {
+      "binding": "OWOKX_BACKEND",
+      "service": "owokx"
+    }
+  ],
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["DashboardUi"]
+    }
+  ],
+  "vars": {
+    "DASHBOARD_ENV": "staging"
+  },
+  "env": {
+    "production": {
+      "services": [
+        {
+          "binding": "OWOKX_BACKEND",
+          "service": "owokx",
+          "environment": "production"
+        }
+      ],
+      "vars": {
+        "DASHBOARD_ENV": "production"
+      }
+    }
+  }
+}
+

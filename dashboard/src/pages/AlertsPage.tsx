@@ -34,6 +34,7 @@ export function AlertsPage({ enabled = true, compact = false }: AlertsPageProps)
   const [rules, setRules] = useState<AlertRule[]>([])
   const [history, setHistory] = useState<AlertHistoryEvent[]>([])
   const [historyFilter, setHistoryFilter] = useState<HistoryFilter>('open')
+  const [isCreateRuleModalOpen, setIsCreateRuleModalOpen] = useState(false)
   const [loading, setLoading] = useState(false)
   const [busyRuleId, setBusyRuleId] = useState<string | null>(null)
   const [creating, setCreating] = useState(false)
@@ -76,6 +77,18 @@ export function AlertsPage({ enabled = true, compact = false }: AlertsPageProps)
     return () => clearTimeout(timeout)
   }, [message])
 
+  useEffect(() => {
+    if (!isCreateRuleModalOpen) return
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape' && !creating) {
+        setIsCreateRuleModalOpen(false)
+      }
+    }
+
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [creating, isCreateRuleModalOpen])
+
   const openAlerts = useMemo(() => history.filter((event) => !event.acknowledged_at).length, [history])
 
   const handleCreateRule = useCallback(async () => {
@@ -96,6 +109,7 @@ export function AlertsPage({ enabled = true, compact = false }: AlertsPageProps)
       setNewRuleDescription('')
       setNewRuleSeverity('warning')
       setNewRuleEnabled(true)
+      setIsCreateRuleModalOpen(false)
       setMessage('Alert rule created')
       await loadData()
     } catch (createError) {
@@ -192,6 +206,9 @@ export function AlertsPage({ enabled = true, compact = false }: AlertsPageProps)
             <button type='button' className='hud-button' onClick={() => void loadData()} disabled={loading}>
               {loading ? 'Refreshing...' : 'Refresh'}
             </button>
+            <button type='button' className='hud-button' onClick={() => setIsCreateRuleModalOpen(true)} disabled={creating}>
+              Create Rule
+            </button>
             <select
               className='hud-input h-auto min-w-[160px]'
               value={historyFilter}
@@ -207,50 +224,6 @@ export function AlertsPage({ enabled = true, compact = false }: AlertsPageProps)
 
           <div className={compact ? 'space-y-3' : 'grid grid-cols-1 xl:grid-cols-3 gap-3 flex-1 min-h-0'}>
             <div className={compact ? 'space-y-3' : 'space-y-3 min-h-0'}>
-              <div className='border border-hud-line/30 rounded p-3 space-y-2'>
-                <div className='hud-label text-hud-primary'>Create Rule</div>
-                <input
-                  className='hud-input'
-                  placeholder='Rule ID (optional)'
-                  value={newRuleId}
-                  onChange={(event) => setNewRuleId(event.target.value)}
-                />
-                <input
-                  className='hud-input'
-                  placeholder='Title'
-                  value={newRuleTitle}
-                  onChange={(event) => setNewRuleTitle(event.target.value)}
-                />
-                <input
-                  className='hud-input'
-                  placeholder='Description'
-                  value={newRuleDescription}
-                  onChange={(event) => setNewRuleDescription(event.target.value)}
-                />
-                <div className='grid grid-cols-2 gap-2'>
-                  <select
-                    className='hud-input h-auto'
-                    value={newRuleSeverity}
-                    onChange={(event) => setNewRuleSeverity(event.target.value as AlertSeverity)}
-                  >
-                    <option value='info'>info</option>
-                    <option value='warning'>warning</option>
-                    <option value='critical'>critical</option>
-                  </select>
-                  <label className='flex items-center gap-2 text-xs text-hud-text'>
-                    <input
-                      type='checkbox'
-                      checked={newRuleEnabled}
-                      onChange={(event) => setNewRuleEnabled(event.target.checked)}
-                    />
-                    Enabled
-                  </label>
-                </div>
-                <button type='button' className='hud-button w-full' onClick={() => void handleCreateRule()} disabled={creating || !newRuleTitle.trim()}>
-                  {creating ? 'Creating...' : 'Create Rule'}
-                </button>
-              </div>
-
               <div className={compact ? 'max-h-[220px] overflow-y-auto border border-hud-line/30 rounded' : 'min-h-0 flex-1 overflow-y-auto border border-hud-line/30 rounded'}>
                 {rules.length === 0 ? (
                   <div className='text-sm text-hud-text-dim text-center py-6'>No alert rules found.</div>
@@ -333,6 +306,94 @@ export function AlertsPage({ enabled = true, compact = false }: AlertsPageProps)
           </div>
         </div>
       </Panel>
+
+      {isCreateRuleModalOpen && (
+        <div
+          className='fixed inset-0 z-50 bg-black/70 flex items-center justify-center p-3'
+          role='dialog'
+          aria-modal='true'
+          aria-label='Create alert rule dialog'
+          onClick={() => {
+            if (!creating) setIsCreateRuleModalOpen(false)
+          }}
+        >
+          <div
+            className='hud-panel w-full max-w-xl max-h-[90vh] overflow-y-auto'
+            tabIndex={-1}
+            onClick={(event) => event.stopPropagation()}
+            onKeyDown={(event) => event.stopPropagation()}
+          >
+            <div className='flex items-center justify-between px-4 py-2 border-b border-hud-line'>
+              <span className='hud-label text-hud-primary'>Create Rule</span>
+              <button
+                type='button'
+                className='hud-button'
+                onClick={() => setIsCreateRuleModalOpen(false)}
+                disabled={creating}
+              >
+                Close
+              </button>
+            </div>
+            <div className='p-4 space-y-3'>
+              <input
+                className='hud-input w-full'
+                placeholder='Rule ID (optional)'
+                value={newRuleId}
+                onChange={(event) => setNewRuleId(event.target.value)}
+              />
+              <input
+                className='hud-input w-full'
+                placeholder='Title'
+                value={newRuleTitle}
+                onChange={(event) => setNewRuleTitle(event.target.value)}
+              />
+              <input
+                className='hud-input w-full'
+                placeholder='Description'
+                value={newRuleDescription}
+                onChange={(event) => setNewRuleDescription(event.target.value)}
+              />
+              <div className='grid grid-cols-1 sm:grid-cols-2 gap-2'>
+                <select
+                  className='hud-input h-auto'
+                  value={newRuleSeverity}
+                  onChange={(event) => setNewRuleSeverity(event.target.value as AlertSeverity)}
+                >
+                  <option value='info'>info</option>
+                  <option value='warning'>warning</option>
+                  <option value='critical'>critical</option>
+                </select>
+                <label className='flex items-center gap-2 text-xs text-hud-text'>
+                  <input
+                    type='checkbox'
+                    checked={newRuleEnabled}
+                    onChange={(event) => setNewRuleEnabled(event.target.checked)}
+                  />
+                  Enabled
+                </label>
+              </div>
+              <div className='flex justify-end gap-2 pt-1'>
+                <button
+                  type='button'
+                  className='hud-button'
+                  onClick={() => setIsCreateRuleModalOpen(false)}
+                  disabled={creating}
+                >
+                  Cancel
+                </button>
+                <button
+                  type='button'
+                  className='hud-button'
+                  onClick={() => void handleCreateRule()}
+                  disabled={creating || !newRuleTitle.trim()}
+                >
+                  {creating ? 'Creating...' : 'Create Rule'}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

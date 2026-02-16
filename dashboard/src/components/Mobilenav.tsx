@@ -3,15 +3,16 @@ import clsx from 'clsx'
 interface MobileNavProps {
   view: 'overview' | 'positions' | 'activity' | 'signals' | 'lab' | 'alerts'
   onViewChange: (view: 'overview' | 'positions' | 'activity' | 'signals' | 'lab' | 'alerts') => void
+  showStrategyLab?: boolean
 }
 
-export function MobileNav({ view, onViewChange }: MobileNavProps) {
+export function MobileNav({ view, onViewChange, showStrategyLab = true }: MobileNavProps) {
   const tabs = [
     { id: 'overview' as const, label: 'Overview', icon: 'OVR' },
     { id: 'positions' as const, label: 'Positions', icon: 'POS' },
     { id: 'activity' as const, label: 'Activity', icon: 'ACT' },
     { id: 'signals' as const, label: 'Signals', icon: 'SIG' },
-    { id: 'lab' as const, label: 'Lab', icon: 'LAB' },
+    ...(showStrategyLab ? [{ id: 'lab' as const, label: 'Lab', icon: 'LAB' }] : []),
     { id: 'alerts' as const, label: 'Alerts', icon: 'ALR' },
   ]
 

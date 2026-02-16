@@ -5,14 +5,17 @@
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",
+    "dev:dashboard:container": "wrangler dev --config dashboard/wrangler.container.jsonc",
     "build": "tsc",
     "deploy": "wrangler deploy",
     "deploy:production": "wrangler deploy --env production",
+    "deploy:dashboard:container": "wrangler deploy --config dashboard/wrangler.container.jsonc",
+    "deploy:dashboard:container:production": "wrangler deploy --config dashboard/wrangler.container.jsonc --env production",
     "deploy:oneclick": "npx tsx scripts/deploy.ts",
     "benchmark:swarm": "node scripts/benchmark-swarm.mjs",
-    "db:migrate": "wrangler d1 migrations apply Okx-db --local",
-    "db:migrate:remote": "wrangler d1 migrations apply Okx-db --remote",
-    "db:studio": "wrangler d1 execute Okx-db --local --command 'SELECT 1'",
+    "db:migrate": "wrangler d1 migrations apply owokx_db --local",
+    "db:migrate:remote": "wrangler d1 migrations apply owokx_db --remote",
+    "db:studio": "wrangler d1 execute owokx_db --local --command 'SELECT 1'",
     "typecheck": "tsc --noEmit",
     "lint": "biome lint src/",
     "lint:fix": "biome lint --write src/",
@@ -25,7 +28,8 @@
     "test": "vitest",
     "test:run": "vitest run",
     "test:ci": "node scripts/ci-test-runner.mjs",
-    "setup:access": "npx tsx scripts/setup-access.ts"
+    "setup:access": "npx tsx scripts/setup-access.ts",
+    "verify:deploy": "node scripts/verify-deployment.mjs"
   },
   "dependencies": {
     "@ai-sdk/anthropic": "^3.0.44",
@@ -36,6 +40,7 @@
     "@ai-sdk/mistral": "^3.0.20",
     "@ai-sdk/openai": "^3.0.29",
     "@ai-sdk/xai": "^3.0.57",
+    "@cloudflare/containers": "^0.0.23",
     "@modelcontextprotocol/sdk": "^1.26.0",
     "agents": "^0.0.74",
     "ai": "^6.0.86",

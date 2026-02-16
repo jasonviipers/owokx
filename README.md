@@ -13,6 +13,7 @@ The system gathers market/social signals, runs LLM-based research, and executes 
 ## Features
 
 - 24/7 worker runtime on Cloudflare
+- Dashboard container runtime on Cloudflare Containers (Docker)
 - Multi-source signals: StockTwits, Reddit public feeds, SEC filings, crypto market data
 - DataScout source extensions: Reddit RSS backup + Alpha Vantage sentiment
 - Multi-provider LLM support: OpenAI, Anthropic, Google, xAI, DeepSeek (via AI SDK)
@@ -44,13 +45,13 @@ npm install
 
 ```bash
 # D1
-npx wrangler d1 create Okx-db
+npx wrangler d1 create owokx_db
 
 # KV
-npx wrangler kv namespace create CACHE
+npx wrangler kv namespace create CACHE --preview
 
 # Apply migrations
-npx wrangler d1 migrations apply Okx-db
+npx wrangler d1 migrations apply owokx_db
 ```
 
 ### 3. Configure secrets
@@ -123,6 +124,28 @@ Enable the agent:
 ```bash
 curl -H "Authorization: Bearer $OWOKX_TOKEN" http://127.0.0.1:8787/agent/enable
 ```
+
+## One-Click Cloudflare Deployment
+
+Deploy backend Worker and dashboard container together:
+
+```bash
+npm run deploy:oneclick -- --env production --components all
+```
+
+Manual deploy helpers:
+
+```bash
+# backend worker
+npm run deploy
+npm run deploy:production
+
+# dashboard container worker
+npm run deploy:dashboard:container
+npm run deploy:dashboard:container:production
+```
+
+Deployment runbook: `docs/deployment.md`.
 
 ## API Endpoints
 
@@ -258,10 +281,10 @@ Apply migrations for your active D1:
 
 ```bash
 # local dev DB
-npx wrangler d1 migrations apply Okx-db --local
+npx wrangler d1 migrations apply owokx_db --local
 
 # remote DB
-npx wrangler d1 migrations apply Okx-db
+npx wrangler d1 migrations apply owokx_db
 ```
 
 ### LLM usage remains at 0 calls / 0 tokens
