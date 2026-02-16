@@ -103,7 +103,16 @@ export function LineChart({
 
   const handleMouseLeave = () => setHoverIndex(null)
 
-  const hoverValue = hoverIndex !== null ? series[0]?.data[hoverIndex] : null
+  const hoverSeriesValues =
+    hoverIndex !== null
+      ? series
+          .map((entry) => ({
+            label: entry.label,
+            value: entry.data[hoverIndex],
+            variant: entry.variant ?? variant,
+          }))
+          .filter((entry) => Number.isFinite(entry.value))
+      : []
   const hoverLabel = hoverIndex !== null && labels ? labels[hoverIndex] : null
 
   return (
@@ -277,11 +286,12 @@ export function LineChart({
         )
       })}
 
-      {hoverIndex !== null && hoverValue !== null && (() => {
+      {hoverIndex !== null && hoverSeriesValues.length > 0 && (() => {
         const hoverX = getX(hoverIndex)
-        const hoverY = getY(hoverValue)
+        const anchorValue = hoverSeriesValues[0]?.value ?? 0
+        const hoverY = getY(anchorValue)
         const tooltipWidth = 85
-        const tooltipHeight = 38
+        const tooltipHeight = 8 + hoverSeriesValues.length * 13 + (hoverLabel ? 12 : 0)
         const nearRightEdge = hoverX > viewBoxWidth - padding.right - tooltipWidth - 20
         const tooltipX = nearRightEdge ? hoverX - tooltipWidth - 12 : hoverX + 12
         const tooltipY = Math.min(Math.max(hoverY - tooltipHeight / 2, padding.top), padding.top + chartHeight - tooltipHeight)
@@ -316,11 +326,23 @@ export function LineChart({
                 strokeWidth={1}
                 rx={2}
               />
-              <text x={8} y={15} fill="var(--color-hud-text)" fontSize={11} fontWeight="500">
-                {formatLabel(hoverValue)}
-              </text>
+              {hoverSeriesValues.map((entry, entryIndex) => {
+                const colors = variantColors[entry.variant]
+                return (
+                  <text
+                    key={`${entry.label}-${entryIndex}`}
+                    x={8}
+                    y={14 + entryIndex * 13}
+                    fill={colors.stroke}
+                    fontSize={10}
+                    fontWeight="500"
+                  >
+                    {formatLabel(entry.value)}
+                  </text>
+                )
+              })}
               {hoverLabel && (
-                <text x={8} y={30} fill="var(--color-hud-text-dim)" fontSize={9}>
+                <text x={8} y={tooltipHeight - 4} fill="var(--color-hud-text-dim)" fontSize={9}>
                   {hoverLabel}
                 </text>
               )}

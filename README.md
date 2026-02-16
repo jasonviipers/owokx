@@ -142,6 +142,40 @@ curl -H "Authorization: Bearer $OWOKX_TOKEN" http://127.0.0.1:8787/agent/enable
 | `/swarm/*` | Swarm health/metrics/queue endpoints |
 | `/mcp` | MCP server endpoint |
 
+### Strategy Lab (Sprint 4)
+
+The dashboard now includes a Strategy Lab panel for experiment comparison and manual promotion.
+
+Experiment endpoints:
+
+| Endpoint | Description |
+|---|---|
+| `/agent/experiments/runs` | List experiment runs (`strategy_name`, `date_from`, `date_to`, `limit`, `offset`) |
+| `/agent/experiments/runs/:run_id` | Get run details (DB row + summary/equity/metrics artifacts when available) |
+| `/agent/experiments/variants` | List strategy variants and champion flags |
+| `/agent/experiments/promote` | Promote a run or variant to champion |
+
+Promotion examples:
+
+```bash
+# Promote a run (creates/updates variant from run config and marks it champion)
+curl -X POST -H "Authorization: Bearer $OWOKX_TOKEN" -H "Content-Type: application/json" \
+  -d '{"run_id":"<run-id>"}' \
+  http://127.0.0.1:8787/agent/experiments/promote
+
+# Promote existing variant by id
+curl -X POST -H "Authorization: Bearer $OWOKX_TOKEN" -H "Content-Type: application/json" \
+  -d '{"strategy_name":"live_hourly_snapshot","variant_id":"<variant-id>"}' \
+  http://127.0.0.1:8787/agent/experiments/promote
+```
+
+Rollback runbook:
+
+1. Open Strategy Lab in the dashboard and identify the previous stable champion run/variant.
+2. Promote the previous stable run/variant again via dashboard or API.
+3. Verify champion state via `/agent/experiments/variants`.
+4. Trigger a cycle (`/agent/trigger`) and verify behavior in `/agent/logs` before continuing autonomous execution.
+
 ## Activity Logs
 
 `/agent/logs` supports server-side filtering and search.
@@ -214,6 +248,20 @@ Model format:
 
 ```bash
 curl -X POST -H "Authorization: Bearer $OWOKX_TOKEN" http://127.0.0.1:8787/agent/trigger
+```
+
+### Strategy Lab endpoints return 500 / empty with migration warning
+
+If `/agent/experiments/runs` or `/agent/experiments/variants` fail, your D1 schema is likely missing `migrations/0008_experiments.sql`.
+
+Apply migrations for your active D1:
+
+```bash
+# local dev DB
+npx wrangler d1 migrations apply Okx-db --local
+
+# remote DB
+npx wrangler d1 migrations apply Okx-db
 ```
 
 ### LLM usage remains at 0 calls / 0 tokens

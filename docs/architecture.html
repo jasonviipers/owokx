@@ -299,6 +299,23 @@
       </table>
       <p>For daily operation, use the <code>/agent/*</code> HTTP endpoints instead (see <a href="./configuration.html">Configuration</a>).</p>
 
+      <h2>Strategy Lab</h2>
+      <p>The Strategy Lab adds an experimentation loop on top of runtime automation:</p>
+      <ol>
+        <li>Persist run metadata and artifacts (summary/equity/metrics) into D1 + R2.</li>
+        <li>Compare runs in the dashboard using normalized equity curves and key metrics (P&L, drawdown, win rate).</li>
+        <li>Promote a selected run or variant as champion via <code>/agent/experiments/promote</code>.</li>
+      </ol>
+
+      <h3>Promotion and Rollback</h3>
+      <p>Champion state is stored in <code>experiment_variants</code>. Rollback is a re-promotion of the previous champion:</p>
+      <ol>
+        <li>Find the previously stable run/variant from Strategy Lab.</li>
+        <li>Promote it again (dashboard or API).</li>
+        <li>Confirm champion flag in <code>/agent/experiments/variants</code>.</li>
+        <li>Trigger one cycle and validate logs before full resumption.</li>
+      </ol>
+
       <h2>Project Structure</h2>
       <pre>
 Okx/
