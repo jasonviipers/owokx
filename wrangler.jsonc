@@ -121,7 +121,9 @@
 	// Required:
 	// - OWOKX_API_TOKEN (API authentication - generate with: openssl rand -base64 48)
 	// - KILL_SWITCH_SECRET (emergency kill switch + approval token signing)
-	// - BROKER_PROVIDER ("alpaca" | "okx", default: "alpaca")
+	// - BROKER_PROVIDER ("alpaca" | "okx" | "polymarket", default: "alpaca")
+	// - BROKER_FALLBACK_PROVIDER (optional fallback broker id)
+	// - BROKER_FALLBACK_ALLOW_TRADING ("true" to allow create/cancel order failover, default: "false")
 	//
 	// Broker credentials (based on BROKER_PROVIDER):
 	// Alpaca:
@@ -133,6 +135,14 @@
 	// - OKX_SECRET
 	// - OKX_PASSPHRASE
 	// - OKX_SIMULATED_TRADING ("true" to enable demo trading)
+	// Polymarket:
+	// - POLYMARKET_API_KEY
+	// - POLYMARKET_API_SECRET (base64 API secret)
+	// - POLYMARKET_API_PASSPHRASE
+	// - POLYMARKET_ADDRESS
+	// - POLYMARKET_API_URL (optional CLOB endpoint override)
+	// - POLYMARKET_DATA_API_URL (optional Data API endpoint override; defaults to https://data-api.polymarket.com)
+	// - POLYMARKET_ORDER_SIGNER_URL (required for order placement unless signing is handled in-process)
 	// 
 	// LLM Provider (choose one mode):
 	// - LLM_PROVIDER ("openai-raw" | "ai-sdk" | "vercel-gateway", default: "openai-raw")

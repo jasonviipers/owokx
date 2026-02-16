@@ -58,7 +58,7 @@ export interface CostTracker {
 }
 
 export interface Config {
-  broker?: 'alpaca' | 'okx'
+  broker?: 'alpaca' | 'okx' | 'polymarket'
   data_poll_interval_ms: number
   analyst_interval_ms: number
   max_position_value: number

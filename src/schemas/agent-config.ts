@@ -2,7 +2,7 @@ import { z } from "zod";
 
 export const AgentConfigSchema = z
   .object({
-    broker: z.enum(["alpaca", "okx"]),
+    broker: z.enum(["alpaca", "okx", "polymarket"]),
     data_poll_interval_ms: z.number().min(5000).max(300000),
     analyst_interval_ms: z.number().min(30000).max(600000),
 

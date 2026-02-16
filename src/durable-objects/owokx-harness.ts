@@ -73,7 +73,7 @@ interface AgentConfig {
   data_poll_interval_ms: number; // [TUNE] Default: 30s. Lower = more API calls
   analyst_interval_ms: number; // [TUNE] Default: 120s. How often to run trading logic
 
-  broker: "alpaca" | "okx";
+  broker: "alpaca" | "okx" | "polymarket";
 
   // Position limits - risk management basics
   max_position_value: number; // [TUNE] Max $ per position
@@ -1457,8 +1457,8 @@ export class OwokxHarness extends DurableObject<Env> {
     const trimmed = symbol.trim();
     if (trimmed.length === 0) return null;
 
-    if (broker === "alpaca") {
-      // Social feeds often emit crypto aliases like BTC.X/ETH.X that are not Alpaca equities.
+    if (broker === "alpaca" || broker === "polymarket") {
+      // Social feeds often emit crypto aliases like BTC.X/ETH.X that are not mapped instruments.
       if (/[.\-_]X$/i.test(trimmed)) {
         return null;
       }
@@ -2062,6 +2062,7 @@ export class OwokxHarness extends DurableObject<Env> {
     let account: Account | null = null;
     let positions: Position[] = [];
     let clock: MarketClock | null = null;
+    let brokerError: string | undefined;
 
     const cachedAuthError = this.state.lastBrokerAuthError;
     if (cachedAuthError && Date.now() - cachedAuthError.at < 60_000) {
@@ -2105,17 +2106,35 @@ export class OwokxHarness extends DurableObject<Env> {
       });
     }
 
-    try {
-      [account, positions, clock] = await Promise.all([
-        broker.trading.getAccount(),
-        broker.trading.getPositions(),
-        broker.trading.getClock(),
-      ]);
-      this.state.lastBrokerAuthError = undefined;
+    const brokerFailures: string[] = [];
+    let authFailureMessage: string | null = null;
+    const recordBrokerFailure = (scope: string, reason: unknown): void => {
+      const message = String(reason);
+      brokerFailures.push(`${scope}: ${message}`);
+
+      const code = (reason as { code?: string } | null)?.code;
+      if ((code === ErrorCode.UNAUTHORIZED || code === ErrorCode.FORBIDDEN) && !authFailureMessage) {
+        authFailureMessage = message;
+      }
+    };
+
+    const [accountResult, positionsResult, clockResult] = await Promise.allSettled([
+      this.withTimeout(broker.trading.getAccount(), 6_500, "broker_get_account_timeout"),
+      this.withTimeout(broker.trading.getPositions(), 6_500, "broker_get_positions_timeout"),
+      this.withTimeout(broker.trading.getClock(), 3_000, "broker_get_clock_timeout"),
+    ]);
+
+    if (accountResult.status === "fulfilled") {
+      account = accountResult.value;
       if (account) {
         this.maybeRecordPortfolioSnapshot(account.equity);
       }
+    } else {
+      recordBrokerFailure("account", accountResult.reason);
+    }
 
+    if (positionsResult.status === "fulfilled") {
+      positions = positionsResult.value;
       for (const pos of positions || []) {
         const entry = this.state.positionEntries[pos.symbol];
         if (entry && entry.entry_price === 0 && pos.avg_entry_price) {
@@ -2123,11 +2142,31 @@ export class OwokxHarness extends DurableObject<Env> {
           entry.peak_price = Math.max(entry.peak_price, pos.current_price);
         }
       }
-    } catch (error) {
-      const code = (error as { code?: string } | null)?.code;
-      if (code === ErrorCode.UNAUTHORIZED || code === ErrorCode.FORBIDDEN) {
-        this.state.lastBrokerAuthError = { at: Date.now(), message: String(error) };
-      }
+    } else {
+      recordBrokerFailure("positions", positionsResult.reason);
+    }
+
+    if (clockResult.status === "fulfilled") {
+      clock = clockResult.value;
+    } else {
+      recordBrokerFailure("clock", clockResult.reason);
+    }
+
+    if (authFailureMessage) {
+      this.state.lastBrokerAuthError = { at: Date.now(), message: authFailureMessage };
+    } else if (accountResult.status === "fulfilled") {
+      this.state.lastBrokerAuthError = undefined;
+    }
+
+    if (brokerFailures.length > 0) {
+      brokerError = brokerFailures.join(" | ");
+      this.log("System", "broker_status_partial_failure", {
+        broker: this.state.config.broker,
+        failures: brokerFailures,
+        severity: "warning",
+        status: "warning",
+        event_type: "api",
+      });
     }
 
     let swarm: any;
@@ -2136,8 +2175,8 @@ export class OwokxHarness extends DurableObject<Env> {
         const id = this.env.SWARM_REGISTRY.idFromName("default");
         const stub = this.env.SWARM_REGISTRY.get(id);
         const [healthRes, agentsRes] = await Promise.all([
-          stub.fetch("http://registry/health"),
-          stub.fetch("http://registry/agents"),
+          this.withTimeout(stub.fetch("http://registry/health"), 1_000, "swarm_registry_health_timeout"),
+          this.withTimeout(stub.fetch("http://registry/agents"), 1_000, "swarm_registry_agents_timeout"),
         ]);
         if (healthRes.ok && agentsRes.ok) {
           const health = (await healthRes.json()) as { healthy: boolean; active_agents: number };
@@ -2190,6 +2229,7 @@ export class OwokxHarness extends DurableObject<Env> {
         signalQuality,
         signalPerformance,
         swarm,
+        broker_error: brokerError,
       },
     });
   }
@@ -2223,10 +2263,10 @@ export class OwokxHarness extends DurableObject<Env> {
 
     if (typeof body.broker === "string") {
       const normalizedBroker = body.broker.trim().toLowerCase();
-      if (normalizedBroker !== "alpaca" && normalizedBroker !== "okx") {
+      if (normalizedBroker !== "alpaca" && normalizedBroker !== "okx" && normalizedBroker !== "polymarket") {
         this.log("System", "config_update_rejected", {
           field: "broker",
-          reason: "broker must be 'alpaca' or 'okx'",
+          reason: "broker must be 'alpaca', 'okx', or 'polymarket'",
           attempted_value: body.broker,
           changed_keys: changedKeys,
           severity: "error",
@@ -2237,7 +2277,7 @@ export class OwokxHarness extends DurableObject<Env> {
           JSON.stringify(
             {
               ok: false,
-              error: "broker must be one of: alpaca, okx",
+              error: "broker must be one of: alpaca, okx, polymarket",
             },
             null,
             2

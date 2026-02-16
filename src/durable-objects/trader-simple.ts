@@ -368,7 +368,7 @@ export class TraderSimple extends AgentBase<TraderState> {
     }
 
     try {
-      const broker = createBrokerProviders(this.env, "alpaca");
+      const broker = createBrokerProviders(this.env);
       const db = createD1Client(this.env.DB);
       const [accountSnapshot, positions, clock, riskState, policyConfig] = await Promise.all([
         broker.trading.getAccount(),
@@ -440,7 +440,7 @@ export class TraderSimple extends AgentBase<TraderState> {
         idempotency_key,
         order: {
           symbol,
-          asset_class: "us_equity",
+          asset_class: broker.broker === "alpaca" ? "us_equity" : "crypto",
           side: "buy",
           notional: Math.round(positionSize * 100) / 100,
           order_type: "market",
@@ -557,7 +557,7 @@ export class TraderSimple extends AgentBase<TraderState> {
     }
 
     try {
-      const broker = createBrokerProviders(this.env, "alpaca");
+      const broker = createBrokerProviders(this.env);
       const position = await broker.trading.getPosition(symbol).catch(() => null);
 
       if (!position) {
@@ -594,7 +594,7 @@ export class TraderSimple extends AgentBase<TraderState> {
         idempotency_key,
         order: {
           symbol: position.symbol,
-          asset_class: "us_equity",
+          asset_class: position.asset_class === "us_equity" ? "us_equity" : "crypto",
           side: "sell",
           qty: position.qty,
           order_type: "market",

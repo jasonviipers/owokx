@@ -549,6 +549,10 @@ export default function App() {
 
   const account = status?.account
   const positions = status?.positions || []
+  const brokerError =
+    typeof status?.broker_error === 'string' && status.broker_error.trim().length > 0
+      ? status.broker_error.trim()
+      : null
   const signals = status?.signals || []
   const portfolioRisk = status?.portfolioRisk ?? null
   const signalQuality = status?.signalQuality
@@ -952,6 +956,11 @@ export default function App() {
                       />
                     </div>
                   </div>
+                </div>
+              ) : brokerError ? (
+                <div className="space-y-2">
+                  <div className="text-hud-error text-sm">Broker unavailable</div>
+                  <div className="text-hud-text-dim text-xs break-words">{brokerError}</div>
                 </div>
               ) : (
                 <div className="text-hud-text-dim text-sm">Loading...</div>
@@ -1518,6 +1527,11 @@ export default function App() {
                         color={totalPl >= 0 ? 'success' : 'error'}
                       />
                     </div>
+                  </div>
+                ) : brokerError ? (
+                  <div className="space-y-2">
+                    <div className="text-hud-error text-sm">Broker unavailable</div>
+                    <div className="text-hud-text-dim text-xs break-words">{brokerError}</div>
                   </div>
                 ) : (
                   <div className="text-hud-text-dim text-sm">Loading...</div>

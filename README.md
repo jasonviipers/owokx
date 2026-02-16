@@ -6,7 +6,7 @@ An autonomous, LLM-powered trading agent that runs on Cloudflare Workers using D
 
 [![Discord](https://img.shields.io/discord/1467592472158015553?color=7289da&label=Discord&logo=discord&logoColor=white)](https://discord.gg/vMFnHe2YBh)
 
-The system gathers market/social signals, runs LLM-based research, and executes trades through a configurable broker (Alpaca or OKX).
+The system gathers market/social signals, runs LLM-based research, and executes trades through a configurable broker (Alpaca, OKX, or Polymarket).
 
 <img width="1278" height="957" alt="dashboard" src="https://github.com/user-attachments/assets/56473ab6-e2c6-45fc-9e32-cf85e69f1a2d" />
 
@@ -17,7 +17,7 @@ The system gathers market/social signals, runs LLM-based research, and executes 
 - Multi-source signals: StockTwits, Reddit public feeds, SEC filings, crypto market data
 - DataScout source extensions: Reddit RSS backup + Alpha Vantage sentiment
 - Multi-provider LLM support: OpenAI, Anthropic, Google, xAI, DeepSeek (via AI SDK)
-- Broker abstraction: Alpaca or OKX
+- Broker abstraction: Alpaca, OKX, or Polymarket
 - Activity logging with event typing, severity, status, filtering, and history
 - Swarm-aware execution with production safety guardrails
 - Discord notifications and configurable risk/position rules
@@ -28,7 +28,8 @@ The system gathers market/social signals, runs LLM-based research, and executes 
 - Cloudflare account
 - Broker account:
   - Alpaca (paper trading recommended first), or
-  - OKX (API key, secret, passphrase)
+  - OKX (API key, secret, passphrase), or
+  - Polymarket CLOB API credentials
 - LLM provider credentials (or Cloudflare AI Gateway credentials)
 
 ## Quick Start
@@ -62,7 +63,10 @@ npx wrangler secret put OWOKX_API_TOKEN
 npx wrangler secret put KILL_SWITCH_SECRET
 
 # Broker selection
-npx wrangler secret put BROKER_PROVIDER    # "alpaca" or "okx"
+npx wrangler secret put BROKER_PROVIDER    # "alpaca" | "okx" | "polymarket"
+# optional failover:
+# npx wrangler secret put BROKER_FALLBACK_PROVIDER
+# npx wrangler secret put BROKER_FALLBACK_ALLOW_TRADING   # "true" only if you accept cross-venue trade fallback risk
 
 # Alpaca (when BROKER_PROVIDER=alpaca)
 npx wrangler secret put ALPACA_API_KEY
@@ -76,6 +80,18 @@ npx wrangler secret put OKX_PASSPHRASE
 # optional:
 # npx wrangler secret put OKX_SIMULATED_TRADING
 # npx wrangler secret put OKX_DEFAULT_QUOTE_CCY
+
+# Polymarket (when BROKER_PROVIDER=polymarket)
+npx wrangler secret put POLYMARKET_API_KEY
+npx wrangler secret put POLYMARKET_API_SECRET
+npx wrangler secret put POLYMARKET_API_PASSPHRASE
+npx wrangler secret put POLYMARKET_ADDRESS
+# optional:
+# npx wrangler secret put POLYMARKET_API_URL
+# npx wrangler secret put POLYMARKET_DATA_API_URL
+# npx wrangler secret put POLYMARKET_SYMBOL_MAP_JSON
+# npx wrangler secret put POLYMARKET_ORDER_SIGNER_URL
+# npx wrangler secret put POLYMARKET_ORDER_SIGNER_BEARER_TOKEN
 
 # LLM mode
 npx wrangler secret put LLM_PROVIDER         # "openai-raw" | "ai-sdk" | "cloudflare-gateway"
