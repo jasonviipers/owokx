@@ -1,4 +1,7 @@
+import { createAlertNotifier } from "../alerts/notifier";
+import { type AlertRuleThresholds, evaluateAlertRules } from "../alerts/rules";
 import type { Env } from "../env.d";
+import { parseNumber } from "../lib/utils";
 import { getDefaultPolicyConfig } from "../policy/config";
 import { persistBacktestRunArtifacts } from "../providers/backtest";
 import { createBrokerProviders } from "../providers/broker-factory";
@@ -151,6 +154,132 @@ function nyDateString(d: Date): string {
   }).format(d);
 }
 
+interface SwarmQueueStateSnapshot {
+  deadLettered: number;
+  queued: number;
+  staleAgents: number;
+}
+
+interface HarnessLlmSnapshot {
+  last_auth_error: {
+    at?: number;
+    message?: string;
+  } | null;
+}
+
+function toAlertThresholds(env: Env): Partial<AlertRuleThresholds> {
+  return {
+    drawdownWarnRatio: parseNumber(env.ALERT_DRAWDOWN_WARN_RATIO, 0.8),
+    deadLetterWarn: parseNumber(env.ALERT_DLQ_WARN_THRESHOLD, 1),
+    deadLetterCritical: parseNumber(env.ALERT_DLQ_CRITICAL_THRESHOLD, 10),
+    llmAuthFailureWindowMs: parseNumber(env.ALERT_LLM_AUTH_WINDOW_SECONDS, 900) * 1000,
+  };
+}
+
+async function fetchSwarmQueueState(env: Env): Promise<SwarmQueueStateSnapshot | null> {
+  if (!env.SWARM_REGISTRY) return null;
+
+  try {
+    const registryId = env.SWARM_REGISTRY.idFromName("default");
+    const registry = env.SWARM_REGISTRY.get(registryId);
+    const response = await registry.fetch("http://registry/queue/state");
+    if (!response.ok) return null;
+
+    const payload = (await response.json()) as {
+      deadLettered?: number;
+      queued?: number;
+      staleAgents?: number;
+    };
+
+    return {
+      deadLettered: Number.isFinite(payload.deadLettered) ? Number(payload.deadLettered) : 0,
+      queued: Number.isFinite(payload.queued) ? Number(payload.queued) : 0,
+      staleAgents: Number.isFinite(payload.staleAgents) ? Number(payload.staleAgents) : 0,
+    };
+  } catch (error) {
+    console.error("[alerts] swarm_queue_fetch_failed", String(error));
+    return null;
+  }
+}
+
+async function fetchHarnessLlmSnapshot(env: Env): Promise<HarnessLlmSnapshot | null> {
+  if (!env.OWOKX_HARNESS) return null;
+
+  try {
+    const harnessId = env.OWOKX_HARNESS.idFromName("main");
+    const harness = env.OWOKX_HARNESS.get(harnessId);
+    const token = env.OWOKX_API_TOKEN_READONLY || env.OWOKX_API_TOKEN;
+    const response = await harness.fetch(
+      new Request("http://harness/metrics", {
+        method: "GET",
+        headers: {
+          Authorization: `Bearer ${token}`,
+        },
+      })
+    );
+    if (!response.ok) return null;
+
+    const payload = (await response.json()) as {
+      data?: {
+        llm?: {
+          last_auth_error?: {
+            at?: number;
+            message?: string;
+          } | null;
+        };
+      };
+    };
+
+    return {
+      last_auth_error: payload.data?.llm?.last_auth_error ?? null,
+    };
+  } catch (error) {
+    console.error("[alerts] harness_metrics_fetch_failed", String(error));
+    return null;
+  }
+}
+
+async function runAlertEvaluations(
+  env: Env,
+  input: {
+    account: { equity: number };
+    riskState: {
+      kill_switch_active: boolean;
+      kill_switch_reason: string | null;
+      kill_switch_at: string | null;
+      daily_equity_start: number | null;
+      max_portfolio_drawdown_pct: number;
+    };
+    policyConfig: {
+      max_portfolio_drawdown_pct: number;
+    };
+  }
+): Promise<void> {
+  const [swarm, llm] = await Promise.all([fetchSwarmQueueState(env), fetchHarnessLlmSnapshot(env)]);
+  const alerts = evaluateAlertRules({
+    environment: env.ENVIRONMENT,
+    account: input.account,
+    riskState: input.riskState,
+    policyConfig: input.policyConfig,
+    swarm,
+    llm,
+    thresholds: toAlertThresholds(env),
+  });
+
+  if (alerts.length === 0) return;
+
+  const notifier = createAlertNotifier(env);
+  const result = await notifier.notify(alerts);
+
+  console.log(
+    "[alerts] dispatch_result",
+    JSON.stringify({
+      attempted_rules: alerts.length,
+      ...result,
+    })
+  );
+}
+
 async function runHourlyCacheRefresh(env: Env): Promise<void> {
   console.log("Running hourly cache refresh...");
   const db = createD1Client(env.DB);
@@ -212,6 +341,12 @@ async function runHourlyCacheRefresh(env: Env): Promise<void> {
         await setDailyLossAbsolute(db, dailyLossUsd);
       }
     }
+
+    await runAlertEvaluations(env, {
+      account,
+      riskState,
+      policyConfig,
+    });
 
     const missingTrades = await getSubmittedOrderSubmissionsMissingTrades(db, 100);
     if (missingTrades.length > 0) {
