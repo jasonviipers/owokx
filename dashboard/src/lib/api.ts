@@ -1,4 +1,6 @@
 import type {
+  AlertHistoryEvent,
+  AlertRule,
   Config,
   ExperimentRun,
   ExperimentRunDetails,
@@ -51,6 +53,14 @@ export interface ExperimentPromotionResponse {
   strategy_name: string;
   variant_id?: string;
   promoted_variant?: ExperimentVariant;
+}
+
+export interface AlertRulesResponse {
+  rules: AlertRule[];
+}
+
+export interface AlertHistoryResponse {
+  events: AlertHistoryEvent[];
 }
 
 interface ApiEnvelope<T> {
@@ -243,6 +253,123 @@ export async function promoteExperimentRun(runId: string, variantName?: string):
     throw new Error(payload.error || "Promotion failed");
   }
   return payload.data;
+}
+
+export interface AlertRulesQuery {
+  include_disabled?: boolean;
+  limit?: number;
+  offset?: number;
+}
+
+export interface AlertRuleUpsertPayload {
+  id?: string;
+  title: string;
+  description?: string;
+  enabled?: boolean;
+  default_severity?: "info" | "warning" | "critical";
+  config?: Record<string, unknown>;
+}
+
+export interface AlertRulePatchPayload {
+  title?: string;
+  description?: string;
+  enabled?: boolean;
+  default_severity?: "info" | "warning" | "critical";
+  config?: Record<string, unknown>;
+}
+
+export async function fetchAlertRules(query: AlertRulesQuery = {}): Promise<AlertRule[]> {
+  const qs = toQueryString(query);
+  const path = `${API_BASE}/alerts/rules${qs ? `?${qs}` : ""}`;
+  const { payload } = await requestJson<ApiEnvelope<AlertRulesResponse>>(path, { method: "GET" });
+  return Array.isArray(payload.data?.rules) ? payload.data.rules : [];
+}
+
+export async function createAlertRule(input: AlertRuleUpsertPayload): Promise<AlertRule> {
+  const { payload } = await requestJson<ApiEnvelope<{ rule?: AlertRule }>>(`${API_BASE}/alerts/rules`, {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+
+  if (!payload.ok || !payload.data?.rule) {
+    throw new Error(payload.error || "Failed to create alert rule");
+  }
+  return payload.data.rule;
+}
+
+export async function updateAlertRule(ruleId: string, patch: AlertRulePatchPayload): Promise<AlertRule> {
+  const encodedRuleId = encodeURIComponent(ruleId);
+  const { payload } = await requestJson<ApiEnvelope<{ rule?: AlertRule }>>(`${API_BASE}/alerts/rules/${encodedRuleId}`, {
+    method: "PUT",
+    body: JSON.stringify(patch),
+  });
+
+  if (!payload.ok || !payload.data?.rule) {
+    throw new Error(payload.error || "Failed to update alert rule");
+  }
+  return payload.data.rule;
+}
+
+export async function deleteAlertRule(ruleId: string): Promise<void> {
+  const encodedRuleId = encodeURIComponent(ruleId);
+  const { payload } = await requestJson<ApiEnvelope<{ deleted?: boolean }>>(`${API_BASE}/alerts/rules/${encodedRuleId}`, {
+    method: "DELETE",
+  });
+  if (!payload.ok) {
+    throw new Error(payload.error || "Failed to delete alert rule");
+  }
+}
+
+export interface AlertHistoryQuery {
+  rule_id?: string;
+  severity?: "info" | "warning" | "critical";
+  acknowledged?: boolean;
+  since?: string;
+  until?: string;
+  limit?: number;
+  offset?: number;
+}
+
+export async function fetchAlertHistory(query: AlertHistoryQuery = {}): Promise<AlertHistoryEvent[]> {
+  const qs = toQueryString(query);
+  const path = `${API_BASE}/alerts/history${qs ? `?${qs}` : ""}`;
+  const { payload } = await requestJson<ApiEnvelope<AlertHistoryResponse>>(path, { method: "GET" });
+  return Array.isArray(payload.data?.events) ? payload.data.events : [];
+}
+
+export async function acknowledgeAlertEvent(eventId: string, acknowledgedBy?: string): Promise<AlertHistoryEvent> {
+  const encodedId = encodeURIComponent(eventId);
+  const { payload } = await requestJson<ApiEnvelope<{ event?: AlertHistoryEvent }>>(
+    `${API_BASE}/alerts/history/${encodedId}/ack`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        acknowledged_by: acknowledgedBy,
+      }),
+    }
+  );
+
+  if (!payload.ok || !payload.data?.event) {
+    throw new Error(payload.error || "Failed to acknowledge alert");
+  }
+  return payload.data.event;
+}
+
+export async function acknowledgeAlertRule(ruleId: string, acknowledgedBy?: string): Promise<number> {
+  const encodedId = encodeURIComponent(ruleId);
+  const { payload } = await requestJson<ApiEnvelope<{ acknowledged?: number }>>(
+    `${API_BASE}/alerts/rules/${encodedId}/ack`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        acknowledged_by: acknowledgedBy,
+      }),
+    }
+  );
+  if (!payload.ok) {
+    throw new Error(payload.error || "Failed to acknowledge rule alerts");
+  }
+  return typeof payload.data?.acknowledged === "number" ? payload.data.acknowledged : 0;
 }
 
 export async function saveSessionToken(token: string): Promise<void> {

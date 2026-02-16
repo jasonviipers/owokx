@@ -7,6 +7,7 @@ import { persistBacktestRunArtifacts } from "../providers/backtest";
 import { createBrokerProviders } from "../providers/broker-factory";
 import { createSECEdgarProvider } from "../providers/news/sec-edgar";
 import { createD1Client } from "../storage/d1/client";
+import { listAlertRules, recordAlertEventsBatch } from "../storage/d1/queries/alerts";
 import { cleanupExpiredApprovals } from "../storage/d1/queries/approvals";
 import { insertRawEvent, rawEventExists } from "../storage/d1/queries/events";
 import { getSubmittedOrderSubmissionsMissingTrades } from "../storage/d1/queries/order-submissions";
@@ -173,16 +174,11 @@ interface HarnessLlmSnapshot {
   } | null;
 }
 
-/**
- * Builds alert threshold overrides from environment variables.
- *
- * @param env - Runtime environment variables
- * @returns Partial alert thresholds where:
- * - `drawdownWarnRatio` is the drawdown ratio that triggers a warning (defaults to 0.8)
- * - `deadLetterWarn` is the dead-letter queue count that triggers a warning (defaults to 1)
- * - `deadLetterCritical` is the dead-letter queue count that triggers a critical alert (defaults to 10)
- * - `llmAuthFailureWindowMs` is the time window, in milliseconds, used to evaluate LLM auth failures (defaults to 900 seconds)
- */
+function isMissingAlertsSchemaError(error: unknown): boolean {
+  const message = String(error).toLowerCase();
+  return message.includes("no such table") && (message.includes("alert_rules") || message.includes("alert_events"));
+}
+
 function toAlertThresholds(env: Env): Partial<AlertRuleThresholds> {
   return {
     drawdownWarnRatio: parseNumber(env.ALERT_DRAWDOWN_WARN_RATIO, 0.8),
@@ -278,6 +274,7 @@ async function fetchHarnessLlmSnapshot(env: Env): Promise<HarnessLlmSnapshot | n
  *   - `policyConfig`: policy-derived thresholds used by alert rules
  */
 async function runAlertEvaluations(
+  db: ReturnType<typeof createD1Client>,
   env: Env,
   input: {
     account: { equity: number };
@@ -294,7 +291,7 @@ async function runAlertEvaluations(
   }
 ): Promise<void> {
   const [swarm, llm] = await Promise.all([fetchSwarmQueueState(env), fetchHarnessLlmSnapshot(env)]);
-  const alerts = evaluateAlertRules({
+  const evaluatedAlerts = evaluateAlertRules({
     environment: env.ENVIRONMENT,
     account: input.account,
     riskState: input.riskState,
@@ -303,6 +300,46 @@ async function runAlertEvaluations(
     llm,
     thresholds: toAlertThresholds(env),
   });
+
+  let alerts = evaluatedAlerts;
+  try {
+    const managedRules = await listAlertRules(db);
+    const ruleMap = new Map(managedRules.map((rule) => [rule.id, rule]));
+    alerts = evaluatedAlerts.flatMap((alert) => {
+      const managedRule = ruleMap.get(alert.rule);
+      if (!managedRule || !managedRule.enabled) {
+        return [];
+      }
+
+      const severityOverride = managedRule.config?.severity_override;
+      const finalSeverity =
+        severityOverride === "info" || severityOverride === "warning" || severityOverride === "critical"
+          ? severityOverride
+          : alert.severity;
+
+      return [{ ...alert, severity: finalSeverity }];
+    });
+
+    if (alerts.length > 0) {
+      await recordAlertEventsBatch(
+        db,
+        alerts.map((alert) => ({
+          id: alert.id,
+          rule_id: alert.rule,
+          severity: alert.severity,
+          title: alert.title,
+          message: alert.message,
+          fingerprint: alert.fingerprint,
+          details: alert.details,
+          occurred_at: alert.occurred_at,
+        }))
+      );
+    }
+  } catch (error) {
+    if (!isMissingAlertsSchemaError(error)) {
+      console.warn("[alerts] persistence_failed", String(error));
+    }
+  }
 
   if (alerts.length === 0) return;
 
@@ -385,7 +422,7 @@ async function runHourlyCacheRefresh(env: Env): Promise<void> {
       }
     }
 
-    await runAlertEvaluations(env, {
+    await runAlertEvaluations(db, env, {
       account,
       riskState,
       policyConfig,

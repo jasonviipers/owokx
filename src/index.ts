@@ -6,6 +6,15 @@ import { createTelemetry, type TelemetryTags } from "./lib/telemetry";
 import { OwokxMcpAgent } from "./mcp/agent";
 import { createD1Client } from "./storage/d1/client";
 import {
+  acknowledgeAlertEvent,
+  acknowledgeAlertEventsByRule,
+  deleteAlertRule,
+  getAlertRuleById,
+  listAlertEvents,
+  listAlertRules,
+  upsertAlertRule,
+} from "./storage/d1/queries/alerts";
+import {
   getExperimentRunById,
   listExperimentMetrics,
   listExperimentRuns,
@@ -64,6 +73,7 @@ function parsePositiveInt(input: string | null, fallback: number, max: number): 
 
 const EXPERIMENTS_SCHEMA_HINT =
   "Experiment schema not initialized. Apply D1 migrations (including migrations/0008_experiments.sql).";
+const ALERTS_SCHEMA_HINT = "Alert schema not initialized. Apply D1 migrations (including migrations/0010_alerts.sql).";
 
 function getErrorMessage(error: unknown): string {
   if (error instanceof Error && typeof error.message === "string" && error.message.trim().length > 0) {
@@ -82,11 +92,11 @@ function isMissingExperimentsSchemaError(error: unknown): boolean {
   );
 }
 
-/**
- * Retrieves the Durable Object stub for the swarm registry named "default".
- *
- * @returns The Durable Object stub for `SWARM_REGISTRY` bound to the name `"default"`.
- */
+function isMissingAlertsSchemaError(error: unknown): boolean {
+  const message = getErrorMessage(error).toLowerCase();
+  return message.includes("no such table") && (message.includes("alert_rules") || message.includes("alert_events"));
+}
+
 function getRegistryStub(env: Env): DurableObjectStub {
   const registryId = env.SWARM_REGISTRY.idFromName("default");
   return env.SWARM_REGISTRY.get(registryId);
@@ -429,6 +439,277 @@ export default {
       } catch (error) {
         if (isMissingExperimentsSchemaError(error)) {
           return jsonResponse({ ok: false, error: EXPERIMENTS_SCHEMA_HINT }, 503);
+        }
+        return jsonResponse({ ok: false, error: getErrorMessage(error) }, 500);
+      }
+    }
+
+    if (url.pathname === "/agent/alerts/rules" && request.method === "GET") {
+      return withRouteTelemetry({ route: "/agent/alerts/rules", method: request.method }, async () => {
+        if (!isRequestAuthorized(request, env, "read")) {
+          return unauthorizedResponse();
+        }
+
+        const db = createD1Client(env.DB);
+        const includeDisabledRaw = url.searchParams.get("include_disabled");
+        const includeDisabled =
+          includeDisabledRaw === null || (includeDisabledRaw !== "false" && includeDisabledRaw !== "0");
+        const limit = parsePositiveInt(url.searchParams.get("limit"), 200, 500);
+        const offsetRaw = Number.parseInt(url.searchParams.get("offset") ?? "0", 10);
+        const offset = Number.isFinite(offsetRaw) && offsetRaw >= 0 ? offsetRaw : 0;
+
+        try {
+          const rules = await listAlertRules(db, {
+            include_disabled: includeDisabled,
+            limit,
+            offset,
+          });
+          return jsonResponse({ ok: true, data: { rules } });
+        } catch (error) {
+          if (isMissingAlertsSchemaError(error)) {
+            return jsonResponse({
+              ok: true,
+              data: { rules: [] },
+              warning: ALERTS_SCHEMA_HINT,
+            });
+          }
+          return jsonResponse({ ok: false, error: getErrorMessage(error) }, 500);
+        }
+      });
+    }
+
+    if (url.pathname === "/agent/alerts/rules" && request.method === "POST") {
+      if (!isRequestAuthorized(request, env, "trade")) {
+        return unauthorizedResponse();
+      }
+
+      type UpsertRuleBody = {
+        id?: string;
+        title?: string;
+        description?: string;
+        enabled?: boolean;
+        default_severity?: "info" | "warning" | "critical";
+        config?: Record<string, unknown>;
+      };
+
+      let body: UpsertRuleBody = {};
+      try {
+        body = (await request.json()) as UpsertRuleBody;
+      } catch {
+        return jsonResponse({ ok: false, error: "Invalid JSON payload" }, 400);
+      }
+
+      if (typeof body.title !== "string" || body.title.trim().length === 0) {
+        return jsonResponse({ ok: false, error: "title is required" }, 400);
+      }
+
+      const db = createD1Client(env.DB);
+      try {
+        const rule = await upsertAlertRule(db, {
+          id: body.id,
+          title: body.title,
+          description: body.description,
+          enabled: body.enabled,
+          default_severity: body.default_severity,
+          config: body.config,
+        });
+        return jsonResponse({ ok: true, data: { rule } });
+      } catch (error) {
+        if (isMissingAlertsSchemaError(error)) {
+          return jsonResponse({ ok: false, error: ALERTS_SCHEMA_HINT }, 503);
+        }
+        return jsonResponse({ ok: false, error: getErrorMessage(error) }, 500);
+      }
+    }
+
+    if (url.pathname.startsWith("/agent/alerts/rules/") && request.method === "PUT") {
+      if (!isRequestAuthorized(request, env, "trade")) {
+        return unauthorizedResponse();
+      }
+
+      const routeSuffix = decodeURIComponent(url.pathname.slice("/agent/alerts/rules/".length));
+      if (!routeSuffix || routeSuffix === "ack" || routeSuffix.includes("/")) {
+        return jsonResponse({ ok: false, error: "rule_id is required" }, 400);
+      }
+
+      type UpdateRuleBody = {
+        title?: string;
+        description?: string;
+        enabled?: boolean;
+        default_severity?: "info" | "warning" | "critical";
+        config?: Record<string, unknown>;
+      };
+
+      let body: UpdateRuleBody = {};
+      try {
+        body = (await request.json()) as UpdateRuleBody;
+      } catch {
+        return jsonResponse({ ok: false, error: "Invalid JSON payload" }, 400);
+      }
+
+      const db = createD1Client(env.DB);
+      try {
+        const existing = await getAlertRuleById(db, routeSuffix);
+        if (!existing) {
+          return jsonResponse({ ok: false, error: "Alert rule not found" }, 404);
+        }
+
+        const rule = await upsertAlertRule(db, {
+          id: routeSuffix,
+          title: typeof body.title === "string" && body.title.trim().length > 0 ? body.title : existing.title,
+          description: typeof body.description === "string" ? body.description : existing.description,
+          enabled: typeof body.enabled === "boolean" ? body.enabled : existing.enabled,
+          default_severity: body.default_severity ?? existing.default_severity,
+          config:
+            body.config && typeof body.config === "object" && !Array.isArray(body.config)
+              ? body.config
+              : existing.config,
+        });
+        return jsonResponse({ ok: true, data: { rule } });
+      } catch (error) {
+        if (isMissingAlertsSchemaError(error)) {
+          return jsonResponse({ ok: false, error: ALERTS_SCHEMA_HINT }, 503);
+        }
+        return jsonResponse({ ok: false, error: getErrorMessage(error) }, 500);
+      }
+    }
+
+    if (url.pathname.endsWith("/ack") && url.pathname.startsWith("/agent/alerts/rules/") && request.method === "POST") {
+      if (!isRequestAuthorized(request, env, "trade")) {
+        return unauthorizedResponse();
+      }
+
+      const ruleId = decodeURIComponent(url.pathname.slice("/agent/alerts/rules/".length, -"/ack".length));
+      if (!ruleId) {
+        return jsonResponse({ ok: false, error: "rule_id is required" }, 400);
+      }
+
+      type AckBody = { acknowledged_by?: string };
+      let body: AckBody = {};
+      try {
+        body = (await request.json()) as AckBody;
+      } catch {
+        body = {};
+      }
+
+      const db = createD1Client(env.DB);
+      try {
+        const acknowledged = await acknowledgeAlertEventsByRule(db, ruleId, body.acknowledged_by ?? null);
+        return jsonResponse({ ok: true, data: { rule_id: ruleId, acknowledged } });
+      } catch (error) {
+        if (isMissingAlertsSchemaError(error)) {
+          return jsonResponse({ ok: false, error: ALERTS_SCHEMA_HINT }, 503);
+        }
+        return jsonResponse({ ok: false, error: getErrorMessage(error) }, 500);
+      }
+    }
+
+    if (url.pathname.startsWith("/agent/alerts/rules/") && request.method === "DELETE") {
+      if (!isRequestAuthorized(request, env, "trade")) {
+        return unauthorizedResponse();
+      }
+
+      const ruleId = decodeURIComponent(url.pathname.slice("/agent/alerts/rules/".length));
+      if (!ruleId || ruleId.includes("/")) {
+        return jsonResponse({ ok: false, error: "rule_id is required" }, 400);
+      }
+
+      const db = createD1Client(env.DB);
+      try {
+        const existing = await getAlertRuleById(db, ruleId);
+        if (!existing) {
+          return jsonResponse({ ok: false, error: "Alert rule not found" }, 404);
+        }
+        await deleteAlertRule(db, ruleId);
+        return jsonResponse({ ok: true, data: { deleted: true, rule_id: ruleId } });
+      } catch (error) {
+        if (isMissingAlertsSchemaError(error)) {
+          return jsonResponse({ ok: false, error: ALERTS_SCHEMA_HINT }, 503);
+        }
+        return jsonResponse({ ok: false, error: getErrorMessage(error) }, 500);
+      }
+    }
+
+    if (url.pathname === "/agent/alerts/history" && request.method === "GET") {
+      return withRouteTelemetry({ route: "/agent/alerts/history", method: request.method }, async () => {
+        if (!isRequestAuthorized(request, env, "read")) {
+          return unauthorizedResponse();
+        }
+
+        const db = createD1Client(env.DB);
+        const ruleId = url.searchParams.get("rule_id") ?? undefined;
+        const severityRaw = url.searchParams.get("severity");
+        const severity =
+          severityRaw === "info" || severityRaw === "warning" || severityRaw === "critical" ? severityRaw : undefined;
+        const acknowledgedRaw = url.searchParams.get("acknowledged");
+        const acknowledged =
+          acknowledgedRaw === "true" || acknowledgedRaw === "1"
+            ? true
+            : acknowledgedRaw === "false" || acknowledgedRaw === "0"
+              ? false
+              : undefined;
+        const since = url.searchParams.get("since") ?? undefined;
+        const until = url.searchParams.get("until") ?? undefined;
+        const limit = parsePositiveInt(url.searchParams.get("limit"), 100, 500);
+        const offsetRaw = Number.parseInt(url.searchParams.get("offset") ?? "0", 10);
+        const offset = Number.isFinite(offsetRaw) && offsetRaw >= 0 ? offsetRaw : 0;
+
+        try {
+          const events = await listAlertEvents(db, {
+            rule_id: ruleId,
+            severity,
+            acknowledged,
+            since,
+            until,
+            limit,
+            offset,
+          });
+          return jsonResponse({ ok: true, data: { events } });
+        } catch (error) {
+          if (isMissingAlertsSchemaError(error)) {
+            return jsonResponse({
+              ok: true,
+              data: { events: [] },
+              warning: ALERTS_SCHEMA_HINT,
+            });
+          }
+          return jsonResponse({ ok: false, error: getErrorMessage(error) }, 500);
+        }
+      });
+    }
+
+    if (
+      url.pathname.startsWith("/agent/alerts/history/") &&
+      url.pathname.endsWith("/ack") &&
+      request.method === "POST"
+    ) {
+      if (!isRequestAuthorized(request, env, "trade")) {
+        return unauthorizedResponse();
+      }
+
+      const eventId = decodeURIComponent(url.pathname.slice("/agent/alerts/history/".length, -"/ack".length));
+      if (!eventId) {
+        return jsonResponse({ ok: false, error: "event_id is required" }, 400);
+      }
+
+      type AckBody = { acknowledged_by?: string };
+      let body: AckBody = {};
+      try {
+        body = (await request.json()) as AckBody;
+      } catch {
+        body = {};
+      }
+
+      const db = createD1Client(env.DB);
+      try {
+        const event = await acknowledgeAlertEvent(db, eventId, body.acknowledged_by ?? null);
+        if (!event) {
+          return jsonResponse({ ok: false, error: "Alert event not found" }, 404);
+        }
+        return jsonResponse({ ok: true, data: { event } });
+      } catch (error) {
+        if (isMissingAlertsSchemaError(error)) {
+          return jsonResponse({ ok: false, error: ALERTS_SCHEMA_HINT }, 503);
         }
         return jsonResponse({ ok: false, error: getErrorMessage(error) }, 500);
       }

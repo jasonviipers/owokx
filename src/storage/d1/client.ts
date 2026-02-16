@@ -223,6 +223,31 @@ export interface DecisionTraceRow {
   created_at: string;
 }
 
+export interface AlertRuleRow {
+  id: string;
+  title: string;
+  description: string;
+  enabled: number;
+  default_severity: string;
+  config_json: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface AlertEventRow {
+  id: string;
+  rule_id: string;
+  severity: string;
+  title: string;
+  message: string;
+  fingerprint: string;
+  details_json: string;
+  occurred_at: string;
+  acknowledged_at: string | null;
+  acknowledged_by: string | null;
+  created_at: string;
+}
+
 export function createD1Client(db: D1Database | undefined | null): D1Client {
   if (!db || typeof db.prepare !== "function") {
     throw new Error(
