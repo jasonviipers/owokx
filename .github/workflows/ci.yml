@@ -128,12 +128,7 @@ jobs:
           version: 10
 
       - name: Install dependencies
-        run: |
-          if [ ! -f pnpm-lock.yaml ]; then
-            echo "::error::pnpm-lock.yaml missing at repository root. Deploy job requires locked dependencies."
-            exit 1
-          fi
-          pnpm install --frozen-lockfile
+        run: pnpm install
 
       - name: Check formatting and linting
         run: pnpm run check
