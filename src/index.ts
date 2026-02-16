@@ -2,8 +2,18 @@ import { getHarnessStub } from "./durable-objects/owokx-harness";
 import type { Env } from "./env.d";
 import { handleCronEvent } from "./jobs/cron";
 import { isRequestAuthorized, isTokenAuthorized } from "./lib/auth";
+import { createTelemetry, type TelemetryTags } from "./lib/telemetry";
 import { OwokxMcpAgent } from "./mcp/agent";
 import { createD1Client } from "./storage/d1/client";
+import {
+  acknowledgeAlertEvent,
+  acknowledgeAlertEventsByRule,
+  deleteAlertRule,
+  getAlertRuleById,
+  listAlertEvents,
+  listAlertRules,
+  upsertAlertRule,
+} from "./storage/d1/queries/alerts";
 import {
   getExperimentRunById,
   listExperimentMetrics,
@@ -63,6 +73,7 @@ function parsePositiveInt(input: string | null, fallback: number, max: number): 
 
 const EXPERIMENTS_SCHEMA_HINT =
   "Experiment schema not initialized. Apply D1 migrations (including migrations/0008_experiments.sql).";
+const ALERTS_SCHEMA_HINT = "Alert schema not initialized. Apply D1 migrations (including migrations/0010_alerts.sql).";
 
 function getErrorMessage(error: unknown): string {
   if (error instanceof Error && typeof error.message === "string" && error.message.trim().length > 0) {
@@ -81,9 +92,44 @@ function isMissingExperimentsSchemaError(error: unknown): boolean {
   );
 }
 
+function isMissingAlertsSchemaError(error: unknown): boolean {
+  const message = getErrorMessage(error).toLowerCase();
+  return message.includes("no such table") && (message.includes("alert_rules") || message.includes("alert_events"));
+}
+
 function getRegistryStub(env: Env): DurableObjectStub {
   const registryId = env.SWARM_REGISTRY.idFromName("default");
   return env.SWARM_REGISTRY.get(registryId);
+}
+
+const workerTelemetry = createTelemetry("worker_index");
+
+/**
+ * Record telemetry for an HTTP route (requests, responses, errors, latency) and run the provided handler.
+ *
+ * Records request/response counts, error counts, and request latency using the given telemetry tags while invoking `handler`.
+ *
+ * @param tags - Telemetry tags applied to all recorded metrics for this route
+ * @param handler - Async function that handles the route and returns a `Response`
+ * @returns The `Response` produced by `handler`
+ */
+async function withRouteTelemetry(tags: TelemetryTags, handler: () => Promise<Response>): Promise<Response> {
+  workerTelemetry.increment("http_requests_total", 1, tags);
+  const stopTimer = workerTelemetry.startTimer("http_request_latency_ms", tags);
+  try {
+    const response = await handler();
+    const status = response.status;
+    workerTelemetry.increment("http_responses_total", 1, { ...tags, status });
+    if (status >= 400) {
+      workerTelemetry.increment("http_errors_total", 1, { ...tags, status });
+    }
+    return response;
+  } catch (error) {
+    workerTelemetry.increment("http_errors_total", 1, { ...tags, status: 500 });
+    throw error;
+  } finally {
+    stopTimer();
+  }
 }
 
 export default {
@@ -140,16 +186,18 @@ export default {
     }
 
     if (url.pathname === "/metrics") {
-      if (!isRequestAuthorized(request, env, "read")) {
-        return unauthorizedResponse();
-      }
-      const stub = getHarnessStub(env);
-      return stub.fetch(
-        new Request("http://harness/metrics", {
-          method: "GET",
-          headers: request.headers,
-        })
-      );
+      return withRouteTelemetry({ route: "/metrics", method: request.method }, async () => {
+        if (!isRequestAuthorized(request, env, "read")) {
+          return unauthorizedResponse();
+        }
+        const stub = getHarnessStub(env);
+        return stub.fetch(
+          new Request("http://harness/metrics", {
+            method: "GET",
+            headers: request.headers,
+          })
+        );
+      });
     }
 
     if (url.pathname === "/") {
@@ -178,112 +226,118 @@ export default {
     }
 
     if (url.pathname === "/agent/experiments/runs" && request.method === "GET") {
-      if (!isRequestAuthorized(request, env, "read")) {
-        return unauthorizedResponse();
-      }
-
-      const db = createD1Client(env.DB);
-      const strategyName = url.searchParams.get("strategy_name") ?? undefined;
-      const dateFrom = url.searchParams.get("date_from") ?? undefined;
-      const dateTo = url.searchParams.get("date_to") ?? undefined;
-      const limit = parsePositiveInt(url.searchParams.get("limit"), 50, 500);
-      const offsetRaw = Number.parseInt(url.searchParams.get("offset") ?? "0", 10);
-      const offset = Number.isFinite(offsetRaw) && offsetRaw >= 0 ? offsetRaw : 0;
-
-      try {
-        const runs = await listExperimentRuns(db, {
-          strategy_name: strategyName,
-          date_from: dateFrom,
-          date_to: dateTo,
-          limit,
-          offset,
-        });
-        return jsonResponse({ ok: true, data: { runs } });
-      } catch (error) {
-        if (isMissingExperimentsSchemaError(error)) {
-          return jsonResponse({
-            ok: true,
-            data: { runs: [] },
-            warning: EXPERIMENTS_SCHEMA_HINT,
-          });
+      return withRouteTelemetry({ route: "/agent/experiments/runs", method: request.method }, async () => {
+        if (!isRequestAuthorized(request, env, "read")) {
+          return unauthorizedResponse();
         }
-        return jsonResponse({ ok: false, error: getErrorMessage(error) }, 500);
-      }
+
+        const db = createD1Client(env.DB);
+        const strategyName = url.searchParams.get("strategy_name") ?? undefined;
+        const dateFrom = url.searchParams.get("date_from") ?? undefined;
+        const dateTo = url.searchParams.get("date_to") ?? undefined;
+        const limit = parsePositiveInt(url.searchParams.get("limit"), 50, 500);
+        const offsetRaw = Number.parseInt(url.searchParams.get("offset") ?? "0", 10);
+        const offset = Number.isFinite(offsetRaw) && offsetRaw >= 0 ? offsetRaw : 0;
+
+        try {
+          const runs = await listExperimentRuns(db, {
+            strategy_name: strategyName,
+            date_from: dateFrom,
+            date_to: dateTo,
+            limit,
+            offset,
+          });
+          return jsonResponse({ ok: true, data: { runs } });
+        } catch (error) {
+          if (isMissingExperimentsSchemaError(error)) {
+            return jsonResponse({
+              ok: true,
+              data: { runs: [] },
+              warning: EXPERIMENTS_SCHEMA_HINT,
+            });
+          }
+          return jsonResponse({ ok: false, error: getErrorMessage(error) }, 500);
+        }
+      });
     }
 
     if (url.pathname.startsWith("/agent/experiments/runs/") && request.method === "GET") {
-      if (!isRequestAuthorized(request, env, "read")) {
-        return unauthorizedResponse();
-      }
-
-      const runId = decodeURIComponent(url.pathname.slice("/agent/experiments/runs/".length));
-      if (!runId) {
-        return jsonResponse({ ok: false, error: "run_id is required" }, 400);
-      }
-
-      const db = createD1Client(env.DB);
-      const r2 = createR2Client(env.ARTIFACTS);
-
-      try {
-        const run = await getExperimentRunById(db, runId);
-        if (!run) {
-          return jsonResponse({ ok: false, error: "Experiment run not found" }, 404);
+      return withRouteTelemetry({ route: "/agent/experiments/runs/:id", method: request.method }, async () => {
+        if (!isRequestAuthorized(request, env, "read")) {
+          return unauthorizedResponse();
         }
 
-        const metricsKey = R2Paths.experimentRunMetrics(run.strategy_name, run.id);
-        const [summaryArtifact, equityArtifact, metricsArtifact, metrics] = await Promise.all([
-          run.summary_artifact_key ? r2.getExperimentArtifact(run.summary_artifact_key) : Promise.resolve(null),
-          run.equity_artifact_key ? r2.getExperimentArtifact(run.equity_artifact_key) : Promise.resolve(null),
-          r2.getExperimentArtifact(metricsKey).catch(() => null),
-          listExperimentMetrics(db, { run_id: run.id, limit: 2000 }),
-        ]);
-
-        return jsonResponse({
-          ok: true,
-          data: {
-            run,
-            summary_artifact: summaryArtifact,
-            equity_artifact: equityArtifact,
-            metrics_artifact: metricsArtifact,
-            metrics,
-          },
-        });
-      } catch (error) {
-        if (isMissingExperimentsSchemaError(error)) {
-          return jsonResponse({ ok: false, error: EXPERIMENTS_SCHEMA_HINT }, 503);
+        const runId = decodeURIComponent(url.pathname.slice("/agent/experiments/runs/".length));
+        if (!runId) {
+          return jsonResponse({ ok: false, error: "run_id is required" }, 400);
         }
-        return jsonResponse({ ok: false, error: getErrorMessage(error) }, 500);
-      }
+
+        const db = createD1Client(env.DB);
+        const r2 = createR2Client(env.ARTIFACTS);
+
+        try {
+          const run = await getExperimentRunById(db, runId);
+          if (!run) {
+            return jsonResponse({ ok: false, error: "Experiment run not found" }, 404);
+          }
+
+          const metricsKey = R2Paths.experimentRunMetrics(run.strategy_name, run.id);
+          const [summaryArtifact, equityArtifact, metricsArtifact, metrics] = await Promise.all([
+            run.summary_artifact_key ? r2.getExperimentArtifact(run.summary_artifact_key) : Promise.resolve(null),
+            run.equity_artifact_key ? r2.getExperimentArtifact(run.equity_artifact_key) : Promise.resolve(null),
+            r2.getExperimentArtifact(metricsKey).catch(() => null),
+            listExperimentMetrics(db, { run_id: run.id, limit: 2000 }),
+          ]);
+
+          return jsonResponse({
+            ok: true,
+            data: {
+              run,
+              summary_artifact: summaryArtifact,
+              equity_artifact: equityArtifact,
+              metrics_artifact: metricsArtifact,
+              metrics,
+            },
+          });
+        } catch (error) {
+          if (isMissingExperimentsSchemaError(error)) {
+            return jsonResponse({ ok: false, error: EXPERIMENTS_SCHEMA_HINT }, 503);
+          }
+          return jsonResponse({ ok: false, error: getErrorMessage(error) }, 500);
+        }
+      });
     }
 
     if (url.pathname === "/agent/experiments/variants" && request.method === "GET") {
-      if (!isRequestAuthorized(request, env, "read")) {
-        return unauthorizedResponse();
-      }
-
-      const db = createD1Client(env.DB);
-      const strategyName = url.searchParams.get("strategy_name") ?? undefined;
-      const limit = parsePositiveInt(url.searchParams.get("limit"), 50, 500);
-      const offsetRaw = Number.parseInt(url.searchParams.get("offset") ?? "0", 10);
-      const offset = Number.isFinite(offsetRaw) && offsetRaw >= 0 ? offsetRaw : 0;
-
-      try {
-        const variants = await listExperimentVariants(db, {
-          strategy_name: strategyName,
-          limit,
-          offset,
-        });
-        return jsonResponse({ ok: true, data: { variants } });
-      } catch (error) {
-        if (isMissingExperimentsSchemaError(error)) {
-          return jsonResponse({
-            ok: true,
-            data: { variants: [] },
-            warning: EXPERIMENTS_SCHEMA_HINT,
-          });
+      return withRouteTelemetry({ route: "/agent/experiments/variants", method: request.method }, async () => {
+        if (!isRequestAuthorized(request, env, "read")) {
+          return unauthorizedResponse();
         }
-        return jsonResponse({ ok: false, error: getErrorMessage(error) }, 500);
-      }
+
+        const db = createD1Client(env.DB);
+        const strategyName = url.searchParams.get("strategy_name") ?? undefined;
+        const limit = parsePositiveInt(url.searchParams.get("limit"), 50, 500);
+        const offsetRaw = Number.parseInt(url.searchParams.get("offset") ?? "0", 10);
+        const offset = Number.isFinite(offsetRaw) && offsetRaw >= 0 ? offsetRaw : 0;
+
+        try {
+          const variants = await listExperimentVariants(db, {
+            strategy_name: strategyName,
+            limit,
+            offset,
+          });
+          return jsonResponse({ ok: true, data: { variants } });
+        } catch (error) {
+          if (isMissingExperimentsSchemaError(error)) {
+            return jsonResponse({
+              ok: true,
+              data: { variants: [] },
+              warning: EXPERIMENTS_SCHEMA_HINT,
+            });
+          }
+          return jsonResponse({ ok: false, error: getErrorMessage(error) }, 500);
+        }
+      });
     }
 
     if (url.pathname === "/agent/experiments/promote" && request.method === "POST") {
@@ -390,6 +444,277 @@ export default {
       }
     }
 
+    if (url.pathname === "/agent/alerts/rules" && request.method === "GET") {
+      return withRouteTelemetry({ route: "/agent/alerts/rules", method: request.method }, async () => {
+        if (!isRequestAuthorized(request, env, "read")) {
+          return unauthorizedResponse();
+        }
+
+        const db = createD1Client(env.DB);
+        const includeDisabledRaw = url.searchParams.get("include_disabled");
+        const includeDisabled =
+          includeDisabledRaw === null || (includeDisabledRaw !== "false" && includeDisabledRaw !== "0");
+        const limit = parsePositiveInt(url.searchParams.get("limit"), 200, 500);
+        const offsetRaw = Number.parseInt(url.searchParams.get("offset") ?? "0", 10);
+        const offset = Number.isFinite(offsetRaw) && offsetRaw >= 0 ? offsetRaw : 0;
+
+        try {
+          const rules = await listAlertRules(db, {
+            include_disabled: includeDisabled,
+            limit,
+            offset,
+          });
+          return jsonResponse({ ok: true, data: { rules } });
+        } catch (error) {
+          if (isMissingAlertsSchemaError(error)) {
+            return jsonResponse({
+              ok: true,
+              data: { rules: [] },
+              warning: ALERTS_SCHEMA_HINT,
+            });
+          }
+          return jsonResponse({ ok: false, error: getErrorMessage(error) }, 500);
+        }
+      });
+    }
+
+    if (url.pathname === "/agent/alerts/rules" && request.method === "POST") {
+      if (!isRequestAuthorized(request, env, "trade")) {
+        return unauthorizedResponse();
+      }
+
+      type UpsertRuleBody = {
+        id?: string;
+        title?: string;
+        description?: string;
+        enabled?: boolean;
+        default_severity?: "info" | "warning" | "critical";
+        config?: Record<string, unknown>;
+      };
+
+      let body: UpsertRuleBody = {};
+      try {
+        body = (await request.json()) as UpsertRuleBody;
+      } catch {
+        return jsonResponse({ ok: false, error: "Invalid JSON payload" }, 400);
+      }
+
+      if (typeof body.title !== "string" || body.title.trim().length === 0) {
+        return jsonResponse({ ok: false, error: "title is required" }, 400);
+      }
+
+      const db = createD1Client(env.DB);
+      try {
+        const rule = await upsertAlertRule(db, {
+          id: body.id,
+          title: body.title,
+          description: body.description,
+          enabled: body.enabled,
+          default_severity: body.default_severity,
+          config: body.config,
+        });
+        return jsonResponse({ ok: true, data: { rule } });
+      } catch (error) {
+        if (isMissingAlertsSchemaError(error)) {
+          return jsonResponse({ ok: false, error: ALERTS_SCHEMA_HINT }, 503);
+        }
+        return jsonResponse({ ok: false, error: getErrorMessage(error) }, 500);
+      }
+    }
+
+    if (url.pathname.startsWith("/agent/alerts/rules/") && request.method === "PUT") {
+      if (!isRequestAuthorized(request, env, "trade")) {
+        return unauthorizedResponse();
+      }
+
+      const routeSuffix = decodeURIComponent(url.pathname.slice("/agent/alerts/rules/".length));
+      if (!routeSuffix || routeSuffix === "ack" || routeSuffix.includes("/")) {
+        return jsonResponse({ ok: false, error: "rule_id is required" }, 400);
+      }
+
+      type UpdateRuleBody = {
+        title?: string;
+        description?: string;
+        enabled?: boolean;
+        default_severity?: "info" | "warning" | "critical";
+        config?: Record<string, unknown>;
+      };
+
+      let body: UpdateRuleBody = {};
+      try {
+        body = (await request.json()) as UpdateRuleBody;
+      } catch {
+        return jsonResponse({ ok: false, error: "Invalid JSON payload" }, 400);
+      }
+
+      const db = createD1Client(env.DB);
+      try {
+        const existing = await getAlertRuleById(db, routeSuffix);
+        if (!existing) {
+          return jsonResponse({ ok: false, error: "Alert rule not found" }, 404);
+        }
+
+        const rule = await upsertAlertRule(db, {
+          id: routeSuffix,
+          title: typeof body.title === "string" && body.title.trim().length > 0 ? body.title : existing.title,
+          description: typeof body.description === "string" ? body.description : existing.description,
+          enabled: typeof body.enabled === "boolean" ? body.enabled : existing.enabled,
+          default_severity: body.default_severity ?? existing.default_severity,
+          config:
+            body.config && typeof body.config === "object" && !Array.isArray(body.config)
+              ? body.config
+              : existing.config,
+        });
+        return jsonResponse({ ok: true, data: { rule } });
+      } catch (error) {
+        if (isMissingAlertsSchemaError(error)) {
+          return jsonResponse({ ok: false, error: ALERTS_SCHEMA_HINT }, 503);
+        }
+        return jsonResponse({ ok: false, error: getErrorMessage(error) }, 500);
+      }
+    }
+
+    if (url.pathname.endsWith("/ack") && url.pathname.startsWith("/agent/alerts/rules/") && request.method === "POST") {
+      if (!isRequestAuthorized(request, env, "trade")) {
+        return unauthorizedResponse();
+      }
+
+      const ruleId = decodeURIComponent(url.pathname.slice("/agent/alerts/rules/".length, -"/ack".length));
+      if (!ruleId) {
+        return jsonResponse({ ok: false, error: "rule_id is required" }, 400);
+      }
+
+      type AckBody = { acknowledged_by?: string };
+      let body: AckBody = {};
+      try {
+        body = (await request.json()) as AckBody;
+      } catch {
+        body = {};
+      }
+
+      const db = createD1Client(env.DB);
+      try {
+        const acknowledged = await acknowledgeAlertEventsByRule(db, ruleId, body.acknowledged_by ?? null);
+        return jsonResponse({ ok: true, data: { rule_id: ruleId, acknowledged } });
+      } catch (error) {
+        if (isMissingAlertsSchemaError(error)) {
+          return jsonResponse({ ok: false, error: ALERTS_SCHEMA_HINT }, 503);
+        }
+        return jsonResponse({ ok: false, error: getErrorMessage(error) }, 500);
+      }
+    }
+
+    if (url.pathname.startsWith("/agent/alerts/rules/") && request.method === "DELETE") {
+      if (!isRequestAuthorized(request, env, "trade")) {
+        return unauthorizedResponse();
+      }
+
+      const ruleId = decodeURIComponent(url.pathname.slice("/agent/alerts/rules/".length));
+      if (!ruleId || ruleId.includes("/")) {
+        return jsonResponse({ ok: false, error: "rule_id is required" }, 400);
+      }
+
+      const db = createD1Client(env.DB);
+      try {
+        const existing = await getAlertRuleById(db, ruleId);
+        if (!existing) {
+          return jsonResponse({ ok: false, error: "Alert rule not found" }, 404);
+        }
+        await deleteAlertRule(db, ruleId);
+        return jsonResponse({ ok: true, data: { deleted: true, rule_id: ruleId } });
+      } catch (error) {
+        if (isMissingAlertsSchemaError(error)) {
+          return jsonResponse({ ok: false, error: ALERTS_SCHEMA_HINT }, 503);
+        }
+        return jsonResponse({ ok: false, error: getErrorMessage(error) }, 500);
+      }
+    }
+
+    if (url.pathname === "/agent/alerts/history" && request.method === "GET") {
+      return withRouteTelemetry({ route: "/agent/alerts/history", method: request.method }, async () => {
+        if (!isRequestAuthorized(request, env, "read")) {
+          return unauthorizedResponse();
+        }
+
+        const db = createD1Client(env.DB);
+        const ruleId = url.searchParams.get("rule_id") ?? undefined;
+        const severityRaw = url.searchParams.get("severity");
+        const severity =
+          severityRaw === "info" || severityRaw === "warning" || severityRaw === "critical" ? severityRaw : undefined;
+        const acknowledgedRaw = url.searchParams.get("acknowledged");
+        const acknowledged =
+          acknowledgedRaw === "true" || acknowledgedRaw === "1"
+            ? true
+            : acknowledgedRaw === "false" || acknowledgedRaw === "0"
+              ? false
+              : undefined;
+        const since = url.searchParams.get("since") ?? undefined;
+        const until = url.searchParams.get("until") ?? undefined;
+        const limit = parsePositiveInt(url.searchParams.get("limit"), 100, 500);
+        const offsetRaw = Number.parseInt(url.searchParams.get("offset") ?? "0", 10);
+        const offset = Number.isFinite(offsetRaw) && offsetRaw >= 0 ? offsetRaw : 0;
+
+        try {
+          const events = await listAlertEvents(db, {
+            rule_id: ruleId,
+            severity,
+            acknowledged,
+            since,
+            until,
+            limit,
+            offset,
+          });
+          return jsonResponse({ ok: true, data: { events } });
+        } catch (error) {
+          if (isMissingAlertsSchemaError(error)) {
+            return jsonResponse({
+              ok: true,
+              data: { events: [] },
+              warning: ALERTS_SCHEMA_HINT,
+            });
+          }
+          return jsonResponse({ ok: false, error: getErrorMessage(error) }, 500);
+        }
+      });
+    }
+
+    if (
+      url.pathname.startsWith("/agent/alerts/history/") &&
+      url.pathname.endsWith("/ack") &&
+      request.method === "POST"
+    ) {
+      if (!isRequestAuthorized(request, env, "trade")) {
+        return unauthorizedResponse();
+      }
+
+      const eventId = decodeURIComponent(url.pathname.slice("/agent/alerts/history/".length, -"/ack".length));
+      if (!eventId) {
+        return jsonResponse({ ok: false, error: "event_id is required" }, 400);
+      }
+
+      type AckBody = { acknowledged_by?: string };
+      let body: AckBody = {};
+      try {
+        body = (await request.json()) as AckBody;
+      } catch {
+        body = {};
+      }
+
+      const db = createD1Client(env.DB);
+      try {
+        const event = await acknowledgeAlertEvent(db, eventId, body.acknowledged_by ?? null);
+        if (!event) {
+          return jsonResponse({ ok: false, error: "Alert event not found" }, 404);
+        }
+        return jsonResponse({ ok: true, data: { event } });
+      } catch (error) {
+        if (isMissingAlertsSchemaError(error)) {
+          return jsonResponse({ ok: false, error: ALERTS_SCHEMA_HINT }, 503);
+        }
+        return jsonResponse({ ok: false, error: getErrorMessage(error) }, 500);
+      }
+    }
+
     if (url.pathname.startsWith("/agent")) {
       const stub = getHarnessStub(env);
       const agentPath = url.pathname.replace("/agent", "") || "/status";
@@ -488,133 +813,141 @@ export default {
     }
 
     if (url.pathname === "/swarm/health") {
-      if (!isRequestAuthorized(request, env, "read")) {
-        return unauthorizedResponse();
-      }
-      const registry = getRegistryStub(env);
-      const [healthRes, queueRes] = await Promise.all([
-        registry.fetch("http://registry/health"),
-        registry.fetch("http://registry/queue/state"),
-      ]);
+      return withRouteTelemetry({ route: "/swarm/health", method: request.method }, async () => {
+        if (!isRequestAuthorized(request, env, "read")) {
+          return unauthorizedResponse();
+        }
+        const registry = getRegistryStub(env);
+        const [healthRes, queueRes] = await Promise.all([
+          registry.fetch("http://registry/health"),
+          registry.fetch("http://registry/queue/state"),
+        ]);
 
-      if (!healthRes.ok || !queueRes.ok) {
+        if (!healthRes.ok || !queueRes.ok) {
+          return new Response(
+            JSON.stringify({
+              healthy: false,
+              error: "Unable to load swarm health",
+              registryStatus: healthRes.status,
+              queueStatus: queueRes.status,
+              telemetry: workerTelemetry.snapshot(),
+            }),
+            {
+              status: 503,
+              headers: { "Content-Type": "application/json" },
+            }
+          );
+        }
+
+        const health = (await healthRes.json()) as {
+          healthy?: boolean;
+        };
+        const queue = (await queueRes.json()) as {
+          deadLettered?: number;
+          staleAgents?: number;
+        };
+        const deadLettered = Number.isFinite(queue.deadLettered) ? Number(queue.deadLettered) : 0;
+        const staleAgents = Number.isFinite(queue.staleAgents) ? Number(queue.staleAgents) : 0;
+
         return new Response(
           JSON.stringify({
-            healthy: false,
-            error: "Unable to load swarm health",
-            registryStatus: healthRes.status,
-            queueStatus: queueRes.status,
+            healthy: Boolean(health.healthy),
+            degraded: deadLettered > 0 || staleAgents > 0,
+            deadLettered,
+            staleAgents,
+            registry: health,
+            queue,
+            timestamp: new Date().toISOString(),
+            telemetry: workerTelemetry.snapshot(),
           }),
           {
-            status: 503,
             headers: { "Content-Type": "application/json" },
           }
         );
-      }
-
-      const health = (await healthRes.json()) as {
-        healthy?: boolean;
-      };
-      const queue = (await queueRes.json()) as {
-        deadLettered?: number;
-        staleAgents?: number;
-      };
-      const deadLettered = Number.isFinite(queue.deadLettered) ? Number(queue.deadLettered) : 0;
-      const staleAgents = Number.isFinite(queue.staleAgents) ? Number(queue.staleAgents) : 0;
-
-      return new Response(
-        JSON.stringify({
-          healthy: Boolean(health.healthy),
-          degraded: deadLettered > 0 || staleAgents > 0,
-          deadLettered,
-          staleAgents,
-          registry: health,
-          queue,
-          timestamp: new Date().toISOString(),
-        }),
-        {
-          headers: { "Content-Type": "application/json" },
-        }
-      );
+      });
     }
 
     if (url.pathname === "/swarm/metrics") {
-      if (!isRequestAuthorized(request, env, "read")) {
-        return unauthorizedResponse();
-      }
-      const registry = getRegistryStub(env);
-      const [agentsRes, queueRes] = await Promise.all([
-        registry.fetch("http://registry/agents"),
-        registry.fetch("http://registry/queue/state"),
-      ]);
+      return withRouteTelemetry({ route: "/swarm/metrics", method: request.method }, async () => {
+        if (!isRequestAuthorized(request, env, "read")) {
+          return unauthorizedResponse();
+        }
+        const registry = getRegistryStub(env);
+        const [agentsRes, queueRes] = await Promise.all([
+          registry.fetch("http://registry/agents"),
+          registry.fetch("http://registry/queue/state"),
+        ]);
 
-      if (!agentsRes.ok || !queueRes.ok) {
+        if (!agentsRes.ok || !queueRes.ok) {
+          return new Response(
+            JSON.stringify({
+              error: "Unable to load swarm metrics",
+              registryAgentsStatus: agentsRes.status,
+              queueStatus: queueRes.status,
+              telemetry: workerTelemetry.snapshot(),
+            }),
+            {
+              status: 503,
+              headers: { "Content-Type": "application/json" },
+            }
+          );
+        }
+
+        const now = Date.now();
+        const staleThresholdMs = 300_000;
+        const agents = (await agentsRes.json()) as Record<
+          string,
+          {
+            id?: string;
+            type?: string;
+            status?: string;
+            lastHeartbeat?: number;
+          }
+        >;
+        const queue = (await queueRes.json()) as {
+          queued?: number;
+          deadLettered?: number;
+          stats?: Record<string, number>;
+          routingState?: Record<string, number>;
+          staleAgents?: number;
+        };
+
+        const byType: Record<string, number> = {};
+        const byStatus: Record<string, number> = {};
+        let staleComputed = 0;
+
+        for (const agent of Object.values(agents)) {
+          const type = agent.type ?? "unknown";
+          const status = agent.status ?? "unknown";
+          byType[type] = (byType[type] ?? 0) + 1;
+          byStatus[status] = (byStatus[status] ?? 0) + 1;
+          if (typeof agent.lastHeartbeat === "number" && now - agent.lastHeartbeat > staleThresholdMs) {
+            staleComputed += 1;
+          }
+        }
+
         return new Response(
           JSON.stringify({
-            error: "Unable to load swarm metrics",
-            registryAgentsStatus: agentsRes.status,
-            queueStatus: queueRes.status,
+            timestamp: new Date().toISOString(),
+            agents: {
+              total: Object.keys(agents).length,
+              byType,
+              byStatus,
+              stale: Number.isFinite(queue.staleAgents) ? Number(queue.staleAgents) : staleComputed,
+            },
+            queue: {
+              queued: Number.isFinite(queue.queued) ? Number(queue.queued) : 0,
+              deadLettered: Number.isFinite(queue.deadLettered) ? Number(queue.deadLettered) : 0,
+              stats: queue.stats ?? {},
+              routingState: queue.routingState ?? {},
+            },
+            telemetry: workerTelemetry.snapshot(),
           }),
           {
-            status: 503,
             headers: { "Content-Type": "application/json" },
           }
         );
-      }
-
-      const now = Date.now();
-      const staleThresholdMs = 300_000;
-      const agents = (await agentsRes.json()) as Record<
-        string,
-        {
-          id?: string;
-          type?: string;
-          status?: string;
-          lastHeartbeat?: number;
-        }
-      >;
-      const queue = (await queueRes.json()) as {
-        queued?: number;
-        deadLettered?: number;
-        stats?: Record<string, number>;
-        routingState?: Record<string, number>;
-        staleAgents?: number;
-      };
-
-      const byType: Record<string, number> = {};
-      const byStatus: Record<string, number> = {};
-      let staleComputed = 0;
-
-      for (const agent of Object.values(agents)) {
-        const type = agent.type ?? "unknown";
-        const status = agent.status ?? "unknown";
-        byType[type] = (byType[type] ?? 0) + 1;
-        byStatus[status] = (byStatus[status] ?? 0) + 1;
-        if (typeof agent.lastHeartbeat === "number" && now - agent.lastHeartbeat > staleThresholdMs) {
-          staleComputed += 1;
-        }
-      }
-
-      return new Response(
-        JSON.stringify({
-          timestamp: new Date().toISOString(),
-          agents: {
-            total: Object.keys(agents).length,
-            byType,
-            byStatus,
-            stale: Number.isFinite(queue.staleAgents) ? Number(queue.staleAgents) : staleComputed,
-          },
-          queue: {
-            queued: Number.isFinite(queue.queued) ? Number(queue.queued) : 0,
-            deadLettered: Number.isFinite(queue.deadLettered) ? Number(queue.deadLettered) : 0,
-            stats: queue.stats ?? {},
-            routingState: queue.routingState ?? {},
-          },
-        }),
-        {
-          headers: { "Content-Type": "application/json" },
-        }
-      );
+      });
     }
 
     if (url.pathname === "/swarm/queue") {

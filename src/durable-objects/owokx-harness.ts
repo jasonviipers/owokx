@@ -45,6 +45,7 @@ import {
   periodWindowMs,
   timeframeBucketMs,
 } from "../lib/portfolio-history";
+import { createTelemetry, type TelemetryTags } from "../lib/telemetry";
 import { getDefaultPolicyConfig } from "../policy/config";
 import { type BrokerProviders, createBrokerProviders } from "../providers/broker-factory";
 import { createLLMProvider } from "../providers/llm/factory";
@@ -1174,6 +1175,7 @@ function detectSentiment(text: string): number {
 export class OwokxHarness extends DurableObject<Env> {
   private state: AgentState = { ...DEFAULT_STATE };
   private _llm: LLMProvider | null = null;
+  private readonly telemetry = createTelemetry("owokx_harness");
   private readonly harnessContext: HarnessContext<AgentState>;
   private readonly signalService: SignalService;
   private readonly researchService: ResearchService<ResearchResult>;
@@ -1507,9 +1509,15 @@ export class OwokxHarness extends DurableObject<Env> {
   }
 
   async alarm(): Promise<void> {
+    const alarmTags: TelemetryTags = { loop: "main" };
+    this.telemetry.increment("alarm_runs_total", 1, alarmTags);
+    const stopAlarmTimer = this.telemetry.startTimer("alarm_latency_ms", alarmTags);
+
     if (!this.state.enabled) {
+      this.telemetry.increment("alarm_skipped_total", 1, { reason: "disabled" });
       this.log("System", "alarm_skipped", { reason: "Agent not enabled" });
       await this.persist();
+      stopAlarmTimer();
       return;
     }
 
@@ -1526,6 +1534,7 @@ export class OwokxHarness extends DurableObject<Env> {
       // 1. Check Kill Switch (Task 3)
       const isKillSwitchActive = await this.checkKillSwitch();
       if (isKillSwitchActive) {
+        this.telemetry.increment("alarm_skipped_total", 1, { reason: "kill_switch" });
         this.log("System", "alarm_skipped", { reason: "Kill switch active" });
         return;
       }
@@ -1544,6 +1553,7 @@ export class OwokxHarness extends DurableObject<Env> {
             this.lastSwarmBypassLogAt = nowMs;
           }
         } else {
+          this.telemetry.increment("alarm_skipped_total", 1, { reason: "swarm_unhealthy" });
           this.log("System", "alarm_skipped", { reason: "Swarm unhealthy (quorum not met)" });
           return;
         }
@@ -1559,12 +1569,22 @@ export class OwokxHarness extends DurableObject<Env> {
       const clock = await broker.trading.getClock();
 
       if (now - this.state.lastDataGatherRun >= dataPollIntervalMs) {
-        await this.signalService.runDataGatherers();
+        const stopStage = this.telemetry.startTimer("alarm_stage_latency_ms", { stage: "data_gather" });
+        try {
+          await this.signalService.runDataGatherers();
+        } finally {
+          stopStage();
+        }
         this.state.lastDataGatherRun = now;
       }
 
       if (now - this.state.lastResearchRun >= researchIntervalMs) {
-        await this.researchService.researchTopSignals(5);
+        const stopStage = this.telemetry.startTimer("alarm_stage_latency_ms", { stage: "research" });
+        try {
+          await this.researchService.researchTopSignals(5);
+        } finally {
+          stopStage();
+        }
         this.state.lastResearchRun = now;
       }
 
@@ -1594,7 +1614,12 @@ export class OwokxHarness extends DurableObject<Env> {
 
         if (now - this.state.lastAnalystRun >= analystIntervalMs) {
           const analystStart = Date.now();
-          await this.runAnalyst();
+          const stopStage = this.telemetry.startTimer("alarm_stage_latency_ms", { stage: "analyst" });
+          try {
+            await this.runAnalyst();
+          } finally {
+            stopStage();
+          }
           this.recordPerformanceSample("analyst", Date.now() - analystStart, false);
           this.state.lastAnalystRun = now;
         }
@@ -1636,11 +1661,13 @@ export class OwokxHarness extends DurableObject<Env> {
       }
     } catch (error) {
       this.log("System", "alarm_error", { error: String(error) });
+      this.telemetry.increment("alarm_errors_total", 1, { stage: "main" });
       this.recordPerformanceSample("analyst", this.state.optimization.analystLatencyEmaMs || 1_000, true);
     } finally {
       this.pruneMemoryEpisodes();
       await this.persist();
       await this.scheduleNextAlarm();
+      stopAlarmTimer();
     }
   }
 
@@ -1690,7 +1717,13 @@ export class OwokxHarness extends DurableObject<Env> {
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
-    const action = url.pathname.slice(1);
+    const action = url.pathname.slice(1) || "root";
+    const telemetryTags: TelemetryTags = {
+      action,
+      method: request.method.toUpperCase(),
+    };
+    this.telemetry.increment("http_requests_total", 1, telemetryTags);
+    const stopRequestTimer = this.telemetry.startTimer("http_request_latency_ms", telemetryTags);
 
     const readActions = [
       "status",
@@ -1714,89 +1747,110 @@ export class OwokxHarness extends DurableObject<Env> {
       requiredScope = request.method === "POST" ? "trade" : "read";
     }
 
-    if (requiredScope) {
-      if (!this.isAuthorized(request, requiredScope)) {
-        return this.unauthorizedResponse();
-      }
-    }
-
+    let response: Response;
     try {
-      switch (action) {
-        case "status":
-          return this.handleStatus();
-
-        case "setup/status":
-          return this.handleSetupStatus(request);
-
-        case "config":
-          if (request.method === "POST") {
-            return this.handleUpdateConfig(request);
-          }
-          return this.jsonResponse({ ok: true, data: this.state.config });
-
-        case "enable":
-          return this.handleEnable();
-
-        case "disable":
-          return this.handleDisable();
-
-        case "reset":
-          return this.handleReset();
-
-        case "logs":
-          return this.handleGetLogs(url);
-
-        case "costs":
-          return this.jsonResponse({ costs: this.state.costTracker });
-
-        case "signals":
-          return this.jsonResponse({ signals: this.state.signalCache });
-
-        case "history":
-          return this.handleGetHistory(url);
-
-        case "metrics":
-          return this.handleMetrics();
-
-        case "regime":
-          return this.jsonResponse({ regime: this.state.marketRegime, risk_profile: this.state.lastRiskProfile });
-
-        case "prediction":
-          return this.jsonResponse({
-            predictive_model: this.state.predictiveModel,
-            top_symbol_stats: Object.entries(this.state.predictiveModel.perSymbol)
-              .sort((a, b) => (b[1]?.samples || 0) - (a[1]?.samples || 0))
-              .slice(0, 20)
-              .reduce<Record<string, unknown>>((acc, [symbol, stats]) => {
-                acc[symbol] = stats;
-                return acc;
-              }, {}),
-          });
-
-        case "stress-test":
-          return this.handleStressTest();
-
-        case "trigger":
-          await this.alarm();
-          return this.jsonResponse({ ok: true, message: "Alarm triggered" });
-
-        case "kill":
-          if (!this.isKillSwitchAuthorized(request)) {
-            return new Response(
-              JSON.stringify({ error: "Forbidden. Requires: Authorization: Bearer <KILL_SWITCH_SECRET>" }),
-              { status: 403, headers: { "Content-Type": "application/json" } }
-            );
-          }
-          return this.handleKillSwitch();
-
-        default:
-          return new Response("Not found", { status: 404 });
+      if (requiredScope && !this.isAuthorized(request, requiredScope)) {
+        response = this.unauthorizedResponse();
+      } else {
+        response = await this.handleActionRequest(action, request, url);
       }
     } catch (error) {
-      return new Response(JSON.stringify({ error: String(error) }), {
+      response = new Response(JSON.stringify({ error: String(error) }), {
         status: 500,
         headers: { "Content-Type": "application/json" },
       });
+    }
+
+    const status = response.status;
+    this.telemetry.increment("http_responses_total", 1, { ...telemetryTags, status });
+    if (status >= 400) {
+      this.telemetry.increment("http_errors_total", 1, { ...telemetryTags, status });
+    }
+    stopRequestTimer();
+
+    return response;
+  }
+
+  private async handleActionRequest(action: string, request: Request, url: URL): Promise<Response> {
+    switch (action) {
+      case "status":
+        return this.handleStatus();
+
+      case "setup/status":
+        return this.handleSetupStatus(request);
+
+      case "config":
+        if (request.method === "POST") {
+          return this.handleUpdateConfig(request);
+        }
+        return this.jsonResponse({ ok: true, data: this.state.config });
+
+      case "enable":
+        return this.handleEnable();
+
+      case "disable":
+        return this.handleDisable();
+
+      case "reset":
+        return this.handleReset();
+
+      case "logs":
+        return this.handleGetLogs(url);
+
+      case "costs":
+        return this.jsonResponse({ costs: this.state.costTracker });
+
+      case "signals":
+        return this.jsonResponse({ signals: this.state.signalCache });
+
+      case "history":
+        return this.handleGetHistory(url);
+
+      case "metrics":
+        return this.handleMetrics();
+
+      case "regime":
+        return this.jsonResponse({ regime: this.state.marketRegime, risk_profile: this.state.lastRiskProfile });
+
+      case "prediction":
+        return this.jsonResponse({
+          predictive_model: this.state.predictiveModel,
+          top_symbol_stats: Object.entries(this.state.predictiveModel.perSymbol)
+            .sort((a, b) => (b[1]?.samples || 0) - (a[1]?.samples || 0))
+            .slice(0, 20)
+            .reduce<Record<string, unknown>>((acc, [symbol, stats]) => {
+              acc[symbol] = stats;
+              return acc;
+            }, {}),
+        });
+
+      case "stress-test":
+        return this.handleStressTest();
+
+      case "trigger":
+        if (request.method !== "POST") {
+          return this.jsonResponse(
+            { ok: false, error: "Method not allowed. Use POST to trigger alarm execution." },
+            { status: 405, headers: { Allow: "POST" } }
+          );
+        }
+        await this.alarm();
+        return this.jsonResponse({ ok: true, message: "Alarm triggered" });
+
+      case "kill":
+        if (!this.isKillSwitchAuthorized(request)) {
+          return new Response(
+            JSON.stringify({ error: "Forbidden. Requires: Authorization: Bearer <KILL_SWITCH_SECRET>" }),
+            {
+              status: 403,
+              headers: { "Content-Type": "application/json" },
+            }
+          );
+        }
+        return this.handleKillSwitch();
+
+      default:
+        return new Response("Not found", { status: 404 });
     }
   }
 
@@ -1917,6 +1971,7 @@ export class OwokxHarness extends DurableObject<Env> {
         swarm_role_health: this.state.swarmRoleHealth,
         swarm_role_sync_at: this.state.lastSwarmRoleSyncAt || null,
         now_ms: now,
+        telemetry: this.telemetry.snapshot(),
       },
     });
   }
@@ -7648,6 +7703,10 @@ Response format:
     this.state.costTracker.calls++;
     this.state.costTracker.tokens_in += safeTokensIn;
     this.state.costTracker.tokens_out += safeTokensOut;
+    this.telemetry.increment("llm_calls_total", 1, { model: normalizedModel });
+    this.telemetry.increment("llm_tokens_in_total", safeTokensIn, { model: normalizedModel });
+    this.telemetry.increment("llm_tokens_out_total", safeTokensOut, { model: normalizedModel });
+    this.telemetry.increment("llm_cost_usd_total", cost, { model: normalizedModel });
 
     return cost;
   }
@@ -7769,9 +7828,19 @@ Response format:
     );
   }
 
-  private jsonResponse(data: unknown): Response {
+  private jsonResponse(
+    data: unknown,
+    options?: {
+      status?: number;
+      headers?: HeadersInit;
+    }
+  ): Response {
     return new Response(JSON.stringify(data, null, 2), {
-      headers: { "Content-Type": "application/json" },
+      status: options?.status,
+      headers: {
+        "Content-Type": "application/json",
+        ...(options?.headers ?? {}),
+      },
     });
   }
 

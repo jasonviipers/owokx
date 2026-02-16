@@ -222,12 +222,20 @@ describe("OwokxHarness route regression", () => {
       data: {
         logs_total: number;
         llm: Record<string, unknown>;
+        telemetry: {
+          scope: string;
+          counters: Record<string, unknown>;
+          timers: Record<string, unknown>;
+        };
       };
     };
     expect(metricsResponse.ok).toBe(true);
     expect(metricsPayload.ok).toBe(true);
     expect(typeof metricsPayload.data.logs_total).toBe("number");
     expect(typeof metricsPayload.data.llm).toBe("object");
+    expect(metricsPayload.data.telemetry.scope).toBe("owokx_harness");
+    expect(typeof metricsPayload.data.telemetry.counters).toBe("object");
+    expect(typeof metricsPayload.data.telemetry.timers).toBe("object");
   });
 
   it("routes trigger to alarm execution when trade auth is present", async () => {
@@ -246,5 +254,24 @@ describe("OwokxHarness route regression", () => {
     expect(payload.ok).toBe(true);
     expect(payload.message).toBe("Alarm triggered");
     expect(alarmSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects non-POST trigger requests with 405 and Allow header", async () => {
+    const { ctx, waitForInit } = createContext("harness-routes-trigger-method");
+    const harness = new OwokxHarness(ctx, createEnv());
+    await waitForInit();
+
+    const alarmSpy = vi.spyOn(harness, "alarm").mockResolvedValue();
+    const response = await doFetch(harness, "/trigger", {
+      method: "GET",
+      headers: { Authorization: "Bearer token" },
+    });
+    const payload = (await response.json()) as { ok: boolean; error?: string };
+
+    expect(response.status).toBe(405);
+    expect(response.headers.get("Allow")).toBe("POST");
+    expect(payload.ok).toBe(false);
+    expect(payload.error).toContain("Method not allowed");
+    expect(alarmSpy).not.toHaveBeenCalled();
   });
 });

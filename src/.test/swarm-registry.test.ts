@@ -130,9 +130,14 @@ describe("SwarmRegistry", () => {
     expect(pollData.messages[0]?.source).toBe("scout-1");
 
     const queueStateRes = await doFetch(registry, "http://registry/queue/state", { method: "GET" });
-    const queueState = (await queueStateRes.json()) as { queued: number; stats: { delivered: number } };
+    const queueState = (await queueStateRes.json()) as {
+      queued: number;
+      stats: { delivered: number };
+      telemetry: { scope: string };
+    };
     expect(queueState.queued).toBe(0);
     expect(queueState.stats.delivered).toBe(1);
+    expect(queueState.telemetry.scope).toBe("swarm_registry");
   });
 
   it("dispatches queued messages to registered active agents", async () => {

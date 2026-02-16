@@ -1,9 +1,13 @@
+import { createAlertNotifier } from "../alerts/notifier";
+import { type AlertRuleThresholds, evaluateAlertRules } from "../alerts/rules";
 import type { Env } from "../env.d";
+import { parseNumber } from "../lib/utils";
 import { getDefaultPolicyConfig } from "../policy/config";
 import { persistBacktestRunArtifacts } from "../providers/backtest";
 import { createBrokerProviders } from "../providers/broker-factory";
 import { createSECEdgarProvider } from "../providers/news/sec-edgar";
 import { createD1Client } from "../storage/d1/client";
+import { listAlertRules, recordAlertEventsBatch } from "../storage/d1/queries/alerts";
 import { cleanupExpiredApprovals } from "../storage/d1/queries/approvals";
 import { insertRawEvent, rawEventExists } from "../storage/d1/queries/events";
 import { getSubmittedOrderSubmissionsMissingTrades } from "../storage/d1/queries/order-submissions";
@@ -142,6 +146,12 @@ async function runMidnightReset(env: Env): Promise<void> {
   }
 }
 
+/**
+ * Format a Date as a New York–time date string in YYYY-MM-DD format.
+ *
+ * @param d - The Date to format in the America/New_York timezone
+ * @returns The formatted date string in `YYYY-MM-DD` (en-CA) form
+ */
 function nyDateString(d: Date): string {
   return new Intl.DateTimeFormat("en-CA", {
     timeZone: "America/New_York",
@@ -151,6 +161,215 @@ function nyDateString(d: Date): string {
   }).format(d);
 }
 
+interface SwarmQueueStateSnapshot {
+  deadLettered: number;
+  queued: number;
+  staleAgents: number;
+}
+
+interface HarnessLlmSnapshot {
+  last_auth_error: {
+    at?: number;
+    message?: string;
+  } | null;
+}
+
+function isMissingAlertsSchemaError(error: unknown): boolean {
+  const message = String(error).toLowerCase();
+  return message.includes("no such table") && (message.includes("alert_rules") || message.includes("alert_events"));
+}
+
+function toAlertThresholds(env: Env): Partial<AlertRuleThresholds> {
+  return {
+    drawdownWarnRatio: parseNumber(env.ALERT_DRAWDOWN_WARN_RATIO, 0.8),
+    deadLetterWarn: parseNumber(env.ALERT_DLQ_WARN_THRESHOLD, 1),
+    deadLetterCritical: parseNumber(env.ALERT_DLQ_CRITICAL_THRESHOLD, 10),
+    llmAuthFailureWindowMs: parseNumber(env.ALERT_LLM_AUTH_WINDOW_SECONDS, 900) * 1000,
+  };
+}
+
+/**
+ * Retrieves the swarm queue state snapshot from the configured swarm registry.
+ *
+ * @returns The snapshot with counts for `deadLettered`, `queued`, and `staleAgents`, or `null` if no registry is configured, the request fails, or the response is missing/invalid.
+ */
+async function fetchSwarmQueueState(env: Env): Promise<SwarmQueueStateSnapshot | null> {
+  if (!env.SWARM_REGISTRY) return null;
+
+  try {
+    const registryId = env.SWARM_REGISTRY.idFromName("default");
+    const registry = env.SWARM_REGISTRY.get(registryId);
+    const response = await registry.fetch("http://registry/queue/state");
+    if (!response.ok) return null;
+
+    const payload = (await response.json()) as {
+      deadLettered?: number;
+      queued?: number;
+      staleAgents?: number;
+    };
+
+    return {
+      deadLettered: Number.isFinite(payload.deadLettered) ? Number(payload.deadLettered) : 0,
+      queued: Number.isFinite(payload.queued) ? Number(payload.queued) : 0,
+      staleAgents: Number.isFinite(payload.staleAgents) ? Number(payload.staleAgents) : 0,
+    };
+  } catch (error) {
+    console.error("[alerts] swarm_queue_fetch_failed", String(error));
+    return null;
+  }
+}
+
+/**
+ * Fetches the latest LLM authentication error snapshot from the configured Harness service.
+ *
+ * @returns A `HarnessLlmSnapshot` containing `last_auth_error` (with optional `at` timestamp and `message`), or `null` if the Harness is not configured or the snapshot could not be retrieved.
+ */
+async function fetchHarnessLlmSnapshot(env: Env): Promise<HarnessLlmSnapshot | null> {
+  if (!env.OWOKX_HARNESS) return null;
+
+  try {
+    const harnessId = env.OWOKX_HARNESS.idFromName("main");
+    const harness = env.OWOKX_HARNESS.get(harnessId);
+    const token = env.OWOKX_API_TOKEN_READONLY || env.OWOKX_API_TOKEN;
+    const response = await harness.fetch(
+      new Request("http://harness/metrics", {
+        method: "GET",
+        headers: {
+          Authorization: `Bearer ${token}`,
+        },
+      })
+    );
+    if (!response.ok) return null;
+
+    const payload = (await response.json()) as {
+      data?: {
+        llm?: {
+          last_auth_error?: {
+            at?: number;
+            message?: string;
+          } | null;
+        };
+      };
+    };
+
+    return {
+      last_auth_error: payload.data?.llm?.last_auth_error ?? null,
+    };
+  } catch (error) {
+    console.error("[alerts] harness_metrics_fetch_failed", String(error));
+    return null;
+  }
+}
+
+/**
+ * Evaluate alert rules using the current account, risk state, and policy configuration, and dispatch any generated alerts.
+ *
+ * This function fetches external telemetry (swarm queue state and harness LLM snapshot), evaluates configured alert rules against
+ * the provided account and risk state, and, if any alerts are produced, sends notifications and logs a dispatch summary.
+ *
+ * @param env - Runtime environment bindings and configuration used to fetch external state and create the alert notifier
+ * @param input - Current runtime inputs for evaluation:
+ *   - `account`: current account snapshot (uses `equity`)
+ *   - `riskState`: current risk system state (kill switch, daily equity start, drawdown metrics)
+ *   - `policyConfig`: policy-derived thresholds used by alert rules
+ */
+async function runAlertEvaluations(
+  db: ReturnType<typeof createD1Client>,
+  env: Env,
+  input: {
+    account: { equity: number };
+    riskState: {
+      kill_switch_active: boolean;
+      kill_switch_reason: string | null;
+      kill_switch_at: string | null;
+      daily_equity_start: number | null;
+      max_portfolio_drawdown_pct: number;
+    };
+    policyConfig: {
+      max_portfolio_drawdown_pct: number;
+    };
+  }
+): Promise<void> {
+  const [swarm, llm] = await Promise.all([fetchSwarmQueueState(env), fetchHarnessLlmSnapshot(env)]);
+  const evaluatedAlerts = evaluateAlertRules({
+    environment: env.ENVIRONMENT,
+    account: input.account,
+    riskState: input.riskState,
+    policyConfig: input.policyConfig,
+    swarm,
+    llm,
+    thresholds: toAlertThresholds(env),
+  });
+
+  let alerts = evaluatedAlerts;
+  try {
+    const managedRules = await listAlertRules(db);
+    const ruleMap = new Map(managedRules.map((rule) => [rule.id, rule]));
+    alerts = evaluatedAlerts.flatMap((alert) => {
+      const managedRule = ruleMap.get(alert.rule);
+      if (!managedRule || !managedRule.enabled) {
+        return [];
+      }
+
+      const severityOverride = managedRule.config?.severity_override;
+      const finalSeverity =
+        severityOverride === "info" || severityOverride === "warning" || severityOverride === "critical"
+          ? severityOverride
+          : alert.severity;
+
+      return [{ ...alert, severity: finalSeverity }];
+    });
+
+    if (alerts.length > 0) {
+      await recordAlertEventsBatch(
+        db,
+        alerts.map((alert) => ({
+          id: alert.id,
+          rule_id: alert.rule,
+          severity: alert.severity,
+          title: alert.title,
+          message: alert.message,
+          fingerprint: alert.fingerprint,
+          details: alert.details,
+          occurred_at: alert.occurred_at,
+        }))
+      );
+    }
+  } catch (error) {
+    if (!isMissingAlertsSchemaError(error)) {
+      console.warn("[alerts] persistence_failed", String(error));
+    }
+  }
+
+  if (alerts.length === 0) return;
+
+  try {
+    const notifier = createAlertNotifier(env);
+    const result = await notifier.notify(alerts);
+
+    console.log(
+      "[alerts] dispatch_result",
+      JSON.stringify({
+        attempted_rules: alerts.length,
+        ...result,
+      })
+    );
+  } catch (error) {
+    console.error(
+      "[alerts] dispatch_failed",
+      JSON.stringify({
+        attempted_rules: alerts.length,
+        error: String(error),
+      })
+    );
+  }
+}
+
+/**
+ * Performs hourly maintenance: refreshes risk and account state, updates daily-loss tracking, evaluates and dispatches alerts, backfills missing trades, and persists a live hourly snapshot.
+ *
+ * @param env - Environment bindings and configuration used to create the database and broker clients, derive policy defaults, and persist artifacts
+ */
 async function runHourlyCacheRefresh(env: Env): Promise<void> {
   console.log("Running hourly cache refresh...");
   const db = createD1Client(env.DB);
@@ -211,6 +430,21 @@ async function runHourlyCacheRefresh(env: Env): Promise<void> {
       } else {
         await setDailyLossAbsolute(db, dailyLossUsd);
       }
+    }
+
+    try {
+      await runAlertEvaluations(db, env, {
+        account,
+        riskState,
+        policyConfig,
+      });
+    } catch (error) {
+      console.error("[alerts] hourly_evaluation_failed", {
+        error: String(error),
+        account_id: account.id,
+        account_number: account.account_number,
+        broker: broker.broker,
+      });
     }
 
     const missingTrades = await getSubmittedOrderSubmissionsMissingTrades(db, 100);
