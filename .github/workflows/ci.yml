@@ -139,6 +139,10 @@ jobs:
             echo "::error::Missing CLOUDFLARE_API_TOKEN secret for staging environment."
             exit 1
           fi
+          if ! npx wrangler whoami; then
+            echo "::error::CLOUDFLARE_API_TOKEN is invalid or missing required permissions for deploy."
+            exit 1
+          fi
 
       - name: Deploy to Cloudflare
-        run: pnpm run deploy -- --env=""
+        run: npx wrangler deploy --config wrangler.jsonc --env ""
