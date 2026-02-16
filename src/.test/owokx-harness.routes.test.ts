@@ -255,4 +255,23 @@ describe("OwokxHarness route regression", () => {
     expect(payload.message).toBe("Alarm triggered");
     expect(alarmSpy).toHaveBeenCalledTimes(1);
   });
+
+  it("rejects non-POST trigger requests with 405 and Allow header", async () => {
+    const { ctx, waitForInit } = createContext("harness-routes-trigger-method");
+    const harness = new OwokxHarness(ctx, createEnv());
+    await waitForInit();
+
+    const alarmSpy = vi.spyOn(harness, "alarm").mockResolvedValue();
+    const response = await doFetch(harness, "/trigger", {
+      method: "GET",
+      headers: { Authorization: "Bearer token" },
+    });
+    const payload = (await response.json()) as { ok: boolean; error?: string };
+
+    expect(response.status).toBe(405);
+    expect(response.headers.get("Allow")).toBe("POST");
+    expect(payload.ok).toBe(false);
+    expect(payload.error).toContain("Method not allowed");
+    expect(alarmSpy).not.toHaveBeenCalled();
+  });
 });

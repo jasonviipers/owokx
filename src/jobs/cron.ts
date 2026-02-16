@@ -389,11 +389,20 @@ async function runHourlyCacheRefresh(env: Env): Promise<void> {
       }
     }
 
-    await runAlertEvaluations(db, env, {
-      account,
-      riskState,
-      policyConfig,
-    });
+    try {
+      await runAlertEvaluations(db, env, {
+        account,
+        riskState,
+        policyConfig,
+      });
+    } catch (error) {
+      console.error("[alerts] hourly_evaluation_failed", {
+        error: String(error),
+        account_id: account.id,
+        account_number: account.account_number,
+        broker: broker.broker,
+      });
+    }
 
     const missingTrades = await getSubmittedOrderSubmissionsMissingTrades(db, 100);
     if (missingTrades.length > 0) {

@@ -29,4 +29,13 @@ describe("telemetry", () => {
     expect(metric?.by_dimension["route=/a"]?.count).toBe(2);
     expect(metric?.by_dimension["route=/b"]?.avg_ms).toBe(40);
   });
+
+  it("skips timer recording for non-finite durations", () => {
+    const telemetry = createTelemetry("test_scope");
+    telemetry.recordDuration("latency_ms", Number.NaN, { route: "/a" });
+    telemetry.recordDuration("latency_ms", Number.POSITIVE_INFINITY, { route: "/a" });
+
+    const snapshot = telemetry.snapshot();
+    expect(snapshot.timers.latency_ms).toBeUndefined();
+  });
 });

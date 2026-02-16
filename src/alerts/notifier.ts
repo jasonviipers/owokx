@@ -15,10 +15,29 @@ interface AlertNotifierConfig {
 }
 
 export interface AlertDispatchSummary {
+  /**
+   * Number of alert objects processed by `notify`.
+   */
   attempted: number;
+  /**
+   * Number of successful channel sends.
+   * This is channel-level, not alert-level: one alert can increment this once per enabled channel.
+   */
   sent: number;
+  /**
+   * Number of alerts skipped because their fingerprint was already sent in the dedupe window.
+   * This is alert-level.
+   */
   deduped: number;
+  /**
+   * Number of channel attempts skipped due to rate limiting.
+   * This is channel-level, not alert-level.
+   */
   rate_limited: number;
+  /**
+   * Number of failed channel send attempts.
+   * This is channel-level, not alert-level.
+   */
   failed: number;
 }
 
@@ -233,6 +252,8 @@ export function createAlertNotifier(env: Env): AlertNotifier {
 
         let sentForAlert = false;
 
+        // Intentionally fan out each alert to all enabled channels via sendViaChannel.
+        // `sent`, `rate_limited`, and `failed` are channel-attempt counters (not per-alert counters).
         for (const channel of channels) {
           const nowMs = Date.now();
           const canSend = await canSendForRateLimit(
@@ -267,6 +288,7 @@ export function createAlertNotifier(env: Env): AlertNotifier {
           }
         }
 
+        // Deduplication is alert-level and only applied after at least one channel accepted the alert.
         if (sentForAlert) {
           await markDuplicate(env.CACHE, alert.fingerprint, config.dedupeWindowSeconds);
         }

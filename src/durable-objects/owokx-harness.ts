@@ -1828,6 +1828,12 @@ export class OwokxHarness extends DurableObject<Env> {
         return this.handleStressTest();
 
       case "trigger":
+        if (request.method !== "POST") {
+          return this.jsonResponse(
+            { ok: false, error: "Method not allowed. Use POST to trigger alarm execution." },
+            { status: 405, headers: { Allow: "POST" } }
+          );
+        }
         await this.alarm();
         return this.jsonResponse({ ok: true, message: "Alarm triggered" });
 
@@ -7822,9 +7828,19 @@ Response format:
     );
   }
 
-  private jsonResponse(data: unknown): Response {
+  private jsonResponse(
+    data: unknown,
+    options?: {
+      status?: number;
+      headers?: HeadersInit;
+    }
+  ): Response {
     return new Response(JSON.stringify(data, null, 2), {
-      headers: { "Content-Type": "application/json" },
+      status: options?.status,
+      headers: {
+        "Content-Type": "application/json",
+        ...(options?.headers ?? {}),
+      },
     });
   }
 

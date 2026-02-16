@@ -107,7 +107,11 @@ export class TelemetryRegistry {
   }
 
   recordDuration(timerName: string, durationMs: number, tags?: TelemetryTags): number {
-    const safeDurationMs = Number.isFinite(durationMs) ? Math.max(0, Number(durationMs)) : 0;
+    if (!Number.isFinite(durationMs)) {
+      return durationMs;
+    }
+
+    const safeDurationMs = Math.max(0, Number(durationMs));
     const dimension = normalizeDimension(tags);
     const bucket = this.getTimerBucket(timerName);
     this.applyDuration(bucket.overall, safeDurationMs);
