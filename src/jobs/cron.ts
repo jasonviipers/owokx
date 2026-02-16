@@ -343,16 +343,26 @@ async function runAlertEvaluations(
 
   if (alerts.length === 0) return;
 
-  const notifier = createAlertNotifier(env);
-  const result = await notifier.notify(alerts);
+  try {
+    const notifier = createAlertNotifier(env);
+    const result = await notifier.notify(alerts);
 
-  console.log(
-    "[alerts] dispatch_result",
-    JSON.stringify({
-      attempted_rules: alerts.length,
-      ...result,
-    })
-  );
+    console.log(
+      "[alerts] dispatch_result",
+      JSON.stringify({
+        attempted_rules: alerts.length,
+        ...result,
+      })
+    );
+  } catch (error) {
+    console.error(
+      "[alerts] dispatch_failed",
+      JSON.stringify({
+        attempted_rules: alerts.length,
+        error: String(error),
+      })
+    );
+  }
 }
 
 /**

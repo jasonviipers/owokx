@@ -482,9 +482,9 @@ export default function App() {
         if (!cancelled) {
           setActiveAlerts(alerts)
         }
-      } catch {
+      } catch (error) {
         if (!cancelled) {
-          setActiveAlerts([])
+          console.warn('[alerts] load_active_failed', String(error))
         }
       }
     }

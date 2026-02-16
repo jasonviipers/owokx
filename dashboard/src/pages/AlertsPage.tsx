@@ -189,7 +189,7 @@ export function AlertsPage({ enabled = true, compact = false }: AlertsPageProps)
       <Panel title='ALERT MANAGEMENT' titleRight={`${rules.length} rules / ${openAlerts} open`} className={compact ? 'h-auto' : 'h-[520px]'}>
         <div className='h-full flex flex-col gap-3'>
           <div className='flex flex-wrap items-center gap-2'>
-            <button className='hud-button' onClick={() => void loadData()} disabled={loading}>
+            <button type='button' className='hud-button' onClick={() => void loadData()} disabled={loading}>
               {loading ? 'Refreshing...' : 'Refresh'}
             </button>
             <select
@@ -246,7 +246,7 @@ export function AlertsPage({ enabled = true, compact = false }: AlertsPageProps)
                     Enabled
                   </label>
                 </div>
-                <button className='hud-button w-full' onClick={() => void handleCreateRule()} disabled={creating || !newRuleTitle.trim()}>
+                <button type='button' className='hud-button w-full' onClick={() => void handleCreateRule()} disabled={creating || !newRuleTitle.trim()}>
                   {creating ? 'Creating...' : 'Create Rule'}
                 </button>
               </div>
@@ -262,7 +262,7 @@ export function AlertsPage({ enabled = true, compact = false }: AlertsPageProps)
                           <div className='text-sm text-hud-text truncate'>{rule.title}</div>
                           <div className='text-[11px] text-hud-text-dim truncate'>{rule.id}</div>
                         </div>
-                        <button className='hud-button' onClick={() => void handleToggleRule(rule)} disabled={busyRuleId === rule.id}>
+                        <button type='button' className='hud-button' onClick={() => void handleToggleRule(rule)} disabled={busyRuleId === rule.id}>
                           {rule.enabled ? 'Disable' : 'Enable'}
                         </button>
                       </div>
@@ -280,10 +280,10 @@ export function AlertsPage({ enabled = true, compact = false }: AlertsPageProps)
                           <option value='critical'>critical</option>
                         </select>
                         <div className='flex gap-1'>
-                          <button className='hud-button' onClick={() => void handleAcknowledgeRule(rule.id)}>
+                          <button type='button' className='hud-button' onClick={() => void handleAcknowledgeRule(rule.id)}>
                             Ack Open
                           </button>
-                          <button className='hud-button' onClick={() => void handleDeleteRule(rule.id)} disabled={busyRuleId === rule.id}>
+                          <button type='button' className='hud-button' onClick={() => void handleDeleteRule(rule.id)} disabled={busyRuleId === rule.id}>
                             Delete
                           </button>
                         </div>
@@ -320,7 +320,7 @@ export function AlertsPage({ enabled = true, compact = false }: AlertsPageProps)
                         {event.acknowledged_at ? (
                           <span className='text-[11px] text-hud-success'>ACK</span>
                         ) : (
-                          <button className='hud-button' onClick={() => void handleAcknowledgeEvent(event.id)}>
+                          <button type='button' className='hud-button' onClick={() => void handleAcknowledgeEvent(event.id)}>
                             Ack
                           </button>
                         )}
