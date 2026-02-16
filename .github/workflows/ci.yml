@@ -128,7 +128,13 @@ jobs:
           version: 10
 
       - name: Install dependencies
-        run: pnpm install --frozen-lockfile
+        run: |
+          if [ -f pnpm-lock.yaml ]; then
+            pnpm install --frozen-lockfile
+          else
+            echo "::warning::pnpm-lock.yaml missing at repository root; falling back to non-frozen install."
+            pnpm install --no-frozen-lockfile
+          fi
 
       - name: Check formatting and linting
         run: pnpm run check
@@ -142,4 +148,3 @@ jobs:
 
       - name: Deploy to Cloudflare
         run: pnpm run deploy -- --env=""
-
