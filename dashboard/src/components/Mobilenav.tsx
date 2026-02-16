@@ -1,8 +1,8 @@
 import clsx from 'clsx'
 
 interface MobileNavProps {
-  view: 'overview' | 'positions' | 'activity' | 'signals' | 'lab'
-  onViewChange: (view: 'overview' | 'positions' | 'activity' | 'signals' | 'lab') => void
+  view: 'overview' | 'positions' | 'activity' | 'signals' | 'lab' | 'alerts'
+  onViewChange: (view: 'overview' | 'positions' | 'activity' | 'signals' | 'lab' | 'alerts') => void
 }
 
 export function MobileNav({ view, onViewChange }: MobileNavProps) {
@@ -12,6 +12,7 @@ export function MobileNav({ view, onViewChange }: MobileNavProps) {
     { id: 'activity' as const, label: 'Activity', icon: 'ACT' },
     { id: 'signals' as const, label: 'Signals', icon: 'SIG' },
     { id: 'lab' as const, label: 'Lab', icon: 'LAB' },
+    { id: 'alerts' as const, label: 'Alerts', icon: 'ALR' },
   ]
 
   return (

@@ -22,6 +22,14 @@ import { extractFinancialData, isAllowedDomain, scrapeUrl } from "../providers/s
 import { computeTechnicals, detectSignals, type Signal, type TechnicalIndicators } from "../providers/technicals";
 import type { LLMProvider, OptionsProvider } from "../providers/types";
 import { createD1Client, type D1Client } from "../storage/d1/client";
+import {
+  acknowledgeAlertEvent,
+  acknowledgeAlertEventsByRule,
+  deleteAlertRule,
+  listAlertEvents,
+  listAlertRules,
+  upsertAlertRule,
+} from "../storage/d1/queries/alerts";
 import { createDecisionTrace, getDecisionTraceById, listDecisionTraces } from "../storage/d1/queries/decisions";
 import {
   insertNewsItem,
@@ -79,6 +87,7 @@ export class OwokxMcpAgent extends McpAgent<Env> {
     this.registerPositionTools(db, broker);
     this.registerOrderTools(db, broker);
     this.registerRiskTools(db, broker);
+    this.registerAlertTools(db);
     this.registerMemoryTools(db);
     this.registerMarketDataTools(db, broker);
     this.registerTechnicalTools(db, broker);
@@ -1055,6 +1064,212 @@ export class OwokxMcpAgent extends McpAgent<Env> {
     );
   }
 
+  private registerAlertTools(db: D1Client) {
+    this.typedServer.tool(
+      "alerts-rules-list",
+      "List managed alert rules and their current enabled/severity/config state",
+      {
+        include_disabled: z.boolean().default(true),
+        limit: z.number().min(1).max(500).default(200),
+        offset: z.number().min(0).default(0),
+      },
+      async ({ include_disabled, limit, offset }) => {
+        try {
+          const rules = await listAlertRules(db, { include_disabled, limit, offset });
+          return {
+            content: [
+              { type: "text" as const, text: JSON.stringify(success({ count: rules.length, rules }), null, 2) },
+            ],
+          };
+        } catch (error) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: JSON.stringify(failure({ code: ErrorCode.INTERNAL_ERROR, message: String(error) }), null, 2),
+              },
+            ],
+            isError: true,
+          };
+        }
+      }
+    );
+
+    this.typedServer.tool(
+      "alerts-rule-upsert",
+      "Create or update an alert rule used by cron alert evaluation and dashboard management",
+      {
+        id: z.string().min(1).optional(),
+        title: z.string().min(1),
+        description: z.string().optional(),
+        enabled: z.boolean().optional(),
+        default_severity: z.enum(["info", "warning", "critical"]).optional(),
+        config: z.record(z.string(), z.unknown()).optional(),
+      },
+      async ({ id, title, description, enabled, default_severity, config }) => {
+        try {
+          const rule = await upsertAlertRule(db, {
+            id,
+            title,
+            description,
+            enabled,
+            default_severity,
+            config,
+          });
+          return { content: [{ type: "text" as const, text: JSON.stringify(success({ rule }), null, 2) }] };
+        } catch (error) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: JSON.stringify(failure({ code: ErrorCode.INTERNAL_ERROR, message: String(error) }), null, 2),
+              },
+            ],
+            isError: true,
+          };
+        }
+      }
+    );
+
+    this.typedServer.tool(
+      "alerts-rule-delete",
+      "Delete an alert rule from managed rule configuration",
+      { id: z.string().min(1) },
+      async ({ id }) => {
+        try {
+          await deleteAlertRule(db, id);
+          return {
+            content: [{ type: "text" as const, text: JSON.stringify(success({ deleted: true, id }), null, 2) }],
+          };
+        } catch (error) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: JSON.stringify(failure({ code: ErrorCode.INTERNAL_ERROR, message: String(error) }), null, 2),
+              },
+            ],
+            isError: true,
+          };
+        }
+      }
+    );
+
+    this.typedServer.tool(
+      "alerts-history-list",
+      "List alert history/events with severity and acknowledgment filters",
+      {
+        rule_id: z.string().optional(),
+        severity: z.enum(["info", "warning", "critical"]).optional(),
+        acknowledged: z.boolean().optional(),
+        since: z.string().optional(),
+        until: z.string().optional(),
+        limit: z.number().min(1).max(500).default(100),
+        offset: z.number().min(0).default(0),
+      },
+      async ({ rule_id, severity, acknowledged, since, until, limit, offset }) => {
+        try {
+          const events = await listAlertEvents(db, {
+            rule_id,
+            severity,
+            acknowledged,
+            since,
+            until,
+            limit,
+            offset,
+          });
+          return {
+            content: [
+              { type: "text" as const, text: JSON.stringify(success({ count: events.length, events }), null, 2) },
+            ],
+          };
+        } catch (error) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: JSON.stringify(failure({ code: ErrorCode.INTERNAL_ERROR, message: String(error) }), null, 2),
+              },
+            ],
+            isError: true,
+          };
+        }
+      }
+    );
+
+    this.typedServer.tool(
+      "alerts-history-ack",
+      "Acknowledge a single alert event by id",
+      {
+        id: z.string().min(1),
+        acknowledged_by: z.string().optional(),
+      },
+      async ({ id, acknowledged_by }) => {
+        try {
+          const event = await acknowledgeAlertEvent(db, id, acknowledged_by ?? null);
+          if (!event) {
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: JSON.stringify(
+                    failure({ code: ErrorCode.NOT_FOUND, message: "Alert event not found" }),
+                    null,
+                    2
+                  ),
+                },
+              ],
+              isError: true,
+            };
+          }
+          return { content: [{ type: "text" as const, text: JSON.stringify(success({ event }), null, 2) }] };
+        } catch (error) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: JSON.stringify(failure({ code: ErrorCode.INTERNAL_ERROR, message: String(error) }), null, 2),
+              },
+            ],
+            isError: true,
+          };
+        }
+      }
+    );
+
+    this.typedServer.tool(
+      "alerts-rule-ack",
+      "Acknowledge all unacknowledged alert events for a specific rule id",
+      {
+        rule_id: z.string().min(1),
+        acknowledged_by: z.string().optional(),
+      },
+      async ({ rule_id, acknowledged_by }) => {
+        try {
+          const acknowledged = await acknowledgeAlertEventsByRule(db, rule_id, acknowledged_by ?? null);
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: JSON.stringify(success({ rule_id, acknowledged }), null, 2),
+              },
+            ],
+          };
+        } catch (error) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: JSON.stringify(failure({ code: ErrorCode.INTERNAL_ERROR, message: String(error) }), null, 2),
+              },
+            ],
+            isError: true,
+          };
+        }
+      }
+    );
+  }
+
   private registerUtilityTools(db: D1Client) {
     this.typedServer.tool("help-usage", "Get help information about using Okx", {}, async () => {
       const result = success({
@@ -1157,6 +1372,17 @@ export class OwokxMcpAgent extends McpAgent<Env> {
         { category: "Positions", tools: ["positions-list", "positions-close"] },
         { category: "Orders", tools: ["orders-preview", "orders-submit", "orders-list", "orders-cancel"] },
         { category: "Risk", tools: ["risk-status", "kill-switch-enable", "kill-switch-disable"] },
+        {
+          category: "Alerts",
+          tools: [
+            "alerts-rules-list",
+            "alerts-rule-upsert",
+            "alerts-rule-delete",
+            "alerts-history-list",
+            "alerts-history-ack",
+            "alerts-rule-ack",
+          ],
+        },
         {
           category: "Memory",
           tools: [

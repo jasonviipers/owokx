@@ -289,6 +289,33 @@ export interface ExperimentRunDetails {
   metrics: ExperimentMetric[]
 }
 
+export type AlertSeverity = 'info' | 'warning' | 'critical'
+
+export interface AlertRule {
+  id: string
+  title: string
+  description: string
+  enabled: boolean
+  default_severity: AlertSeverity
+  config: Record<string, unknown>
+  created_at: string
+  updated_at: string
+}
+
+export interface AlertHistoryEvent {
+  id: string
+  rule_id: string
+  severity: AlertSeverity
+  title: string
+  message: string
+  fingerprint: string
+  details: Record<string, unknown>
+  occurred_at: string
+  acknowledged_at: string | null
+  acknowledged_by: string | null
+  created_at: string
+}
+
 export interface AgentStatus {
   id: string
   type: string

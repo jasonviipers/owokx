@@ -9,18 +9,21 @@ import { LineChart, Sparkline } from './components/LineChart'
 import { NotificationBell } from './components/NotificationBell'
 import { Tooltip, TooltipContent } from './components/Tooltip'
 import { AgentControls } from './components/AgentControls'
-import type { Config, LogEntry, Signal, Position, SignalResearch, PortfolioSnapshot } from './types'
+import type { AlertHistoryEvent, Config, LogEntry, Signal, Position, SignalResearch, PortfolioSnapshot } from './types'
 import { MobileNav } from './components/Mobilenav'
 import { ErrorBoundary } from './components/ErrorBoundary'
 import { OverviewPage } from './pages/OverviewPage'
 import { ExperimentsPage } from './pages/ExperimentsPage'
+import { AlertsPage } from './pages/AlertsPage'
 import { SettingsPage } from './pages/SettingsPage'
 import { SwarmPage } from './pages/SwarmPage'
 import { useAgentStatus } from './hooks/useAgentStatus'
 import { useLogs } from './hooks/useLogs'
 import { useSwarmMetrics } from './hooks/useSwarmMetrics'
 import {
+  acknowledgeAlertEvent,
   clearSessionToken,
+  fetchAlertHistory,
   fetchPortfolioHistory,
   fetchSetupStatus,
   resetAgent,
@@ -380,7 +383,8 @@ export default function App() {
   const [activitySeverityFilter, setActivitySeverityFilter] = useState<ActivitySeverityFilter>('all')
   const [activityTimeRangeFilter, setActivityTimeRangeFilter] = useState<ActivityTimeRange>('24h')
   const [activityExpandedRows, setActivityExpandedRows] = useState<Record<string, boolean>>({})
-  const [mobileView, setMobileView] = useState<'overview' | 'positions' | 'activity' | 'signals' | 'lab'>('overview')
+  const [mobileView, setMobileView] = useState<'overview' | 'positions' | 'activity' | 'signals' | 'lab' | 'alerts'>('overview')
+  const [activeAlerts, setActiveAlerts] = useState<AlertHistoryEvent[]>([])
 
   const statusPollingEnabled = setupChecked && !showSetup
   const { status, error, refresh: refreshStatus, setStatus } = useAgentStatus({
@@ -467,6 +471,47 @@ export default function App() {
     const historyInterval = setInterval(loadPortfolioHistory, 60000)
     return () => clearInterval(historyInterval)
   }, [statusPollingEnabled, portfolioPeriod])
+
+  useEffect(() => {
+    if (!statusPollingEnabled) return
+    let cancelled = false
+
+    const loadActiveAlerts = async () => {
+      try {
+        const alerts = await fetchAlertHistory({ acknowledged: false, limit: 25 })
+        if (!cancelled) {
+          setActiveAlerts(alerts)
+        }
+      } catch {
+        if (!cancelled) {
+          setActiveAlerts([])
+        }
+      }
+    }
+
+    void loadActiveAlerts()
+    const interval = setInterval(() => {
+      void loadActiveAlerts()
+    }, 15000)
+
+    return () => {
+      cancelled = true
+      clearInterval(interval)
+    }
+  }, [statusPollingEnabled])
+
+  const handleAcknowledgeNotificationAlert = useCallback(async (eventId: string) => {
+    try {
+      const event = await acknowledgeAlertEvent(eventId, 'dashboard-notification')
+      setActiveAlerts((previous) =>
+        previous
+          .map((item) => (item.id === event.id ? event : item))
+          .filter((item) => !item.acknowledged_at)
+      )
+    } catch {
+      // Bell acknowledge is best-effort; management panel handles retries.
+    }
+  }, [])
 
   const handleResetAgent = async () => {
     setAgentMessage(null)
@@ -799,6 +844,8 @@ export default function App() {
             <NotificationBell
               overnightActivity={status?.overnightActivity}
               premarketPlan={status?.premarketPlan}
+              alerts={activeAlerts}
+              onAcknowledgeAlert={handleAcknowledgeNotificationAlert}
             />
             <AgentControls
               enabled={agentEnabled}
@@ -830,6 +877,8 @@ export default function App() {
               <NotificationBell
                 overnightActivity={status?.overnightActivity}
                 premarketPlan={status?.premarketPlan}
+                alerts={activeAlerts}
+                onAcknowledgeAlert={handleAcknowledgeNotificationAlert}
               />
               <button
                 className="hud-label hover:text-hud-primary transition-colors text-xs"
@@ -1090,6 +1139,10 @@ export default function App() {
 
           <ErrorBoundary title="EXPERIMENTS PANEL ERROR">
             <ExperimentsPage enabled={statusPollingEnabled} />
+          </ErrorBoundary>
+
+          <ErrorBoundary title="ALERTS PANEL ERROR">
+            <AlertsPage enabled={statusPollingEnabled} />
           </ErrorBoundary>
 
           <div className="col-span-4 md:col-span-8 lg:col-span-12">
@@ -1595,6 +1648,10 @@ export default function App() {
 
           {mobileView === 'lab' && (
             <ExperimentsPage enabled={statusPollingEnabled} compact={true} />
+          )}
+
+          {mobileView === 'alerts' && (
+            <AlertsPage enabled={statusPollingEnabled} compact={true} />
           )}
 
           {mobileView === 'signals' && (
