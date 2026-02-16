@@ -129,6 +129,7 @@ describe("swarm monitoring routes", () => {
       degraded: boolean;
       deadLettered: number;
       staleAgents: number;
+      telemetry: { scope: string };
     };
 
     expect(response.ok).toBe(true);
@@ -136,6 +137,7 @@ describe("swarm monitoring routes", () => {
     expect(payload.degraded).toBe(true);
     expect(payload.deadLettered).toBe(1);
     expect(payload.staleAgents).toBe(1);
+    expect(payload.telemetry.scope).toBe("worker_index");
   });
 
   it("returns aggregated swarm metrics by type and status", async () => {
@@ -198,6 +200,10 @@ describe("swarm monitoring routes", () => {
         deadLettered: number;
         routingState: Record<string, number>;
       };
+      telemetry: {
+        scope: string;
+        counters: Record<string, unknown>;
+      };
     };
 
     expect(response.ok).toBe(true);
@@ -210,5 +216,7 @@ describe("swarm monitoring routes", () => {
     expect(payload.queue.queued).toBe(4);
     expect(payload.queue.deadLettered).toBe(1);
     expect(payload.queue.routingState.trader).toBe(1);
+    expect(payload.telemetry.scope).toBe("worker_index");
+    expect(typeof payload.telemetry.counters).toBe("object");
   });
 });

@@ -8,6 +8,7 @@ import {
   type QueuedMessage,
   type SwarmState,
 } from "../lib/agents/protocol";
+import { createTelemetry, type TelemetryTags } from "../lib/telemetry";
 
 interface RegistryState extends AgentBaseState, SwarmState {
   lastDispatchAt: number;
@@ -39,6 +40,7 @@ const REGISTRY_MAINTENANCE_INTERVAL_MS = 15_000;
 
 export class SwarmRegistry extends AgentBase<RegistryState> {
   protected agentType: AgentType = "registry";
+  private readonly telemetry = createTelemetry("swarm_registry");
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -113,194 +115,174 @@ export class SwarmRegistry extends AgentBase<RegistryState> {
 
   protected async handleCustomFetch(request: Request, url: URL): Promise<Response> {
     const path = url.pathname;
+    const telemetryTags: TelemetryTags = {
+      path,
+      method: request.method.toUpperCase(),
+    };
+    this.telemetry.increment("http_requests_total", 1, telemetryTags);
+    const stopTimer = this.telemetry.startTimer("http_request_latency_ms", telemetryTags);
 
-    if (path === "/register") {
-      const status = (await request.json()) as AgentStatus;
-      await this.handleRegister(status);
-      return new Response(JSON.stringify({ success: true }), {
-        headers: { "Content-Type": "application/json" },
-      });
-    }
-
-    if (path === "/agents") {
-      return new Response(JSON.stringify(this.state.agents), {
-        headers: { "Content-Type": "application/json" },
-      });
-    }
-
-    if (path === "/subscriptions" && request.method === "GET") {
-      const topic = url.searchParams.get("topic");
-      const subscriptions = topic ? { [topic]: this.state.subscriptions[topic] ?? [] } : this.state.subscriptions;
-      return new Response(JSON.stringify({ subscriptions }), {
-        headers: { "Content-Type": "application/json" },
-      });
-    }
-
-    if (path === "/subscriptions/subscribe" && request.method === "POST") {
-      const body = (await request.json()) as { agentId?: string; topic?: string };
-      if (!body.agentId || !body.topic) {
-        return new Response(JSON.stringify({ error: "agentId and topic are required" }), {
-          status: 400,
-          headers: { "Content-Type": "application/json" },
-        });
+    const respondJson = (payload: unknown, status = 200): Response => {
+      this.telemetry.increment("http_responses_total", 1, { ...telemetryTags, status });
+      if (status >= 400) {
+        this.telemetry.increment("http_errors_total", 1, { ...telemetryTags, status });
       }
-      const ok = await this.subscribeAgent(body.agentId, body.topic);
-      return new Response(JSON.stringify({ ok }), {
+      return new Response(JSON.stringify(payload), {
+        status,
         headers: { "Content-Type": "application/json" },
       });
-    }
+    };
 
-    if (path === "/subscriptions/unsubscribe" && request.method === "POST") {
-      const body = (await request.json()) as { agentId?: string; topic?: string };
-      if (!body.agentId || !body.topic) {
-        return new Response(JSON.stringify({ error: "agentId and topic are required" }), {
-          status: 400,
-          headers: { "Content-Type": "application/json" },
-        });
-      }
-      const ok = await this.unsubscribeAgent(body.agentId, body.topic);
-      return new Response(JSON.stringify({ ok }), {
-        headers: { "Content-Type": "application/json" },
-      });
-    }
-
-    if (path === "/queue/enqueue" && request.method === "POST") {
-      const body = (await request.json()) as {
-        message?: AgentMessage;
-        delayMs?: number;
-        maxAttempts?: number;
-      };
-      if (!body.message) {
-        return new Response(JSON.stringify({ error: "message is required" }), {
-          status: 400,
-          headers: { "Content-Type": "application/json" },
-        });
+    try {
+      if (path === "/register") {
+        const status = (await request.json()) as AgentStatus;
+        await this.handleRegister(status);
+        return respondJson({ success: true });
       }
 
-      const queued = await this.enqueueMessage(body.message, body.delayMs, body.maxAttempts);
-      return new Response(
-        JSON.stringify({
+      if (path === "/agents") {
+        return respondJson(this.state.agents);
+      }
+
+      if (path === "/subscriptions" && request.method === "GET") {
+        const topic = url.searchParams.get("topic");
+        const subscriptions = topic ? { [topic]: this.state.subscriptions[topic] ?? [] } : this.state.subscriptions;
+        return respondJson({ subscriptions });
+      }
+
+      if (path === "/subscriptions/subscribe" && request.method === "POST") {
+        const body = (await request.json()) as { agentId?: string; topic?: string };
+        if (!body.agentId || !body.topic) {
+          return respondJson({ error: "agentId and topic are required" }, 400);
+        }
+        const ok = await this.subscribeAgent(body.agentId, body.topic);
+        return respondJson({ ok });
+      }
+
+      if (path === "/subscriptions/unsubscribe" && request.method === "POST") {
+        const body = (await request.json()) as { agentId?: string; topic?: string };
+        if (!body.agentId || !body.topic) {
+          return respondJson({ error: "agentId and topic are required" }, 400);
+        }
+        const ok = await this.unsubscribeAgent(body.agentId, body.topic);
+        return respondJson({ ok });
+      }
+
+      if (path === "/queue/enqueue" && request.method === "POST") {
+        const body = (await request.json()) as {
+          message?: AgentMessage;
+          delayMs?: number;
+          maxAttempts?: number;
+        };
+        if (!body.message) {
+          return respondJson({ error: "message is required" }, 400);
+        }
+
+        const queued = await this.enqueueMessage(body.message, body.delayMs, body.maxAttempts);
+        return respondJson({
           ok: true,
           queueId: queued.queueId,
-        }),
-        {
-          headers: { "Content-Type": "application/json" },
+        });
+      }
+
+      if (path === "/queue/publish" && request.method === "POST") {
+        const body = (await request.json()) as {
+          source?: string;
+          topic?: string;
+          payload?: unknown;
+        };
+
+        const topic = String(body.topic ?? "");
+        if (!topic) {
+          return respondJson({ error: "topic is required" }, 400);
         }
-      );
-    }
 
-    if (path === "/queue/publish" && request.method === "POST") {
-      const body = (await request.json()) as {
-        source?: string;
-        topic?: string;
-        payload?: unknown;
-      };
-
-      const topic = String(body.topic ?? "");
-      if (!topic) {
-        return new Response(JSON.stringify({ error: "topic is required" }), {
-          status: 400,
-          headers: { "Content-Type": "application/json" },
-        });
+        const result = await this.publishTopic(body.source ?? "system", topic, body.payload);
+        return respondJson(result);
       }
 
-      const result = await this.publishTopic(body.source ?? "system", topic, body.payload);
-      return new Response(JSON.stringify(result), {
-        headers: { "Content-Type": "application/json" },
-      });
-    }
-
-    if (path === "/queue/poll" && request.method === "GET") {
-      const agentId = url.searchParams.get("agentId");
-      if (!agentId) {
-        return new Response(JSON.stringify({ error: "agentId is required" }), {
-          status: 400,
-          headers: { "Content-Type": "application/json" },
-        });
+      if (path === "/queue/poll" && request.method === "GET") {
+        const agentId = url.searchParams.get("agentId");
+        if (!agentId) {
+          return respondJson({ error: "agentId is required" }, 400);
+        }
+        const limit = Number.parseInt(url.searchParams.get("limit") ?? "20", 10);
+        const messages = await this.pollQueueForAgent(agentId, Number.isFinite(limit) ? limit : 20);
+        return respondJson({ messages });
       }
-      const limit = Number.parseInt(url.searchParams.get("limit") ?? "20", 10);
-      const messages = await this.pollQueueForAgent(agentId, Number.isFinite(limit) ? limit : 20);
-      return new Response(JSON.stringify({ messages }), {
-        headers: { "Content-Type": "application/json" },
-      });
-    }
 
-    if (path === "/queue/dispatch" && request.method === "POST") {
-      const body = (await request.json().catch(() => ({}))) as { limit?: number };
-      const limit = body.limit ?? 50;
-      const result = await this.dispatchQueue(Math.max(1, Math.min(limit, 200)));
-      return new Response(JSON.stringify(result), {
-        headers: { "Content-Type": "application/json" },
-      });
-    }
+      if (path === "/queue/dispatch" && request.method === "POST") {
+        const body = (await request.json().catch(() => ({}))) as { limit?: number };
+        const limit = body.limit ?? 50;
+        const result = await this.dispatchQueue(Math.max(1, Math.min(limit, 200)));
+        return respondJson(result);
+      }
 
-    if (path === "/queue/state" && request.method === "GET") {
-      return new Response(
-        JSON.stringify({
+      if (path === "/queue/state" && request.method === "GET") {
+        return respondJson({
           queued: this.state.queueOrder.length,
           deadLettered: Object.keys(this.state.deadLetterQueue).length,
           stats: this.state.deliveryStats,
           routingState: this.state.routingState,
           staleAgents: this.countStaleAgents(),
-        }),
-        {
-          headers: { "Content-Type": "application/json" },
-        }
-      );
-    }
-
-    if (path === "/routing/preview" && request.method === "GET") {
-      const type = url.searchParams.get("type");
-      if (!type) {
-        return new Response(JSON.stringify({ error: "type is required" }), {
-          status: 400,
-          headers: { "Content-Type": "application/json" },
+          telemetry: this.telemetry.snapshot(),
         });
       }
-      const count = Number.parseInt(url.searchParams.get("count") ?? "3", 10);
-      const preview = this.previewRouting(type as AgentType, Number.isFinite(count) ? count : 3);
-      return new Response(JSON.stringify(preview), {
-        headers: { "Content-Type": "application/json" },
-      });
-    }
 
-    if (path === "/recovery/requeue-dead-letter" && request.method === "POST") {
-      const body = (await request.json().catch(() => ({}))) as { limit?: number };
-      const limit = Number.isFinite(body.limit) ? Math.max(1, Math.min(Number(body.limit), 500)) : 50;
-      const result = await this.requeueDeadLetter(limit);
-      return new Response(JSON.stringify(result), {
-        headers: { "Content-Type": "application/json" },
-      });
-    }
+      if (path === "/routing/preview" && request.method === "GET") {
+        const type = url.searchParams.get("type");
+        if (!type) {
+          return respondJson({ error: "type is required" }, 400);
+        }
+        const count = Number.parseInt(url.searchParams.get("count") ?? "3", 10);
+        const preview = this.previewRouting(type as AgentType, Number.isFinite(count) ? count : 3);
+        return respondJson(preview);
+      }
 
-    if (path === "/recovery/prune-stale-agents" && request.method === "POST") {
-      const body = (await request.json().catch(() => ({}))) as { staleMs?: number };
-      const staleMs = Number.isFinite(body.staleMs) ? Math.max(60_000, Number(body.staleMs)) : HEARTBEAT_STALE_MS * 2;
-      const result = await this.pruneStaleAgents(staleMs);
-      return new Response(JSON.stringify(result), {
-        headers: { "Content-Type": "application/json" },
-      });
-    }
+      if (path === "/recovery/requeue-dead-letter" && request.method === "POST") {
+        const body = (await request.json().catch(() => ({}))) as { limit?: number };
+        const limit = Number.isFinite(body.limit) ? Math.max(1, Math.min(Number(body.limit), 500)) : 50;
+        const result = await this.requeueDeadLetter(limit);
+        return respondJson(result);
+      }
 
-    if (path === "/health") {
-      const activeAgents = Object.values(this.state.agents).filter(
-        (a) => Date.now() - a.lastHeartbeat < HEARTBEAT_STALE_MS
-      ).length;
-      return new Response(
-        JSON.stringify({
+      if (path === "/recovery/prune-stale-agents" && request.method === "POST") {
+        const body = (await request.json().catch(() => ({}))) as { staleMs?: number };
+        const staleMs =
+          Number.isFinite(body.staleMs) && body.staleMs !== undefined
+            ? Math.max(60_000, Number(body.staleMs))
+            : HEARTBEAT_STALE_MS * 2;
+        const result = await this.pruneStaleAgents(staleMs);
+        return respondJson(result);
+      }
+
+      if (path === "/health") {
+        const activeAgents = Object.values(this.state.agents).filter(
+          (a) => Date.now() - a.lastHeartbeat < HEARTBEAT_STALE_MS
+        ).length;
+        return respondJson({
           healthy: true,
           active_agents: activeAgents,
           total_agents: Object.keys(this.state.agents).length,
           queue_depth: this.state.queueOrder.length,
           dead_letter_depth: Object.keys(this.state.deadLetterQueue).length,
-        }),
-        {
-          headers: { "Content-Type": "application/json" },
-        }
-      );
-    }
+          telemetry: this.telemetry.snapshot(),
+        });
+      }
 
-    return super.handleCustomFetch(request, url);
+      const fallback = await super.handleCustomFetch(request, url);
+      const fallbackStatus = fallback.status;
+      this.telemetry.increment("http_responses_total", 1, { ...telemetryTags, status: fallbackStatus });
+      if (fallbackStatus >= 400) {
+        this.telemetry.increment("http_errors_total", 1, { ...telemetryTags, status: fallbackStatus });
+      }
+      return fallback;
+    } catch (error) {
+      this.telemetry.increment("http_errors_total", 1, { ...telemetryTags, status: 500 });
+      throw error;
+    } finally {
+      stopTimer();
+    }
   }
 
   private async handleRegister(status: AgentStatus): Promise<void> {
@@ -314,6 +296,10 @@ export class SwarmRegistry extends AgentBase<RegistryState> {
       this.state.routingState[status.type] = 0;
     }
     await this.saveState();
+    this.telemetry.increment("agents_registered_total", 1, {
+      type: status.type,
+      status: status.status,
+    });
     this.log("info", `Registered agent: ${status.type} (${status.id})`);
   }
 
@@ -325,8 +311,12 @@ export class SwarmRegistry extends AgentBase<RegistryState> {
       this.state.agents[agentId].lastHeartbeat = Date.now();
       this.state.agents[agentId].status = payload?.status ?? "active";
       await this.saveState();
+      this.telemetry.increment("heartbeat_success_total", 1, {
+        status: this.state.agents[agentId].status,
+      });
       return { success: true };
     }
+    this.telemetry.increment("heartbeat_missing_agent_total", 1);
     return { success: false };
   }
 
@@ -336,6 +326,7 @@ export class SwarmRegistry extends AgentBase<RegistryState> {
     if (!current.includes(agentId)) {
       this.state.subscriptions[topic] = [...current, agentId];
       await this.saveState();
+      this.telemetry.increment("subscriptions_added_total", 1, { topic });
     }
     return true;
   }
@@ -348,155 +339,193 @@ export class SwarmRegistry extends AgentBase<RegistryState> {
       delete this.state.subscriptions[topic];
     }
     await this.saveState();
+    this.telemetry.increment("subscriptions_removed_total", 1, { topic });
     return true;
   }
 
   private async enqueueMessage(message: AgentMessage, delayMs = 0, maxAttempts = 3): Promise<QueuedMessage> {
-    if (!this.isValidMessage(message)) {
-      throw new Error("Invalid message payload");
+    const stopTimer = this.telemetry.startTimer("enqueue_latency_ms");
+    try {
+      if (!this.isValidMessage(message)) {
+        this.telemetry.increment("enqueue_invalid_total", 1);
+        throw new Error("Invalid message payload");
+      }
+
+      const routedMessage = this.resolveMessageTarget(message);
+
+      const queueId = createMessageId("queue");
+      const queued: QueuedMessage = {
+        queueId,
+        message: routedMessage,
+        enqueuedAt: Date.now(),
+        availableAt: Date.now() + Math.max(0, delayMs),
+        attempts: 0,
+        maxAttempts: Math.max(1, maxAttempts),
+        status: "pending",
+      };
+
+      this.state.queue[queueId] = queued;
+      this.state.queueOrder.push(queueId);
+      this.state.deliveryStats.enqueued += 1;
+      await this.saveState();
+      const targetType = this.parseTargetAgentType(routedMessage.target);
+      this.telemetry.increment("queue_enqueued_total", 1, {
+        topic: routedMessage.topic,
+        target_type: targetType ?? "direct",
+      });
+      return queued;
+    } finally {
+      stopTimer();
     }
-
-    const routedMessage = this.resolveMessageTarget(message);
-
-    const queueId = createMessageId("queue");
-    const queued: QueuedMessage = {
-      queueId,
-      message: routedMessage,
-      enqueuedAt: Date.now(),
-      availableAt: Date.now() + Math.max(0, delayMs),
-      attempts: 0,
-      maxAttempts: Math.max(1, maxAttempts),
-      status: "pending",
-    };
-
-    this.state.queue[queueId] = queued;
-    this.state.queueOrder.push(queueId);
-    this.state.deliveryStats.enqueued += 1;
-    await this.saveState();
-    return queued;
   }
 
   private async publishTopic(source: string, topic: string, payload: unknown): Promise<{ enqueued: number }> {
+    const stopTimer = this.telemetry.startTimer("publish_latency_ms", { topic });
     const subscribers = this.state.subscriptions[topic] ?? [];
     let enqueued = 0;
 
-    for (const target of subscribers) {
-      const message: AgentMessage = {
-        id: createMessageId("event"),
-        source,
-        target,
-        type: "EVENT",
-        topic,
-        payload,
-        timestamp: Date.now(),
-      };
-      await this.enqueueMessage(message);
-      enqueued += 1;
-    }
+    try {
+      for (const target of subscribers) {
+        const message: AgentMessage = {
+          id: createMessageId("event"),
+          source,
+          target,
+          type: "EVENT",
+          topic,
+          payload,
+          timestamp: Date.now(),
+        };
+        await this.enqueueMessage(message);
+        enqueued += 1;
+      }
 
-    return { enqueued };
+      this.telemetry.increment("publish_events_total", 1, { topic });
+      this.telemetry.increment("publish_fanout_total", enqueued, { topic });
+      return { enqueued };
+    } finally {
+      stopTimer();
+    }
   }
 
   private async pollQueueForAgent(agentId: string, limit: number): Promise<AgentMessage[]> {
+    const stopTimer = this.telemetry.startTimer("poll_latency_ms");
     const now = Date.now();
     const safeLimit = Math.max(1, Math.min(limit, 100));
     const messages: AgentMessage[] = [];
     const queueIdsToRemove: string[] = [];
 
-    for (const queueId of this.state.queueOrder) {
-      if (messages.length >= safeLimit) break;
-      const queued = this.state.queue[queueId];
-      if (!queued) continue;
-      if (queued.message.target !== agentId) continue;
-      if (queued.availableAt > now) continue;
-      if (this.isExpired(queued)) {
-        await this.moveToDeadLetter(queued, "Message expired before poll");
+    try {
+      for (const queueId of this.state.queueOrder) {
+        if (messages.length >= safeLimit) break;
+        const queued = this.state.queue[queueId];
+        if (!queued) continue;
+        if (queued.message.target !== agentId) continue;
+        if (queued.availableAt > now) continue;
+        if (this.isExpired(queued)) {
+          await this.moveToDeadLetter(queued, "Message expired before poll");
+          queueIdsToRemove.push(queueId);
+          continue;
+        }
+
+        messages.push(queued.message);
         queueIdsToRemove.push(queueId);
-        continue;
+        this.state.deliveryStats.delivered += 1;
       }
 
-      messages.push(queued.message);
-      queueIdsToRemove.push(queueId);
-      this.state.deliveryStats.delivered += 1;
-    }
+      if (queueIdsToRemove.length > 0) {
+        this.removeQueuedMessages(queueIdsToRemove);
+        await this.saveState();
+      }
 
-    if (queueIdsToRemove.length > 0) {
-      this.removeQueuedMessages(queueIdsToRemove);
-      await this.saveState();
+      this.telemetry.increment("poll_calls_total", 1);
+      this.telemetry.increment("poll_messages_total", messages.length);
+      return messages;
+    } finally {
+      stopTimer();
     }
-
-    return messages;
   }
 
   private async dispatchQueue(limit: number): Promise<{ delivered: number; failed: number; pending: number }> {
+    const stopTimer = this.telemetry.startTimer("dispatch_latency_ms");
     const now = Date.now();
     let delivered = 0;
     let failed = 0;
     const queueIdsToRemove: string[] = [];
     const safeLimit = Math.max(1, Math.min(limit, 200));
 
-    for (const queueId of this.state.queueOrder) {
-      if (delivered + failed >= safeLimit) break;
-      const queued = this.state.queue[queueId];
-      if (!queued) continue;
-      if (queued.availableAt > now) continue;
+    try {
+      for (const queueId of this.state.queueOrder) {
+        if (delivered + failed >= safeLimit) break;
+        const queued = this.state.queue[queueId];
+        if (!queued) continue;
+        if (queued.availableAt > now) continue;
 
-      if (this.isExpired(queued)) {
-        await this.moveToDeadLetter(queued, "Message expired before dispatch");
-        queueIdsToRemove.push(queueId);
-        failed += 1;
-        continue;
-      }
+        if (this.isExpired(queued)) {
+          await this.moveToDeadLetter(queued, "Message expired before dispatch");
+          queueIdsToRemove.push(queueId);
+          failed += 1;
+          continue;
+        }
 
-      const resolvedMessage = this.resolveMessageTarget(queued.message, true);
-      queued.message = resolvedMessage;
-      const targetStatus = this.state.agents[queued.message.target];
-      if (!targetStatus) {
-        this.bumpRetry(queued, "Target agent is not registered");
+        const resolvedMessage = this.resolveMessageTarget(queued.message, true);
+        queued.message = resolvedMessage;
+        const targetStatus = this.state.agents[queued.message.target];
+        if (!targetStatus) {
+          this.bumpRetry(queued, "Target agent is not registered");
+          failed += 1;
+          if (queued.attempts >= queued.maxAttempts) {
+            await this.moveToDeadLetter(queued, queued.lastError ?? "Target agent unavailable");
+            queueIdsToRemove.push(queueId);
+          }
+          continue;
+        }
+
+        if (Date.now() - targetStatus.lastHeartbeat > HEARTBEAT_STALE_MS) {
+          continue;
+        }
+
+        const deliveredNow = await this.tryDeliver(queued, targetStatus.type);
+        if (deliveredNow) {
+          queueIdsToRemove.push(queueId);
+          delivered += 1;
+          continue;
+        }
+
+        this.bumpRetry(queued, "Dispatch to target failed");
         failed += 1;
+
         if (queued.attempts >= queued.maxAttempts) {
-          await this.moveToDeadLetter(queued, queued.lastError ?? "Target agent unavailable");
+          await this.moveToDeadLetter(queued, queued.lastError ?? "Max retry attempts exceeded");
           queueIdsToRemove.push(queueId);
         }
-        continue;
       }
 
-      if (Date.now() - targetStatus.lastHeartbeat > HEARTBEAT_STALE_MS) {
-        continue;
+      this.state.lastDispatchAt = Date.now();
+      if (queueIdsToRemove.length > 0) {
+        this.removeQueuedMessages(queueIdsToRemove);
       }
+      await this.saveState();
 
-      const deliveredNow = await this.tryDeliver(queued, targetStatus.type);
-      if (deliveredNow) {
-        queueIdsToRemove.push(queueId);
-        delivered += 1;
-        continue;
-      }
+      this.telemetry.increment("dispatch_runs_total", 1);
+      this.telemetry.increment("dispatch_delivered_total", delivered);
+      this.telemetry.increment("dispatch_failed_total", failed);
 
-      this.bumpRetry(queued, "Dispatch to target failed");
-      failed += 1;
-
-      if (queued.attempts >= queued.maxAttempts) {
-        await this.moveToDeadLetter(queued, queued.lastError ?? "Max retry attempts exceeded");
-        queueIdsToRemove.push(queueId);
-      }
+      return {
+        delivered,
+        failed,
+        pending: this.state.queueOrder.length,
+      };
+    } finally {
+      stopTimer();
     }
-
-    this.state.lastDispatchAt = Date.now();
-    if (queueIdsToRemove.length > 0) {
-      this.removeQueuedMessages(queueIdsToRemove);
-    }
-    await this.saveState();
-
-    return {
-      delivered,
-      failed,
-      pending: this.state.queueOrder.length,
-    };
   }
 
   private async tryDeliver(queued: QueuedMessage, agentType: AgentType): Promise<boolean> {
+    const stopTimer = this.telemetry.startTimer("delivery_latency_ms", { agent_type: agentType });
     const namespace = this.namespaceForAgentType(agentType);
     if (!namespace) {
+      this.telemetry.increment("delivery_failed_total", 1, { agent_type: agentType, reason: "namespace_missing" });
+      stopTimer();
       return false;
     }
 
@@ -504,21 +533,32 @@ export class SwarmRegistry extends AgentBase<RegistryState> {
     try {
       targetId = namespace.idFromString(queued.message.target);
     } catch {
+      this.telemetry.increment("delivery_failed_total", 1, { agent_type: agentType, reason: "invalid_target_id" });
+      stopTimer();
       return false;
     }
 
-    const stub = namespace.get(targetId);
-    const response = await stub.fetch("http://agent/message", {
-      method: "POST",
-      body: JSON.stringify(queued.message),
-    });
+    try {
+      const stub = namespace.get(targetId);
+      const response = await stub.fetch("http://agent/message", {
+        method: "POST",
+        body: JSON.stringify(queued.message),
+      });
 
-    if (response.ok) {
-      this.state.deliveryStats.delivered += 1;
-      return true;
+      if (response.ok) {
+        this.state.deliveryStats.delivered += 1;
+        this.telemetry.increment("delivery_success_total", 1, { agent_type: agentType });
+        return true;
+      }
+
+      this.telemetry.increment("delivery_failed_total", 1, { agent_type: agentType, status: response.status });
+      return false;
+    } catch {
+      this.telemetry.increment("delivery_failed_total", 1, { agent_type: agentType, reason: "exception" });
+      return false;
+    } finally {
+      stopTimer();
     }
-
-    return false;
   }
 
   private bumpRetry(queued: QueuedMessage, reason: string): void {
@@ -526,6 +566,7 @@ export class SwarmRegistry extends AgentBase<RegistryState> {
     queued.status = "failed";
     queued.lastError = reason;
     this.state.deliveryStats.failed += 1;
+    this.telemetry.increment("queue_retries_total", 1);
 
     const backoffMs = Math.min(30_000, 1_000 * 2 ** Math.max(0, queued.attempts - 1));
     queued.availableAt = Date.now() + backoffMs;
@@ -539,6 +580,7 @@ export class SwarmRegistry extends AgentBase<RegistryState> {
       lastError: reason,
     };
     this.state.deliveryStats.deadLettered += 1;
+    this.telemetry.increment("queue_dead_letter_total", 1);
   }
 
   private removeQueuedMessages(queueIds: string[]): void {
@@ -672,56 +714,69 @@ export class SwarmRegistry extends AgentBase<RegistryState> {
   }
 
   private async requeueDeadLetter(limit: number): Promise<{ requeued: number; remaining: number }> {
-    const entries = Object.values(this.state.deadLetterQueue)
-      .sort((a, b) => a.enqueuedAt - b.enqueuedAt)
-      .slice(0, Math.max(1, Math.min(limit, 500)));
+    const stopTimer = this.telemetry.startTimer("requeue_dead_letter_latency_ms");
+    try {
+      const entries = Object.values(this.state.deadLetterQueue)
+        .sort((a, b) => a.enqueuedAt - b.enqueuedAt)
+        .slice(0, Math.max(1, Math.min(limit, 500)));
 
-    let requeued = 0;
-    for (const entry of entries) {
-      try {
-        await this.enqueueMessage(entry.message, 0, entry.maxAttempts);
-        delete this.state.deadLetterQueue[entry.queueId];
-        requeued += 1;
-      } catch {
-        // Keep in DLQ if still not routable
+      let requeued = 0;
+      for (const entry of entries) {
+        try {
+          await this.enqueueMessage(entry.message, 0, entry.maxAttempts);
+          delete this.state.deadLetterQueue[entry.queueId];
+          requeued += 1;
+        } catch {
+          // Keep in DLQ if still not routable
+        }
       }
+      await this.saveState();
+      this.telemetry.increment("queue_requeued_total", requeued);
+      return {
+        requeued,
+        remaining: Object.keys(this.state.deadLetterQueue).length,
+      };
+    } finally {
+      stopTimer();
     }
-    await this.saveState();
-    return {
-      requeued,
-      remaining: Object.keys(this.state.deadLetterQueue).length,
-    };
   }
 
   private async pruneStaleAgents(staleMs: number): Promise<{ removed: number; remaining: number }> {
-    const threshold = Date.now() - staleMs;
-    const staleAgentIds = Object.values(this.state.agents)
-      .filter((agent) => agent.lastHeartbeat < threshold)
-      .map((agent) => agent.id);
+    const stopTimer = this.telemetry.startTimer("prune_stale_agents_latency_ms");
+    try {
+      const threshold = Date.now() - staleMs;
+      const staleAgentIds = Object.values(this.state.agents)
+        .filter((agent) => agent.lastHeartbeat < threshold)
+        .map((agent) => agent.id);
 
-    if (staleAgentIds.length === 0) {
-      return { removed: 0, remaining: Object.keys(this.state.agents).length };
-    }
-
-    const staleSet = new Set(staleAgentIds);
-    for (const agentId of staleAgentIds) {
-      delete this.state.agents[agentId];
-    }
-
-    for (const topic in this.state.subscriptions) {
-      const subscribers = this.state.subscriptions[topic];
-      if (!subscribers) continue;
-      this.state.subscriptions[topic] = subscribers.filter((id) => !staleSet.has(id));
-      if (this.state.subscriptions[topic].length === 0) {
-        delete this.state.subscriptions[topic];
+      if (staleAgentIds.length === 0) {
+        this.telemetry.increment("stale_agents_pruned_total", 0);
+        return { removed: 0, remaining: Object.keys(this.state.agents).length };
       }
-    }
 
-    await this.saveState();
-    return {
-      removed: staleAgentIds.length,
-      remaining: Object.keys(this.state.agents).length,
-    };
+      const staleSet = new Set(staleAgentIds);
+      for (const agentId of staleAgentIds) {
+        delete this.state.agents[agentId];
+      }
+
+      for (const topic in this.state.subscriptions) {
+        const subscribers = this.state.subscriptions[topic];
+        if (!subscribers) continue;
+        this.state.subscriptions[topic] = subscribers.filter((id) => !staleSet.has(id));
+        if (this.state.subscriptions[topic].length === 0) {
+          delete this.state.subscriptions[topic];
+        }
+      }
+
+      await this.saveState();
+      this.telemetry.increment("stale_agents_pruned_total", staleAgentIds.length);
+      return {
+        removed: staleAgentIds.length,
+        remaining: Object.keys(this.state.agents).length,
+      };
+    } finally {
+      stopTimer();
+    }
   }
 
   private async scheduleMaintenanceAlarm(): Promise<void> {
@@ -729,8 +784,17 @@ export class SwarmRegistry extends AgentBase<RegistryState> {
   }
 
   async alarm(): Promise<void> {
-    await this.dispatchQueue(200);
-    await this.pruneStaleAgents(HEARTBEAT_STALE_MS * 3);
-    await this.scheduleMaintenanceAlarm();
+    this.telemetry.increment("maintenance_runs_total", 1);
+    const stopTimer = this.telemetry.startTimer("maintenance_latency_ms");
+    try {
+      await this.dispatchQueue(200);
+      await this.pruneStaleAgents(HEARTBEAT_STALE_MS * 3);
+    } catch (error) {
+      this.telemetry.increment("maintenance_errors_total", 1);
+      throw error;
+    } finally {
+      await this.scheduleMaintenanceAlarm();
+      stopTimer();
+    }
   }
 }

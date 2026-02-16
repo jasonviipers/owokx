@@ -222,12 +222,20 @@ describe("OwokxHarness route regression", () => {
       data: {
         logs_total: number;
         llm: Record<string, unknown>;
+        telemetry: {
+          scope: string;
+          counters: Record<string, unknown>;
+          timers: Record<string, unknown>;
+        };
       };
     };
     expect(metricsResponse.ok).toBe(true);
     expect(metricsPayload.ok).toBe(true);
     expect(typeof metricsPayload.data.logs_total).toBe("number");
     expect(typeof metricsPayload.data.llm).toBe("object");
+    expect(metricsPayload.data.telemetry.scope).toBe("owokx_harness");
+    expect(typeof metricsPayload.data.telemetry.counters).toBe("object");
+    expect(typeof metricsPayload.data.telemetry.timers).toBe("object");
   });
 
   it("routes trigger to alarm execution when trade auth is present", async () => {

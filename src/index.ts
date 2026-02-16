@@ -2,6 +2,7 @@ import { getHarnessStub } from "./durable-objects/owokx-harness";
 import type { Env } from "./env.d";
 import { handleCronEvent } from "./jobs/cron";
 import { isRequestAuthorized, isTokenAuthorized } from "./lib/auth";
+import { createTelemetry, type TelemetryTags } from "./lib/telemetry";
 import { OwokxMcpAgent } from "./mcp/agent";
 import { createD1Client } from "./storage/d1/client";
 import {
@@ -86,6 +87,27 @@ function getRegistryStub(env: Env): DurableObjectStub {
   return env.SWARM_REGISTRY.get(registryId);
 }
 
+const workerTelemetry = createTelemetry("worker_index");
+
+async function withRouteTelemetry(tags: TelemetryTags, handler: () => Promise<Response>): Promise<Response> {
+  workerTelemetry.increment("http_requests_total", 1, tags);
+  const stopTimer = workerTelemetry.startTimer("http_request_latency_ms", tags);
+  try {
+    const response = await handler();
+    const status = response.status;
+    workerTelemetry.increment("http_responses_total", 1, { ...tags, status });
+    if (status >= 400) {
+      workerTelemetry.increment("http_errors_total", 1, { ...tags, status });
+    }
+    return response;
+  } catch (error) {
+    workerTelemetry.increment("http_errors_total", 1, { ...tags, status: 500 });
+    throw error;
+  } finally {
+    stopTimer();
+  }
+}
+
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
@@ -140,16 +162,18 @@ export default {
     }
 
     if (url.pathname === "/metrics") {
-      if (!isRequestAuthorized(request, env, "read")) {
-        return unauthorizedResponse();
-      }
-      const stub = getHarnessStub(env);
-      return stub.fetch(
-        new Request("http://harness/metrics", {
-          method: "GET",
-          headers: request.headers,
-        })
-      );
+      return withRouteTelemetry({ route: "/metrics", method: request.method }, async () => {
+        if (!isRequestAuthorized(request, env, "read")) {
+          return unauthorizedResponse();
+        }
+        const stub = getHarnessStub(env);
+        return stub.fetch(
+          new Request("http://harness/metrics", {
+            method: "GET",
+            headers: request.headers,
+          })
+        );
+      });
     }
 
     if (url.pathname === "/") {
@@ -178,112 +202,118 @@ export default {
     }
 
     if (url.pathname === "/agent/experiments/runs" && request.method === "GET") {
-      if (!isRequestAuthorized(request, env, "read")) {
-        return unauthorizedResponse();
-      }
-
-      const db = createD1Client(env.DB);
-      const strategyName = url.searchParams.get("strategy_name") ?? undefined;
-      const dateFrom = url.searchParams.get("date_from") ?? undefined;
-      const dateTo = url.searchParams.get("date_to") ?? undefined;
-      const limit = parsePositiveInt(url.searchParams.get("limit"), 50, 500);
-      const offsetRaw = Number.parseInt(url.searchParams.get("offset") ?? "0", 10);
-      const offset = Number.isFinite(offsetRaw) && offsetRaw >= 0 ? offsetRaw : 0;
-
-      try {
-        const runs = await listExperimentRuns(db, {
-          strategy_name: strategyName,
-          date_from: dateFrom,
-          date_to: dateTo,
-          limit,
-          offset,
-        });
-        return jsonResponse({ ok: true, data: { runs } });
-      } catch (error) {
-        if (isMissingExperimentsSchemaError(error)) {
-          return jsonResponse({
-            ok: true,
-            data: { runs: [] },
-            warning: EXPERIMENTS_SCHEMA_HINT,
-          });
+      return withRouteTelemetry({ route: "/agent/experiments/runs", method: request.method }, async () => {
+        if (!isRequestAuthorized(request, env, "read")) {
+          return unauthorizedResponse();
         }
-        return jsonResponse({ ok: false, error: getErrorMessage(error) }, 500);
-      }
+
+        const db = createD1Client(env.DB);
+        const strategyName = url.searchParams.get("strategy_name") ?? undefined;
+        const dateFrom = url.searchParams.get("date_from") ?? undefined;
+        const dateTo = url.searchParams.get("date_to") ?? undefined;
+        const limit = parsePositiveInt(url.searchParams.get("limit"), 50, 500);
+        const offsetRaw = Number.parseInt(url.searchParams.get("offset") ?? "0", 10);
+        const offset = Number.isFinite(offsetRaw) && offsetRaw >= 0 ? offsetRaw : 0;
+
+        try {
+          const runs = await listExperimentRuns(db, {
+            strategy_name: strategyName,
+            date_from: dateFrom,
+            date_to: dateTo,
+            limit,
+            offset,
+          });
+          return jsonResponse({ ok: true, data: { runs } });
+        } catch (error) {
+          if (isMissingExperimentsSchemaError(error)) {
+            return jsonResponse({
+              ok: true,
+              data: { runs: [] },
+              warning: EXPERIMENTS_SCHEMA_HINT,
+            });
+          }
+          return jsonResponse({ ok: false, error: getErrorMessage(error) }, 500);
+        }
+      });
     }
 
     if (url.pathname.startsWith("/agent/experiments/runs/") && request.method === "GET") {
-      if (!isRequestAuthorized(request, env, "read")) {
-        return unauthorizedResponse();
-      }
-
-      const runId = decodeURIComponent(url.pathname.slice("/agent/experiments/runs/".length));
-      if (!runId) {
-        return jsonResponse({ ok: false, error: "run_id is required" }, 400);
-      }
-
-      const db = createD1Client(env.DB);
-      const r2 = createR2Client(env.ARTIFACTS);
-
-      try {
-        const run = await getExperimentRunById(db, runId);
-        if (!run) {
-          return jsonResponse({ ok: false, error: "Experiment run not found" }, 404);
+      return withRouteTelemetry({ route: "/agent/experiments/runs/:id", method: request.method }, async () => {
+        if (!isRequestAuthorized(request, env, "read")) {
+          return unauthorizedResponse();
         }
 
-        const metricsKey = R2Paths.experimentRunMetrics(run.strategy_name, run.id);
-        const [summaryArtifact, equityArtifact, metricsArtifact, metrics] = await Promise.all([
-          run.summary_artifact_key ? r2.getExperimentArtifact(run.summary_artifact_key) : Promise.resolve(null),
-          run.equity_artifact_key ? r2.getExperimentArtifact(run.equity_artifact_key) : Promise.resolve(null),
-          r2.getExperimentArtifact(metricsKey).catch(() => null),
-          listExperimentMetrics(db, { run_id: run.id, limit: 2000 }),
-        ]);
-
-        return jsonResponse({
-          ok: true,
-          data: {
-            run,
-            summary_artifact: summaryArtifact,
-            equity_artifact: equityArtifact,
-            metrics_artifact: metricsArtifact,
-            metrics,
-          },
-        });
-      } catch (error) {
-        if (isMissingExperimentsSchemaError(error)) {
-          return jsonResponse({ ok: false, error: EXPERIMENTS_SCHEMA_HINT }, 503);
+        const runId = decodeURIComponent(url.pathname.slice("/agent/experiments/runs/".length));
+        if (!runId) {
+          return jsonResponse({ ok: false, error: "run_id is required" }, 400);
         }
-        return jsonResponse({ ok: false, error: getErrorMessage(error) }, 500);
-      }
+
+        const db = createD1Client(env.DB);
+        const r2 = createR2Client(env.ARTIFACTS);
+
+        try {
+          const run = await getExperimentRunById(db, runId);
+          if (!run) {
+            return jsonResponse({ ok: false, error: "Experiment run not found" }, 404);
+          }
+
+          const metricsKey = R2Paths.experimentRunMetrics(run.strategy_name, run.id);
+          const [summaryArtifact, equityArtifact, metricsArtifact, metrics] = await Promise.all([
+            run.summary_artifact_key ? r2.getExperimentArtifact(run.summary_artifact_key) : Promise.resolve(null),
+            run.equity_artifact_key ? r2.getExperimentArtifact(run.equity_artifact_key) : Promise.resolve(null),
+            r2.getExperimentArtifact(metricsKey).catch(() => null),
+            listExperimentMetrics(db, { run_id: run.id, limit: 2000 }),
+          ]);
+
+          return jsonResponse({
+            ok: true,
+            data: {
+              run,
+              summary_artifact: summaryArtifact,
+              equity_artifact: equityArtifact,
+              metrics_artifact: metricsArtifact,
+              metrics,
+            },
+          });
+        } catch (error) {
+          if (isMissingExperimentsSchemaError(error)) {
+            return jsonResponse({ ok: false, error: EXPERIMENTS_SCHEMA_HINT }, 503);
+          }
+          return jsonResponse({ ok: false, error: getErrorMessage(error) }, 500);
+        }
+      });
     }
 
     if (url.pathname === "/agent/experiments/variants" && request.method === "GET") {
-      if (!isRequestAuthorized(request, env, "read")) {
-        return unauthorizedResponse();
-      }
-
-      const db = createD1Client(env.DB);
-      const strategyName = url.searchParams.get("strategy_name") ?? undefined;
-      const limit = parsePositiveInt(url.searchParams.get("limit"), 50, 500);
-      const offsetRaw = Number.parseInt(url.searchParams.get("offset") ?? "0", 10);
-      const offset = Number.isFinite(offsetRaw) && offsetRaw >= 0 ? offsetRaw : 0;
-
-      try {
-        const variants = await listExperimentVariants(db, {
-          strategy_name: strategyName,
-          limit,
-          offset,
-        });
-        return jsonResponse({ ok: true, data: { variants } });
-      } catch (error) {
-        if (isMissingExperimentsSchemaError(error)) {
-          return jsonResponse({
-            ok: true,
-            data: { variants: [] },
-            warning: EXPERIMENTS_SCHEMA_HINT,
-          });
+      return withRouteTelemetry({ route: "/agent/experiments/variants", method: request.method }, async () => {
+        if (!isRequestAuthorized(request, env, "read")) {
+          return unauthorizedResponse();
         }
-        return jsonResponse({ ok: false, error: getErrorMessage(error) }, 500);
-      }
+
+        const db = createD1Client(env.DB);
+        const strategyName = url.searchParams.get("strategy_name") ?? undefined;
+        const limit = parsePositiveInt(url.searchParams.get("limit"), 50, 500);
+        const offsetRaw = Number.parseInt(url.searchParams.get("offset") ?? "0", 10);
+        const offset = Number.isFinite(offsetRaw) && offsetRaw >= 0 ? offsetRaw : 0;
+
+        try {
+          const variants = await listExperimentVariants(db, {
+            strategy_name: strategyName,
+            limit,
+            offset,
+          });
+          return jsonResponse({ ok: true, data: { variants } });
+        } catch (error) {
+          if (isMissingExperimentsSchemaError(error)) {
+            return jsonResponse({
+              ok: true,
+              data: { variants: [] },
+              warning: EXPERIMENTS_SCHEMA_HINT,
+            });
+          }
+          return jsonResponse({ ok: false, error: getErrorMessage(error) }, 500);
+        }
+      });
     }
 
     if (url.pathname === "/agent/experiments/promote" && request.method === "POST") {
@@ -488,133 +518,141 @@ export default {
     }
 
     if (url.pathname === "/swarm/health") {
-      if (!isRequestAuthorized(request, env, "read")) {
-        return unauthorizedResponse();
-      }
-      const registry = getRegistryStub(env);
-      const [healthRes, queueRes] = await Promise.all([
-        registry.fetch("http://registry/health"),
-        registry.fetch("http://registry/queue/state"),
-      ]);
+      return withRouteTelemetry({ route: "/swarm/health", method: request.method }, async () => {
+        if (!isRequestAuthorized(request, env, "read")) {
+          return unauthorizedResponse();
+        }
+        const registry = getRegistryStub(env);
+        const [healthRes, queueRes] = await Promise.all([
+          registry.fetch("http://registry/health"),
+          registry.fetch("http://registry/queue/state"),
+        ]);
 
-      if (!healthRes.ok || !queueRes.ok) {
+        if (!healthRes.ok || !queueRes.ok) {
+          return new Response(
+            JSON.stringify({
+              healthy: false,
+              error: "Unable to load swarm health",
+              registryStatus: healthRes.status,
+              queueStatus: queueRes.status,
+              telemetry: workerTelemetry.snapshot(),
+            }),
+            {
+              status: 503,
+              headers: { "Content-Type": "application/json" },
+            }
+          );
+        }
+
+        const health = (await healthRes.json()) as {
+          healthy?: boolean;
+        };
+        const queue = (await queueRes.json()) as {
+          deadLettered?: number;
+          staleAgents?: number;
+        };
+        const deadLettered = Number.isFinite(queue.deadLettered) ? Number(queue.deadLettered) : 0;
+        const staleAgents = Number.isFinite(queue.staleAgents) ? Number(queue.staleAgents) : 0;
+
         return new Response(
           JSON.stringify({
-            healthy: false,
-            error: "Unable to load swarm health",
-            registryStatus: healthRes.status,
-            queueStatus: queueRes.status,
+            healthy: Boolean(health.healthy),
+            degraded: deadLettered > 0 || staleAgents > 0,
+            deadLettered,
+            staleAgents,
+            registry: health,
+            queue,
+            timestamp: new Date().toISOString(),
+            telemetry: workerTelemetry.snapshot(),
           }),
           {
-            status: 503,
             headers: { "Content-Type": "application/json" },
           }
         );
-      }
-
-      const health = (await healthRes.json()) as {
-        healthy?: boolean;
-      };
-      const queue = (await queueRes.json()) as {
-        deadLettered?: number;
-        staleAgents?: number;
-      };
-      const deadLettered = Number.isFinite(queue.deadLettered) ? Number(queue.deadLettered) : 0;
-      const staleAgents = Number.isFinite(queue.staleAgents) ? Number(queue.staleAgents) : 0;
-
-      return new Response(
-        JSON.stringify({
-          healthy: Boolean(health.healthy),
-          degraded: deadLettered > 0 || staleAgents > 0,
-          deadLettered,
-          staleAgents,
-          registry: health,
-          queue,
-          timestamp: new Date().toISOString(),
-        }),
-        {
-          headers: { "Content-Type": "application/json" },
-        }
-      );
+      });
     }
 
     if (url.pathname === "/swarm/metrics") {
-      if (!isRequestAuthorized(request, env, "read")) {
-        return unauthorizedResponse();
-      }
-      const registry = getRegistryStub(env);
-      const [agentsRes, queueRes] = await Promise.all([
-        registry.fetch("http://registry/agents"),
-        registry.fetch("http://registry/queue/state"),
-      ]);
+      return withRouteTelemetry({ route: "/swarm/metrics", method: request.method }, async () => {
+        if (!isRequestAuthorized(request, env, "read")) {
+          return unauthorizedResponse();
+        }
+        const registry = getRegistryStub(env);
+        const [agentsRes, queueRes] = await Promise.all([
+          registry.fetch("http://registry/agents"),
+          registry.fetch("http://registry/queue/state"),
+        ]);
 
-      if (!agentsRes.ok || !queueRes.ok) {
+        if (!agentsRes.ok || !queueRes.ok) {
+          return new Response(
+            JSON.stringify({
+              error: "Unable to load swarm metrics",
+              registryAgentsStatus: agentsRes.status,
+              queueStatus: queueRes.status,
+              telemetry: workerTelemetry.snapshot(),
+            }),
+            {
+              status: 503,
+              headers: { "Content-Type": "application/json" },
+            }
+          );
+        }
+
+        const now = Date.now();
+        const staleThresholdMs = 300_000;
+        const agents = (await agentsRes.json()) as Record<
+          string,
+          {
+            id?: string;
+            type?: string;
+            status?: string;
+            lastHeartbeat?: number;
+          }
+        >;
+        const queue = (await queueRes.json()) as {
+          queued?: number;
+          deadLettered?: number;
+          stats?: Record<string, number>;
+          routingState?: Record<string, number>;
+          staleAgents?: number;
+        };
+
+        const byType: Record<string, number> = {};
+        const byStatus: Record<string, number> = {};
+        let staleComputed = 0;
+
+        for (const agent of Object.values(agents)) {
+          const type = agent.type ?? "unknown";
+          const status = agent.status ?? "unknown";
+          byType[type] = (byType[type] ?? 0) + 1;
+          byStatus[status] = (byStatus[status] ?? 0) + 1;
+          if (typeof agent.lastHeartbeat === "number" && now - agent.lastHeartbeat > staleThresholdMs) {
+            staleComputed += 1;
+          }
+        }
+
         return new Response(
           JSON.stringify({
-            error: "Unable to load swarm metrics",
-            registryAgentsStatus: agentsRes.status,
-            queueStatus: queueRes.status,
+            timestamp: new Date().toISOString(),
+            agents: {
+              total: Object.keys(agents).length,
+              byType,
+              byStatus,
+              stale: Number.isFinite(queue.staleAgents) ? Number(queue.staleAgents) : staleComputed,
+            },
+            queue: {
+              queued: Number.isFinite(queue.queued) ? Number(queue.queued) : 0,
+              deadLettered: Number.isFinite(queue.deadLettered) ? Number(queue.deadLettered) : 0,
+              stats: queue.stats ?? {},
+              routingState: queue.routingState ?? {},
+            },
+            telemetry: workerTelemetry.snapshot(),
           }),
           {
-            status: 503,
             headers: { "Content-Type": "application/json" },
           }
         );
-      }
-
-      const now = Date.now();
-      const staleThresholdMs = 300_000;
-      const agents = (await agentsRes.json()) as Record<
-        string,
-        {
-          id?: string;
-          type?: string;
-          status?: string;
-          lastHeartbeat?: number;
-        }
-      >;
-      const queue = (await queueRes.json()) as {
-        queued?: number;
-        deadLettered?: number;
-        stats?: Record<string, number>;
-        routingState?: Record<string, number>;
-        staleAgents?: number;
-      };
-
-      const byType: Record<string, number> = {};
-      const byStatus: Record<string, number> = {};
-      let staleComputed = 0;
-
-      for (const agent of Object.values(agents)) {
-        const type = agent.type ?? "unknown";
-        const status = agent.status ?? "unknown";
-        byType[type] = (byType[type] ?? 0) + 1;
-        byStatus[status] = (byStatus[status] ?? 0) + 1;
-        if (typeof agent.lastHeartbeat === "number" && now - agent.lastHeartbeat > staleThresholdMs) {
-          staleComputed += 1;
-        }
-      }
-
-      return new Response(
-        JSON.stringify({
-          timestamp: new Date().toISOString(),
-          agents: {
-            total: Object.keys(agents).length,
-            byType,
-            byStatus,
-            stale: Number.isFinite(queue.staleAgents) ? Number(queue.staleAgents) : staleComputed,
-          },
-          queue: {
-            queued: Number.isFinite(queue.queued) ? Number(queue.queued) : 0,
-            deadLettered: Number.isFinite(queue.deadLettered) ? Number(queue.deadLettered) : 0,
-            stats: queue.stats ?? {},
-            routingState: queue.routingState ?? {},
-          },
-        }),
-        {
-          headers: { "Content-Type": "application/json" },
-        }
-      );
+      });
     }
 
     if (url.pathname === "/swarm/queue") {
