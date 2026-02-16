@@ -82,6 +82,11 @@ function isMissingExperimentsSchemaError(error: unknown): boolean {
   );
 }
 
+/**
+ * Retrieves the Durable Object stub for the swarm registry named "default".
+ *
+ * @returns The Durable Object stub for `SWARM_REGISTRY` bound to the name `"default"`.
+ */
 function getRegistryStub(env: Env): DurableObjectStub {
   const registryId = env.SWARM_REGISTRY.idFromName("default");
   return env.SWARM_REGISTRY.get(registryId);
@@ -89,6 +94,15 @@ function getRegistryStub(env: Env): DurableObjectStub {
 
 const workerTelemetry = createTelemetry("worker_index");
 
+/**
+ * Record telemetry for an HTTP route (requests, responses, errors, latency) and run the provided handler.
+ *
+ * Records request/response counts, error counts, and request latency using the given telemetry tags while invoking `handler`.
+ *
+ * @param tags - Telemetry tags applied to all recorded metrics for this route
+ * @param handler - Async function that handles the route and returns a `Response`
+ * @returns The `Response` produced by `handler`
+ */
 async function withRouteTelemetry(tags: TelemetryTags, handler: () => Promise<Response>): Promise<Response> {
   workerTelemetry.increment("http_requests_total", 1, tags);
   const stopTimer = workerTelemetry.startTimer("http_request_latency_ms", tags);

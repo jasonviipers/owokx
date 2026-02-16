@@ -145,6 +145,12 @@ async function runMidnightReset(env: Env): Promise<void> {
   }
 }
 
+/**
+ * Format a Date as a New York–time date string in YYYY-MM-DD format.
+ *
+ * @param d - The Date to format in the America/New_York timezone
+ * @returns The formatted date string in `YYYY-MM-DD` (en-CA) form
+ */
 function nyDateString(d: Date): string {
   return new Intl.DateTimeFormat("en-CA", {
     timeZone: "America/New_York",
@@ -167,6 +173,16 @@ interface HarnessLlmSnapshot {
   } | null;
 }
 
+/**
+ * Builds alert threshold overrides from environment variables.
+ *
+ * @param env - Runtime environment variables
+ * @returns Partial alert thresholds where:
+ * - `drawdownWarnRatio` is the drawdown ratio that triggers a warning (defaults to 0.8)
+ * - `deadLetterWarn` is the dead-letter queue count that triggers a warning (defaults to 1)
+ * - `deadLetterCritical` is the dead-letter queue count that triggers a critical alert (defaults to 10)
+ * - `llmAuthFailureWindowMs` is the time window, in milliseconds, used to evaluate LLM auth failures (defaults to 900 seconds)
+ */
 function toAlertThresholds(env: Env): Partial<AlertRuleThresholds> {
   return {
     drawdownWarnRatio: parseNumber(env.ALERT_DRAWDOWN_WARN_RATIO, 0.8),
@@ -176,6 +192,11 @@ function toAlertThresholds(env: Env): Partial<AlertRuleThresholds> {
   };
 }
 
+/**
+ * Retrieves the swarm queue state snapshot from the configured swarm registry.
+ *
+ * @returns The snapshot with counts for `deadLettered`, `queued`, and `staleAgents`, or `null` if no registry is configured, the request fails, or the response is missing/invalid.
+ */
 async function fetchSwarmQueueState(env: Env): Promise<SwarmQueueStateSnapshot | null> {
   if (!env.SWARM_REGISTRY) return null;
 
@@ -202,6 +223,11 @@ async function fetchSwarmQueueState(env: Env): Promise<SwarmQueueStateSnapshot |
   }
 }
 
+/**
+ * Fetches the latest LLM authentication error snapshot from the configured Harness service.
+ *
+ * @returns A `HarnessLlmSnapshot` containing `last_auth_error` (with optional `at` timestamp and `message`), or `null` if the Harness is not configured or the snapshot could not be retrieved.
+ */
 async function fetchHarnessLlmSnapshot(env: Env): Promise<HarnessLlmSnapshot | null> {
   if (!env.OWOKX_HARNESS) return null;
 
@@ -239,6 +265,18 @@ async function fetchHarnessLlmSnapshot(env: Env): Promise<HarnessLlmSnapshot | n
   }
 }
 
+/**
+ * Evaluate alert rules using the current account, risk state, and policy configuration, and dispatch any generated alerts.
+ *
+ * This function fetches external telemetry (swarm queue state and harness LLM snapshot), evaluates configured alert rules against
+ * the provided account and risk state, and, if any alerts are produced, sends notifications and logs a dispatch summary.
+ *
+ * @param env - Runtime environment bindings and configuration used to fetch external state and create the alert notifier
+ * @param input - Current runtime inputs for evaluation:
+ *   - `account`: current account snapshot (uses `equity`)
+ *   - `riskState`: current risk system state (kill switch, daily equity start, drawdown metrics)
+ *   - `policyConfig`: policy-derived thresholds used by alert rules
+ */
 async function runAlertEvaluations(
   env: Env,
   input: {
@@ -280,6 +318,11 @@ async function runAlertEvaluations(
   );
 }
 
+/**
+ * Performs hourly maintenance: refreshes risk and account state, updates daily-loss tracking, evaluates and dispatches alerts, backfills missing trades, and persists a live hourly snapshot.
+ *
+ * @param env - Environment bindings and configuration used to create the database and broker clients, derive policy defaults, and persist artifacts
+ */
 async function runHourlyCacheRefresh(env: Env): Promise<void> {
   console.log("Running hourly cache refresh...");
   const db = createD1Client(env.DB);
