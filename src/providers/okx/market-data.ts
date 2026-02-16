@@ -1,196 +1,478 @@
-import { createError, ErrorCode } from "../../lib/errors";
+import type { Candle, Instrument, InstrumentType, OrderBook, Ticker, Trade } from "okx-api";
+import { ErrorCode } from "../../lib/errors";
 import type { Bar, BarsParams, MarketDataProvider, Quote, Snapshot } from "../types";
 import type { OkxClient } from "./client";
-import { hasExplicitOkxQuote, normalizeOkxSymbol } from "./symbols";
+import { handleOkxError, OkxClientError } from "./client";
+import { normalizeOkxSymbol } from "./symbols";
 
-interface OkxTicker {
-  instId: string;
-  last: string;
-  bidPx?: string;
-  bidSz?: string;
-  askPx?: string;
-  askSz?: string;
-  ts: string;
+function parseNumber(value: string | number | undefined, fallback: number = 0): number {
+  if (typeof value === "number") {
+    return Number.isFinite(value) ? value : fallback;
+  }
+
+  if (typeof value === "string") {
+    const parsed = Number.parseFloat(value);
+    return Number.isFinite(parsed) ? parsed : fallback;
+  }
+
+  return fallback;
 }
 
-interface OkxTrade {
-  ts: string;
-  px: string;
-  sz: string;
-}
-
-type OkxCandle = [string, string, string, string, string, string, ...string[]];
-
-function parseNumber(value: string | undefined): number {
-  if (!value) return 0;
-  const n = parseFloat(value);
-  return Number.isFinite(n) ? n : 0;
-}
-
-function mapTimeframe(timeframe: string): string {
-  const tf = timeframe.toLowerCase();
-  if (tf === "1min" || tf === "1m") return "1m";
-  if (tf === "5min" || tf === "5m") return "5m";
-  if (tf === "15min" || tf === "15m") return "15m";
-  if (tf === "30min" || tf === "30m") return "30m";
-  if (tf === "1hour" || tf === "1h") return "1H";
-  if (tf === "4hour" || tf === "4h") return "4H";
-  if (tf === "1day" || tf === "1d") return "1D";
-  if (tf === "1week" || tf === "1w") return "1W";
-  return timeframe;
-}
-
-function candleToBar(c: OkxCandle): Bar {
-  const ts = Number(c[0]);
+function parseBar(raw: Candle): Bar {
   return {
-    t: new Date(ts).toISOString(),
-    o: parseNumber(c[1]),
-    h: parseNumber(c[2]),
-    l: parseNumber(c[3]),
-    c: parseNumber(c[4]),
-    v: parseNumber(c[5]),
+    t: raw[0],
+    o: parseNumber(raw[1]),
+    h: parseNumber(raw[2]),
+    l: parseNumber(raw[3]),
+    c: parseNumber(raw[4]),
+    v: parseNumber(raw[5]),
     n: 0,
-    vw: parseNumber(c[4]),
+    vw: parseNumber(raw[4]),
   };
 }
 
-function assertOkxMarketSymbol(symbol: string): void {
-  if (hasExplicitOkxQuote(symbol)) {
-    return;
+function parseQuote(raw: Ticker): Quote {
+  return {
+    symbol: raw.instId,
+    bid_price: parseNumber(raw.bidPx),
+    bid_size: parseNumber(raw.bidSz),
+    ask_price: parseNumber(raw.askPx),
+    ask_size: parseNumber(raw.askSz),
+    timestamp: raw.ts,
+  };
+}
+
+function mapTimeframe(timeframe: string): string {
+  switch (timeframe) {
+    case "1m":
+      return "1m";
+    case "3m":
+      return "3m";
+    case "5m":
+      return "5m";
+    case "15m":
+      return "15m";
+    case "30m":
+      return "30m";
+    case "1h":
+      return "1H";
+    case "2h":
+      return "2H";
+    case "4h":
+      return "4H";
+    case "6h":
+      return "6H";
+    case "12h":
+      return "12H";
+    case "1d":
+      return "1D";
+    case "1w":
+      return "1W";
+    case "1M":
+      return "1M";
+    default:
+      return "1H";
+  }
+}
+
+function extractOkxCode(error: unknown): string | undefined {
+  if (!error || typeof error !== "object") {
+    return undefined;
   }
 
-  throw createError(
+  const record = error as Record<string, unknown>;
+  if (typeof record.okxCode === "string") return record.okxCode;
+
+  if (typeof record.code === "string" && /^\d{5}$/.test(record.code)) {
+    return record.code;
+  }
+
+  if (typeof record.msg === "string") {
+    const msgCode = record.msg.match(/\b\d{5}\b/)?.[0];
+    if (msgCode) return msgCode;
+  }
+
+  if (typeof record.message === "string") {
+    const messageCode = record.message.match(/\b\d{5}\b/)?.[0];
+    if (messageCode) return messageCode;
+  }
+
+  const response = record.response;
+  if (response && typeof response === "object") {
+    const responseRecord = response as Record<string, unknown>;
+    const data = responseRecord.data;
+    if (data && typeof data === "object") {
+      const dataCode = (data as Record<string, unknown>).code;
+      if (typeof dataCode === "string") return dataCode;
+    }
+  }
+
+  return undefined;
+}
+
+function extractOkxMessage(error: unknown): string | undefined {
+  if (!error || typeof error !== "object") {
+    return typeof error === "string" ? error : undefined;
+  }
+
+  const record = error as Record<string, unknown>;
+  if (typeof record.msg === "string") return record.msg;
+  if (typeof record.message === "string") return record.message;
+
+  const response = record.response;
+  if (response && typeof response === "object") {
+    const responseRecord = response as Record<string, unknown>;
+    const data = responseRecord.data;
+    if (data && typeof data === "object") {
+      const dataMessage = (data as Record<string, unknown>).msg;
+      if (typeof dataMessage === "string") return dataMessage;
+    }
+  }
+
+  return undefined;
+}
+
+function isInstrumentUnavailableError(error: unknown): boolean {
+  return extractOkxCode(error) === "51001";
+}
+
+function buildUnsupportedInstrumentError(symbol: string, instId: string): OkxClientError {
+  return new OkxClientError(
+    `Instrument not found or unavailable: ${instId} (from symbol '${symbol}')`,
     ErrorCode.INVALID_INPUT,
-    `OKX market data requires an explicit crypto pair symbol (for example BTC/USDT). Received: ${symbol}`
+    "51001"
   );
 }
 
-export class OkxMarketDataProvider implements MarketDataProvider {
-  constructor(
-    private client: OkxClient,
-    private defaultQuote: string
-  ) {}
-
-  async getBars(symbol: string, timeframe: string, params?: BarsParams): Promise<Bar[]> {
-    assertOkxMarketSymbol(symbol);
-    const info = normalizeOkxSymbol(symbol, this.defaultQuote);
-    const bar = mapTimeframe(timeframe);
-    const limit = params?.limit ?? 100;
-    const res = await this.client.request<OkxCandle>(
-      "GET",
-      "/api/v5/market/candles",
-      {
-        instId: info.instId,
-        bar,
-        limit,
-      },
-      undefined,
-      { auth: false }
-    );
-    const data = res.data ?? [];
-    return data.map(candleToBar).reverse();
-  }
-
-  async getLatestBar(symbol: string): Promise<Bar> {
-    const bars = await this.getBars(symbol, "1m", { limit: 1 });
-    const latest = bars[bars.length - 1];
-    if (!latest) throw createError(ErrorCode.NOT_FOUND, `No bars found for ${symbol}`);
-    return latest;
-  }
-
-  async getLatestBars(symbols: string[]): Promise<Record<string, Bar>> {
-    const results = await Promise.all(symbols.map(async (s) => [s, await this.getLatestBar(s)] as const));
-    return Object.fromEntries(results);
-  }
-
-  async getQuote(symbol: string): Promise<Quote> {
-    assertOkxMarketSymbol(symbol);
-    const info = normalizeOkxSymbol(symbol, this.defaultQuote);
-    const res = await this.client.request<OkxTicker>(
-      "GET",
-      "/api/v5/market/ticker",
-      { instId: info.instId },
-      undefined,
-      { auth: false }
-    );
-    const t = res.data[0];
-    if (!t) throw createError(ErrorCode.NOT_FOUND, `No ticker found for ${symbol}`);
-
-    return {
-      symbol: info.normalizedSymbol,
-      bid_price: parseNumber(t.bidPx),
-      bid_size: parseNumber(t.bidSz),
-      ask_price: parseNumber(t.askPx),
-      ask_size: parseNumber(t.askSz),
-      timestamp: new Date(Number(t.ts)).toISOString(),
-    };
-  }
-
-  async getQuotes(symbols: string[]): Promise<Record<string, Quote>> {
-    const results = await Promise.all(symbols.map(async (s) => [s, await this.getQuote(s)] as const));
-    return Object.fromEntries(results);
-  }
-
-  async getSnapshot(symbol: string): Promise<Snapshot> {
-    return this.getCryptoSnapshot(symbol);
-  }
-
-  async getSnapshots(symbols: string[]): Promise<Record<string, Snapshot>> {
-    const results = await Promise.all(symbols.map(async (s) => [s, await this.getCryptoSnapshot(s)] as const));
-    return Object.fromEntries(results);
-  }
-
-  async getCryptoSnapshot(symbol: string): Promise<Snapshot> {
-    assertOkxMarketSymbol(symbol);
-    const info = normalizeOkxSymbol(symbol, this.defaultQuote);
-
-    const [tickerRes, tradeRes, minuteBars, dailyBars] = await Promise.all([
-      this.client.request<OkxTicker>("GET", "/api/v5/market/ticker", { instId: info.instId }, undefined, {
-        auth: false,
-      }),
-      this.client.request<OkxTrade>("GET", "/api/v5/market/trades", { instId: info.instId, limit: 1 }, undefined, {
-        auth: false,
-      }),
-      this.getBars(info.normalizedSymbol, "1m", { limit: 2 }),
-      this.getBars(info.normalizedSymbol, "1D", { limit: 3 }),
-    ]);
-
-    const ticker = tickerRes.data[0];
-    if (!ticker) throw createError(ErrorCode.NOT_FOUND, `No ticker found for ${symbol}`);
-
-    const trade = tradeRes.data[0];
-    const price = parseNumber(ticker.last);
-
-    const minute =
-      minuteBars[minuteBars.length - 1] ??
-      candleToBar([ticker.ts, String(price), String(price), String(price), String(price), "0"]);
-    const daily = dailyBars[dailyBars.length - 1] ?? minute;
-    const prevDaily = dailyBars.length >= 2 ? dailyBars[dailyBars.length - 2]! : daily;
-
-    const ts = new Date(Number(ticker.ts)).toISOString();
-
-    return {
-      symbol: info.normalizedSymbol,
-      latest_trade: {
-        price: trade ? parseNumber(trade.px) : price,
-        size: trade ? parseNumber(trade.sz) : 0,
-        timestamp: trade ? new Date(Number(trade.ts)).toISOString() : ts,
-      },
-      latest_quote: {
-        symbol: info.normalizedSymbol,
-        bid_price: parseNumber(ticker.bidPx),
-        bid_size: parseNumber(ticker.bidSz),
-        ask_price: parseNumber(ticker.askPx),
-        ask_size: parseNumber(ticker.askSz),
-        timestamp: ts,
-      },
-      minute_bar: minute,
-      daily_bar: daily,
-      prev_daily_bar: prevDaily,
-    };
-  }
+export interface OkxMarketDataProvider extends MarketDataProvider {
+  getTicker(symbol: string): Promise<Ticker | null>;
+  getTickers(instType: InstrumentType, uly?: string, instFamily?: string): Promise<Ticker[]>;
+  getOrderBook(symbol: string, depth?: number): Promise<OrderBook | null>;
+  getTrades(symbol: string, limit?: number): Promise<Trade[]>;
+  getHistoricTrades(
+    symbol: string,
+    params?: { after?: string; before?: string; limit?: number; type?: "1" | "2" }
+  ): Promise<Trade[]>;
+  getInstruments(
+    instType: InstrumentType,
+    filters?: { uly?: string; instFamily?: string; instId?: string }
+  ): Promise<Instrument[]>;
 }
 
-export function createOkxMarketDataProvider(client: OkxClient, defaultQuote: string): OkxMarketDataProvider {
-  return new OkxMarketDataProvider(client, defaultQuote);
+export function createOkxMarketDataProvider(client: OkxClient): OkxMarketDataProvider {
+  const toInstId = (symbol: string): string =>
+    normalizeOkxSymbol(symbol, client.config.defaultQuoteCcy ?? "USDT").instId;
+  const unsupportedInstIds = new Set<string>();
+
+  const ensureInstrumentSupported = (symbol: string, instId: string): void => {
+    if (!unsupportedInstIds.has(instId)) {
+      return;
+    }
+    throw buildUnsupportedInstrumentError(symbol, instId);
+  };
+
+  const handleMarketDataError = (
+    message: string,
+    error: unknown,
+    context: Record<string, unknown>,
+    instId?: string
+  ): never => {
+    if (instId && isInstrumentUnavailableError(error)) {
+      const firstSeen = !unsupportedInstIds.has(instId);
+      unsupportedInstIds.add(instId);
+
+      if (firstSeen) {
+        client.logger.warn("OKX instrument unavailable; caching as unsupported", {
+          ...context,
+          instId,
+          okxCode: "51001",
+          okxMessage: extractOkxMessage(error),
+        });
+      }
+    } else {
+      client.logger.error(message, error, context);
+    }
+
+    throw handleOkxError(error);
+  };
+
+  return {
+    async getBars(symbol: string, timeframe: string, params?: BarsParams): Promise<Bar[]> {
+      const instId = toInstId(symbol);
+      ensureInstrumentSupported(symbol, instId);
+
+      try {
+        const bar = mapTimeframe(timeframe);
+        const response = await client.rest.getCandles({
+          instId,
+          bar,
+          limit: String(params?.limit ?? 100),
+          after: params?.start,
+          before: params?.end,
+        });
+
+        return response.map(parseBar);
+      } catch (error) {
+        return handleMarketDataError("Failed to fetch bars", error, { symbol, timeframe }, instId);
+      }
+    },
+
+    async getLatestBar(symbol: string): Promise<Bar> {
+      const instId = toInstId(symbol);
+      ensureInstrumentSupported(symbol, instId);
+
+      try {
+        const response = await client.rest.getCandles({
+          instId,
+          bar: "1m",
+          limit: "1",
+        });
+
+        const first = response[0];
+        if (!first) {
+          throw new Error(`No candle data available for ${symbol}`);
+        }
+
+        return parseBar(first);
+      } catch (error) {
+        return handleMarketDataError("Failed to fetch latest bar", error, { symbol }, instId);
+      }
+    },
+
+    async getLatestBars(symbols: string[]): Promise<Record<string, Bar>> {
+      const entries = await Promise.all(
+        symbols.map(async (symbol) => {
+          try {
+            const bar = await this.getLatestBar(symbol);
+            return [symbol, bar] as const;
+          } catch (error) {
+            client.logger.warn("Skipping symbol while fetching latest bars", {
+              symbol,
+              error: String(error),
+            });
+            return null;
+          }
+        })
+      );
+
+      return entries.reduce<Record<string, Bar>>((acc, entry) => {
+        if (entry) {
+          acc[entry[0]] = entry[1];
+        }
+        return acc;
+      }, {});
+    },
+
+    async getQuote(symbol: string): Promise<Quote> {
+      const instId = toInstId(symbol);
+      ensureInstrumentSupported(symbol, instId);
+
+      try {
+        const response = await client.rest.getTicker({ instId });
+        const first = response[0];
+        if (!first) {
+          throw new Error(`No ticker data for ${symbol}`);
+        }
+
+        return parseQuote(first);
+      } catch (error) {
+        return handleMarketDataError("Failed to fetch quote", error, { symbol }, instId);
+      }
+    },
+
+    async getQuotes(symbols: string[]): Promise<Record<string, Quote>> {
+      const entries = await Promise.all(
+        symbols.map(async (symbol) => {
+          try {
+            const quote = await this.getQuote(symbol);
+            return [symbol, quote] as const;
+          } catch (error) {
+            client.logger.warn("Skipping symbol while fetching quotes", {
+              symbol,
+              error: String(error),
+            });
+            return null;
+          }
+        })
+      );
+
+      return entries.reduce<Record<string, Quote>>((acc, entry) => {
+        if (entry) {
+          acc[entry[0]] = entry[1];
+        }
+        return acc;
+      }, {});
+    },
+
+    async getSnapshot(symbol: string): Promise<Snapshot> {
+      const instId = toInstId(symbol);
+      ensureInstrumentSupported(symbol, instId);
+
+      try {
+        const [tickerResponse, candleResponse, tradeResponse] = await Promise.all([
+          client.rest.getTicker({ instId }),
+          client.rest.getCandles({ instId, bar: "1D", limit: "2" }),
+          client.rest.getTrades({ instId, limit: 1 }),
+        ]);
+
+        const ticker = tickerResponse[0];
+        if (!ticker) {
+          throw new Error(`No ticker data for ${symbol}`);
+        }
+
+        const latestTrade = tradeResponse[0]
+          ? {
+              price: parseNumber(tradeResponse[0].px),
+              size: parseNumber(tradeResponse[0].sz),
+              timestamp: tradeResponse[0].ts,
+            }
+          : {
+              price: parseNumber(ticker.last),
+              size: parseNumber(ticker.lastSz),
+              timestamp: ticker.ts,
+            };
+
+        const latestMinuteBar = await this.getLatestBar(symbol);
+        const dailyBar = candleResponse[0] ? parseBar(candleResponse[0]) : latestMinuteBar;
+        const previousDailyBar = candleResponse[1] ? parseBar(candleResponse[1]) : latestMinuteBar;
+
+        return {
+          symbol,
+          latest_trade: latestTrade,
+          latest_quote: parseQuote(ticker),
+          minute_bar: latestMinuteBar,
+          daily_bar: dailyBar,
+          prev_daily_bar: previousDailyBar,
+        };
+      } catch (error) {
+        return handleMarketDataError("Failed to fetch snapshot", error, { symbol }, instId);
+      }
+    },
+
+    async getSnapshots(symbols: string[]): Promise<Record<string, Snapshot>> {
+      const entries = await Promise.all(
+        symbols.map(async (symbol) => {
+          try {
+            const snapshot = await this.getSnapshot(symbol);
+            return [symbol, snapshot] as const;
+          } catch (error) {
+            client.logger.warn("Skipping symbol while fetching snapshots", {
+              symbol,
+              error: String(error),
+            });
+            return null;
+          }
+        })
+      );
+
+      return entries.reduce<Record<string, Snapshot>>((acc, entry) => {
+        if (entry) {
+          acc[entry[0]] = entry[1];
+        }
+        return acc;
+      }, {});
+    },
+
+    async getCryptoSnapshot(symbol: string): Promise<Snapshot> {
+      return this.getSnapshot(symbol);
+    },
+
+    async getTicker(symbol: string): Promise<Ticker | null> {
+      const instId = toInstId(symbol);
+      ensureInstrumentSupported(symbol, instId);
+
+      try {
+        const response = await client.rest.getTicker({ instId });
+        return response[0] ?? null;
+      } catch (error) {
+        return handleMarketDataError("Failed to fetch ticker", error, { symbol }, instId);
+      }
+    },
+
+    async getTickers(instType: InstrumentType, uly?: string, instFamily?: string): Promise<Ticker[]> {
+      try {
+        return client.rest.getTickers({ instType, uly, instFamily });
+      } catch (error) {
+        client.logger.error("Failed to fetch tickers", error, { instType, uly, instFamily });
+        throw handleOkxError(error);
+      }
+    },
+
+    async getOrderBook(symbol: string, depth: number = 20): Promise<OrderBook | null> {
+      const instId = toInstId(symbol);
+      ensureInstrumentSupported(symbol, instId);
+
+      try {
+        const response = await client.rest.getOrderBook({
+          instId,
+          sz: String(depth),
+        });
+
+        return response[0] ?? null;
+      } catch (error) {
+        return handleMarketDataError("Failed to fetch order book", error, { symbol, depth }, instId);
+      }
+    },
+
+    async getTrades(symbol: string, limit: number = 100): Promise<Trade[]> {
+      const instId = toInstId(symbol);
+      ensureInstrumentSupported(symbol, instId);
+
+      try {
+        return client.rest.getTrades({
+          instId,
+          limit,
+        });
+      } catch (error) {
+        return handleMarketDataError("Failed to fetch trades", error, { symbol, limit }, instId);
+      }
+    },
+
+    async getHistoricTrades(
+      symbol: string,
+      params?: { after?: string; before?: string; limit?: number; type?: "1" | "2" }
+    ): Promise<Trade[]> {
+      const instId = toInstId(symbol);
+      ensureInstrumentSupported(symbol, instId);
+
+      try {
+        return client.rest.getHistoricTrades({
+          instId,
+          after: params?.after,
+          before: params?.before,
+          limit: params?.limit ? String(params.limit) : undefined,
+          type: params?.type,
+        });
+      } catch (error) {
+        return handleMarketDataError(
+          "Failed to fetch historic trades",
+          error,
+          { symbol, params: params as unknown as Record<string, unknown> },
+          instId
+        );
+      }
+    },
+
+    async getInstruments(
+      instType: InstrumentType,
+      filters?: { uly?: string; instFamily?: string; instId?: string }
+    ): Promise<Instrument[]> {
+      try {
+        return client.rest.getInstruments({
+          instType,
+          uly: filters?.uly,
+          instFamily: filters?.instFamily,
+          instId: filters?.instId,
+        });
+      } catch (error) {
+        client.logger.error("Failed to fetch instruments", error, {
+          instType,
+          uly: filters?.uly,
+          instFamily: filters?.instFamily,
+          instId: filters?.instId,
+        });
+        throw handleOkxError(error);
+      }
+    },
+  };
 }

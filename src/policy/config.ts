@@ -32,6 +32,9 @@ export interface PolicyConfig {
   max_position_pct_equity: number;
   max_open_positions: number;
   max_notional_per_trade: number;
+  max_symbol_exposure_pct: number;
+  max_correlated_exposure_pct: number;
+  max_portfolio_drawdown_pct: number;
   allowed_order_types: string[];
   max_daily_loss_pct: number;
   cooldown_minutes_after_loss: number;
@@ -64,25 +67,55 @@ export function getDefaultOptionsPolicyConfig(): OptionsPolicyConfig {
   };
 }
 
-export function getDefaultPolicyConfig(env: Env): PolicyConfig {
+export function getSafePolicyFallbackConfig(): PolicyConfig {
   return {
-    max_position_pct_equity: parseNumber(env.DEFAULT_MAX_POSITION_PCT, 0.1),
-    max_open_positions: parseNumber(env.DEFAULT_MAX_OPEN_POSITIONS, 10),
-    max_notional_per_trade: parseNumber(env.DEFAULT_MAX_NOTIONAL_PER_TRADE, 5000),
+    max_position_pct_equity: 0.1,
+    max_open_positions: 10,
+    max_notional_per_trade: 5000,
+    max_symbol_exposure_pct: 0.25,
+    max_correlated_exposure_pct: 0.5,
+    max_portfolio_drawdown_pct: 0.15,
     allowed_order_types: ["market", "limit", "stop", "stop_limit"],
-    max_daily_loss_pct: parseNumber(env.DEFAULT_MAX_DAILY_LOSS_PCT, 0.02),
-    cooldown_minutes_after_loss: parseNumber(env.DEFAULT_COOLDOWN_MINUTES, 30),
+    max_daily_loss_pct: 0.02,
+    cooldown_minutes_after_loss: 30,
     allowed_symbols: null,
     deny_symbols: [],
     min_avg_volume: 100000,
     min_price: 1.0,
     trading_hours_only: true,
     extended_hours_allowed: false,
-    approval_token_ttl_seconds: parseNumber(env.DEFAULT_APPROVAL_TTL_SECONDS, 300),
+    approval_token_ttl_seconds: 300,
     allow_short_selling: false,
     use_cash_only: true,
     options: getDefaultOptionsPolicyConfig(),
   };
+}
+
+export function mergePolicyConfigWithDefaults(config: Partial<PolicyConfig> | null | undefined): PolicyConfig {
+  const defaults = getSafePolicyFallbackConfig();
+  const options = config?.options as Partial<OptionsPolicyConfig> | undefined;
+  return {
+    ...defaults,
+    ...(config ?? {}),
+    options: {
+      ...defaults.options,
+      ...(options ?? {}),
+    },
+  };
+}
+
+export function getDefaultPolicyConfig(env: Env): PolicyConfig {
+  return mergePolicyConfigWithDefaults({
+    max_position_pct_equity: parseNumber(env.DEFAULT_MAX_POSITION_PCT, 0.1),
+    max_open_positions: parseNumber(env.DEFAULT_MAX_OPEN_POSITIONS, 10),
+    max_notional_per_trade: parseNumber(env.DEFAULT_MAX_NOTIONAL_PER_TRADE, 5000),
+    max_symbol_exposure_pct: parseNumber(env.DEFAULT_MAX_SYMBOL_EXPOSURE_PCT, 0.25),
+    max_correlated_exposure_pct: parseNumber(env.DEFAULT_MAX_CORRELATED_EXPOSURE_PCT, 0.5),
+    max_portfolio_drawdown_pct: parseNumber(env.DEFAULT_MAX_PORTFOLIO_DRAWDOWN_PCT, 0.15),
+    max_daily_loss_pct: parseNumber(env.DEFAULT_MAX_DAILY_LOSS_PCT, 0.02),
+    cooldown_minutes_after_loss: parseNumber(env.DEFAULT_COOLDOWN_MINUTES, 30),
+    approval_token_ttl_seconds: parseNumber(env.DEFAULT_APPROVAL_TTL_SECONDS, 300),
+  });
 }
 
 export function validateOptionsPolicyConfig(config: unknown): OptionsPolicyConfig {
@@ -170,6 +203,30 @@ export function validatePolicyConfig(config: unknown): PolicyConfig {
 
   if (typeof c.max_notional_per_trade !== "number" || c.max_notional_per_trade <= 0) {
     throw new Error("max_notional_per_trade must be positive");
+  }
+
+  if (
+    typeof c.max_symbol_exposure_pct !== "number" ||
+    c.max_symbol_exposure_pct <= 0 ||
+    c.max_symbol_exposure_pct > 1
+  ) {
+    throw new Error("max_symbol_exposure_pct must be between 0 and 1");
+  }
+
+  if (
+    typeof c.max_correlated_exposure_pct !== "number" ||
+    c.max_correlated_exposure_pct <= 0 ||
+    c.max_correlated_exposure_pct > 1
+  ) {
+    throw new Error("max_correlated_exposure_pct must be between 0 and 1");
+  }
+
+  if (
+    typeof c.max_portfolio_drawdown_pct !== "number" ||
+    c.max_portfolio_drawdown_pct <= 0 ||
+    c.max_portfolio_drawdown_pct > 1
+  ) {
+    throw new Error("max_portfolio_drawdown_pct must be between 0 and 1");
   }
 
   if (!Array.isArray(c.allowed_order_types) || c.allowed_order_types.length === 0) {

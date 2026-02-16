@@ -37,7 +37,6 @@
 
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "../env.d";
-import { executeOrder } from "../execution/execute-order";
 import { isRequestAuthorized } from "../lib/auth";
 import { ErrorCode } from "../lib/errors";
 import {
@@ -63,7 +62,11 @@ import type { D1Client } from "../storage/d1/client";
 import { createD1Client } from "../storage/d1/client";
 import { insertActivityLog, queryActivityLogs } from "../storage/d1/queries/activity-logs";
 import { createDecision } from "../storage/d1/queries/decisions";
-import { insertPortfolioSnapshot, queryPortfolioSnapshots } from "../storage/d1/queries/portfolio-snapshots";
+import { createHarnessContext } from "./harness/context";
+import { createExecutionService, type ExecutionService } from "./harness/execution-service";
+import { createResearchService, type ResearchService } from "./harness/research-service";
+import { createSignalService, type SignalService } from "./harness/signal-service";
+import type { HarnessContext } from "./harness/types";
 
 // ============================================================================
 // SECTION 1: TYPES & CONFIGURATION
@@ -1165,14 +1168,28 @@ const tickerCache = new ValidTickerCache();
 // ============================================================================
 
 function normalizeCryptoSymbol(symbol: string): string {
-  if (symbol.includes("/")) {
-    return symbol.toUpperCase();
+  const upper = symbol.trim().toUpperCase();
+
+  if (upper.includes("/")) {
+    return upper;
   }
-  const match = symbol.toUpperCase().match(/^([A-Z]{2,5})(USD|USDT|USDC)$/);
+
+  const dashed = upper.match(/^([A-Z0-9]{2,15})-(USD|USDT|USDC)$/);
+  if (dashed) {
+    return `${dashed[1]}/${dashed[2]}`;
+  }
+
+  const alias = upper.match(/^([A-Z0-9]{2,15})(?:[.\-_]?X)$/);
+  if (alias) {
+    return `${alias[1]}/USDT`;
+  }
+
+  const match = upper.match(/^([A-Z0-9]{2,15})(USD|USDT|USDC)$/);
   if (match) {
     return `${match[1]}/${match[2]}`;
   }
-  return symbol;
+
+  return upper;
 }
 
 function isCryptoSymbol(symbol: string, cryptoSymbols: string[]): boolean {
@@ -1309,6 +1326,10 @@ function detectSentiment(text: string): number {
 export class OwokxHarness extends DurableObject<Env> {
   private state: AgentState = { ...DEFAULT_STATE };
   private _llm: LLMProvider | null = null;
+  private readonly harnessContext: HarnessContext<AgentState>;
+  private readonly signalService: SignalService;
+  private readonly researchService: ResearchService<ResearchResult>;
+  private readonly executionService: ExecutionService;
   private lastLogPersistAt = 0;
   private logPersistTimerArmed = false;
   private lastSwarmBypassLogAt = 0;
@@ -1327,7 +1348,18 @@ export class OwokxHarness extends DurableObject<Env> {
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
-    this.serviceShardKey = resolveShardKey(env.OWOKX_SHARD_KEY, "default");
+    this.harnessContext = createHarnessContext({
+      env: this.env,
+      getState: () => this.state,
+      getLLM: () => this._llm,
+    });
+    this.signalService = createSignalService(this.harnessContext, {
+      runDataGatherers: () => this.runDataGatherers(),
+    });
+    this.researchService = createResearchService<ResearchResult>(this.harnessContext, {
+      researchTopSignals: (limit?: number) => this.researchTopSignals(limit),
+    });
+    this.executionService = createExecutionService(this.harnessContext);
 
     this._llm = createLLMProvider(env);
     if (this._llm) {
@@ -1735,12 +1767,12 @@ export class OwokxHarness extends DurableObject<Env> {
       const clock = await broker.trading.getClock();
 
       if (now - this.state.lastDataGatherRun >= dataPollIntervalMs) {
-        await this.runDataGatherers();
+        await this.signalService.runDataGatherers();
         this.state.lastDataGatherRun = now;
       }
 
       if (now - this.state.lastResearchRun >= researchIntervalMs) {
-        await this.researchTopSignals(5);
+        await this.researchService.researchTopSignals(5);
         this.state.lastResearchRun = now;
       }
 
@@ -3473,6 +3505,19 @@ export class OwokxHarness extends DurableObject<Env> {
 
     for (const symbol of symbols) {
       try {
+        const cached = tickerCache.getCachedValidation(symbol);
+        if (cached === false) {
+          this.log("Crypto", "symbol_not_tradable", { symbol, broker: broker.broker, source: "cache" });
+          continue;
+        }
+        if (cached === undefined) {
+          const isTradable = await tickerCache.validateWithBroker(symbol, broker);
+          if (!isTradable) {
+            this.log("Crypto", "symbol_not_tradable", { symbol, broker: broker.broker, source: "broker_check" });
+            continue;
+          }
+        }
+
         const snapshot = await broker.marketData.getCryptoSnapshot(symbol);
         if (!snapshot) continue;
         if (!this.validateMarketData(snapshot)) continue;
@@ -3934,14 +3979,10 @@ export class OwokxHarness extends DurableObject<Env> {
 
     try {
       const notional = Math.round(positionSize * 100) / 100;
-      const db = createD1Client(this.env.DB);
       const suffix = idempotencySuffix ?? String(Math.floor(Date.now() / 300_000));
       const idempotency_key = `harness:buy:${symbol}:${suffix}`;
-      const execution = await executeOrder({
-        env: this.env,
-        db,
+      const execution = await this.executionService.submitOrder({
         broker,
-        source: "harness",
         idempotency_key,
         order: {
           symbol,
@@ -3959,7 +4000,7 @@ export class OwokxHarness extends DurableObject<Env> {
         submission_state: execution.submission.state,
         broker_order_id: execution.broker_order_id ?? null,
       });
-      return execution.submission.state === "SUBMITTED" || execution.submission.state === "SUBMITTING";
+      return execution.accepted;
     } catch (error) {
       this.log("Crypto", "buy_failed", { symbol, error: String(error) });
       return false;
@@ -6184,6 +6225,23 @@ export class OwokxHarness extends DurableObject<Env> {
         return null;
       }
 
+      const cached = tickerCache.getCachedValidation(brokerSymbol);
+      if (cached === false) {
+        this.log("SignalResearch", "symbol_not_tradable", { symbol: brokerSymbol, broker: broker.broker });
+        return null;
+      }
+      if (cached === undefined) {
+        const isTradable = await tickerCache.validateWithBroker(brokerSymbol, broker);
+        if (!isTradable) {
+          this.log("SignalResearch", "symbol_not_tradable", {
+            symbol: brokerSymbol,
+            broker: broker.broker,
+            source: "broker_check",
+          });
+          return null;
+        }
+      }
+
       const isCrypto = isCryptoSymbol(brokerSymbol, this.state.config.crypto_symbols || []);
       const stressFailed = !!this.state.lastStressTest && !this.state.lastStressTest.passed;
       const promptPolicy = this.resolvePromptPolicy("research", {
@@ -6463,12 +6521,41 @@ export class OwokxHarness extends DurableObject<Env> {
       });
     }
 
+    const tradableCandidates: Signal[] = [];
+    let untradableFilteredOut = 0;
+
+    for (const signal of brokerCandidates) {
+      const cached = tickerCache.getCachedValidation(signal.symbol);
+      if (cached === false) {
+        untradableFilteredOut += 1;
+        continue;
+      }
+
+      if (cached === undefined) {
+        const isTradable = await tickerCache.validateWithBroker(signal.symbol, broker);
+        if (!isTradable) {
+          untradableFilteredOut += 1;
+          continue;
+        }
+      }
+
+      tradableCandidates.push(signal);
+    }
+
+    if (untradableFilteredOut > 0) {
+      this.log("SignalResearch", "candidates_filtered_untradable", {
+        broker: broker.broker,
+        filtered_out: untradableFilteredOut,
+        candidate_count: tradableCandidates.length,
+      });
+    }
+
     // Use raw_sentiment for threshold (before weighting), weighted sentiment for sorting
-    let eligibleSignals = brokerCandidates.filter((s) => s.raw_sentiment >= this.state.config.min_sentiment_score);
+    let eligibleSignals = tradableCandidates.filter((s) => s.raw_sentiment >= this.state.config.min_sentiment_score);
 
     if (eligibleSignals.length === 0 && broker.broker === "okx") {
       // OKX research should still progress even during low-momentum periods.
-      eligibleSignals = brokerCandidates
+      eligibleSignals = tradableCandidates
         .filter((signal) => isCryptoSymbol(signal.symbol, this.state.config.crypto_symbols || []))
         .sort((a, b) => Math.abs(b.sentiment) - Math.abs(a.sentiment))
         .slice(0, Math.max(limit, 3));
@@ -6487,7 +6574,7 @@ export class OwokxHarness extends DurableObject<Env> {
         broker: broker.broker,
         total_signals: allSignals.length,
         not_held: notHeld.length,
-        broker_candidates: brokerCandidates.length,
+        broker_candidates: tradableCandidates.length,
         min_sentiment: this.state.config.min_sentiment_score,
       });
       this.recordPerformanceSample("research", Date.now() - startedAt, false);
@@ -7528,14 +7615,10 @@ Response format:
       }
 
       const notional = Math.round(positionSize * 100) / 100;
-      const db = createD1Client(this.env.DB);
       const suffix = idempotencySuffix ?? String(Math.floor(Date.now() / 300_000));
       const idempotency_key = `harness:buy:${orderSymbol}:${suffix}`;
-      const execution = await executeOrder({
-        env: this.env,
-        db,
+      const execution = await this.executionService.submitOrder({
         broker,
-        source: "harness",
         idempotency_key,
         order: {
           symbol: orderSymbol,
@@ -7574,7 +7657,7 @@ Response format:
           },
         }
       );
-      return execution.submission.state === "SUBMITTED" || execution.submission.state === "SUBMITTING";
+      return execution.accepted;
     } catch (error) {
       this.log("Executor", "buy_failed", { symbol, error: String(error) });
       this.rememberEpisode(`Buy failed for ${symbol}`, "failure", ["trade", "buy", symbol, "error"], {
@@ -7614,15 +7697,11 @@ Response format:
       const timeInForce = isCrypto ? "gtc" : "day";
 
       const entry = this.state.positionEntries[pos.symbol];
-      const db = createD1Client(this.env.DB);
       const suffix = idempotencySuffix ?? String(entry?.entry_time ?? Math.floor(Date.now() / 300_000));
       const idempotency_key = `harness:sell:${pos.symbol}:${suffix}`;
 
-      const execution = await executeOrder({
-        env: this.env,
-        db,
+      const execution = await this.executionService.submitOrder({
         broker,
-        source: "harness",
         idempotency_key,
         order: {
           symbol: pos.symbol,
@@ -7684,7 +7763,7 @@ Response format:
         }
       }
 
-      return execution.submission.state === "SUBMITTED" || execution.submission.state === "SUBMITTING";
+      return execution.accepted;
     } catch (error) {
       this.log("Executor", "sell_failed", { symbol, error: String(error) });
       this.rememberEpisode(`Sell failed for ${symbol}`, "failure", ["trade", "sell", symbol, "error"], {
@@ -8058,7 +8137,7 @@ Response format:
       researched: Object.keys(this.state.signalResearch).length,
     });
 
-    const signalResearch = await this.researchTopSignals(10);
+    const signalResearch = await this.researchService.researchTopSignals(10);
     const analysis = await this.analyzeSignalsWithLLM(this.state.signalCache, positions, account);
 
     this.state.premarketPlan = {

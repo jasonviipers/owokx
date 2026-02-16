@@ -10,6 +10,9 @@ function createTestConfig(overrides: Partial<PolicyConfig> = {}): PolicyConfig {
     max_position_pct_equity: 0.1,
     max_open_positions: 5,
     max_notional_per_trade: 5000,
+    max_symbol_exposure_pct: 0.25,
+    max_correlated_exposure_pct: 0.5,
+    max_portfolio_drawdown_pct: 0.15,
     allowed_order_types: ["market", "limit"],
     max_daily_loss_pct: 0.02,
     cooldown_minutes_after_loss: 30,
@@ -88,6 +91,9 @@ function createTestRiskState(overrides: Partial<RiskState> = {}): RiskState {
     daily_loss_usd: 0,
     daily_loss_reset_at: new Date().toISOString(),
     daily_equity_start: null,
+    max_symbol_exposure_pct: 0.25,
+    max_correlated_exposure_pct: 0.5,
+    max_portfolio_drawdown_pct: 0.15,
     last_loss_at: null,
     cooldown_until: null,
     updated_at: new Date().toISOString(),
@@ -459,6 +465,65 @@ describe("PolicyEngine", () => {
 
       const result = engine.evaluate(ctx);
       expect(result.violations.some((v) => v.rule === "insufficient_funds")).toBe(false);
+    });
+  });
+
+  describe("unified risk constraints", () => {
+    it("blocks buys that exceed max symbol exposure", () => {
+      engine = new PolicyEngine(
+        createTestConfig({
+          max_position_pct_equity: 1,
+          max_notional_per_trade: 100000,
+          max_symbol_exposure_pct: 0.2,
+        })
+      );
+
+      const ctx = createTestContext({
+        account: createTestAccount({ equity: 100000 }),
+        positions: [createTestPosition({ symbol: "AAPL", market_value: 15000 })],
+        order: createTestOrder({ symbol: "AAPL", notional: 10000 }),
+      });
+
+      const result = engine.evaluate(ctx);
+      expect(result.allowed).toBe(false);
+      expect(result.violations.some((v) => v.rule === "max_symbol_exposure")).toBe(true);
+    });
+
+    it("blocks buys that exceed correlated exposure", () => {
+      engine = new PolicyEngine(
+        createTestConfig({
+          max_position_pct_equity: 1,
+          max_notional_per_trade: 100000,
+          max_symbol_exposure_pct: 1,
+          max_correlated_exposure_pct: 0.3,
+        })
+      );
+
+      const ctx = createTestContext({
+        account: createTestAccount({ equity: 100000 }),
+        positions: [
+          createTestPosition({ symbol: "GOOG", market_value: 15000 }),
+          createTestPosition({ symbol: "MSFT", market_value: 10000 }),
+        ],
+        order: createTestOrder({ symbol: "AAPL", notional: 10000 }),
+      });
+
+      const result = engine.evaluate(ctx);
+      expect(result.allowed).toBe(false);
+      expect(result.violations.some((v) => v.rule === "max_correlated_exposure")).toBe(true);
+    });
+
+    it("blocks trading when portfolio drawdown exceeds limit", () => {
+      engine = new PolicyEngine(createTestConfig({ max_portfolio_drawdown_pct: 0.1, max_notional_per_trade: 100000 }));
+
+      const ctx = createTestContext({
+        account: createTestAccount({ equity: 85000, last_equity: 100000 }),
+        riskState: createTestRiskState({ daily_equity_start: 100000 }),
+      });
+
+      const result = engine.evaluate(ctx);
+      expect(result.allowed).toBe(false);
+      expect(result.violations.some((v) => v.rule === "max_portfolio_drawdown")).toBe(true);
     });
   });
 

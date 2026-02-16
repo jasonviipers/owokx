@@ -1,5 +1,19 @@
+import type {
+  AccountBalance,
+  AccountBill,
+  AccountLeverageResult,
+  AccountPosition,
+  FillsHistoryRequest,
+  Instrument,
+  InstrumentType,
+  OrderDetails,
+  OrderFill,
+  OrderHistoryRequest,
+  OrderRequest,
+  OrderResult,
+  PositionSide,
+} from "okx-api";
 import { createError, ErrorCode } from "../../lib/errors";
-import { nowISO } from "../../lib/utils";
 import type {
   Account,
   Asset,
@@ -14,479 +28,970 @@ import type {
   Position,
 } from "../types";
 import type { OkxClient } from "./client";
+import { handleOkxError } from "./client";
 import { normalizeOkxSymbol } from "./symbols";
 
-interface OkxBalanceDetails {
-  ccy: string;
-  cashBal?: string;
-  availBal?: string;
-  eq?: string;
+const SUPPORTED_INST_TYPES: InstrumentType[] = ["SPOT", "MARGIN", "SWAP", "FUTURES", "OPTION"];
+
+type OkxOrderType = OrderRequest["ordType"];
+
+type OkxTradeMode = OrderRequest["tdMode"];
+
+function parseNumber(value: string | number | undefined, fallback: number = 0): number {
+  if (typeof value === "number") {
+    return Number.isFinite(value) ? value : fallback;
+  }
+  if (typeof value === "string") {
+    const parsed = Number.parseFloat(value);
+    return Number.isFinite(parsed) ? parsed : fallback;
+  }
+  return fallback;
 }
 
-interface OkxBalanceEntry {
-  totalEq?: string;
-  details?: OkxBalanceDetails[];
+function toIsoTimestamp(value: string | undefined): string {
+  if (!value) {
+    return new Date().toISOString();
+  }
+
+  if (/^\d+$/.test(value)) {
+    const parsed = Number.parseInt(value, 10);
+    if (Number.isFinite(parsed)) {
+      return new Date(parsed).toISOString();
+    }
+  }
+
+  return value;
 }
 
-export interface OkxTradingProviderOptions {
-  simulatedTrading?: boolean;
-  enableDemoVirtualBalances?: boolean;
-  demoVirtualCashUsd?: number;
-  demoVirtualBuyingPowerUsd?: number;
+function mapOrderState(state: string | undefined): Order["status"] {
+  switch (state) {
+    case "canceled":
+    case "mmp_canceled":
+      return "canceled";
+    case "live":
+      return "accepted";
+    case "partially_filled":
+      return "partially_filled";
+    case "filled":
+      return "filled";
+    default:
+      return "new";
+  }
 }
 
-interface OkxOrderInfo {
-  instId: string;
-  ordId: string;
-  clOrdId?: string;
-  side: "buy" | "sell";
-  ordType: string;
-  state: string;
-  sz: string;
-  fillSz: string;
-  avgPx: string;
-  px?: string;
-  cTime: string;
-  uTime: string;
+function mapTimeInForce(ordType: string | undefined): string {
+  if (!ordType) {
+    return "gtc";
+  }
+
+  if (ordType === "fok") {
+    return "fok";
+  }
+
+  if (ordType === "ioc" || ordType === "market") {
+    return "ioc";
+  }
+
+  return "gtc";
 }
 
-function parseNumber(value: string | undefined): number {
-  if (!value) return 0;
-  const n = parseFloat(value);
-  return Number.isFinite(n) ? n : 0;
+function inferAssetClass(instType: string | undefined): Order["asset_class"] {
+  if (!instType) {
+    return "crypto";
+  }
+
+  return "crypto";
 }
 
-function mapOrderState(state: string): Order["status"] {
-  const s = state.toLowerCase();
-  if (s === "live") return "new";
-  if (s === "partially_filled") return "partially_filled";
-  if (s === "filled") return "filled";
-  if (s === "canceled") return "canceled";
-  if (s === "canceling") return "pending_cancel";
-  if (s === "failed") return "rejected";
-  return "new";
-}
-
-function mapTimeInForce(tif: OrderParams["time_in_force"]): string | undefined {
-  if (tif === "ioc") return "IOC";
-  if (tif === "fok") return "FOK";
-  return "GTC";
-}
-
-function createSyntheticOrder(params: {
-  id: string;
-  symbol: string;
-  side: "buy" | "sell";
-  type: string;
-  timeInForce: string;
-  qty: string;
-  limitPrice: string | null;
-  createdAt: string;
-}): Order {
+function parseOrder(raw: Partial<OrderDetails> & { ordId: string; instId: string }): Order {
   return {
-    id: params.id,
-    client_order_id: "",
-    symbol: params.symbol,
-    asset_id: "",
-    asset_class: "crypto",
-    qty: params.qty,
-    filled_qty: "0",
-    filled_avg_price: null,
-    order_class: "",
-    order_type: params.type,
-    type: params.type,
-    side: params.side,
-    time_in_force: params.timeInForce,
-    limit_price: params.limitPrice,
+    id: raw.ordId,
+    client_order_id: raw.clOrdId ?? "",
+    symbol: raw.instId,
+    asset_id: raw.instId,
+    asset_class: inferAssetClass(raw.instType),
+    qty: raw.sz ?? "0",
+    filled_qty: raw.accFillSz ?? raw.fillSz ?? "0",
+    filled_avg_price: raw.avgPx || null,
+    order_class: "simple",
+    order_type: raw.ordType ?? "limit",
+    type: raw.ordType ?? "limit",
+    side: (raw.side as Order["side"]) ?? "buy",
+    time_in_force: mapTimeInForce(raw.ordType),
+    limit_price: raw.px || null,
     stop_price: null,
-    status: "new",
+    status: mapOrderState(raw.state),
     extended_hours: false,
-    created_at: params.createdAt,
-    updated_at: params.createdAt,
-    submitted_at: params.createdAt,
-    filled_at: null,
+    created_at: toIsoTimestamp(raw.cTime),
+    updated_at: toIsoTimestamp(raw.uTime),
+    submitted_at: toIsoTimestamp(raw.cTime),
+    filled_at: raw.state === "filled" ? toIsoTimestamp(raw.uTime) : null,
     expired_at: null,
-    canceled_at: null,
+    canceled_at: raw.state === "canceled" || raw.state === "mmp_canceled" ? toIsoTimestamp(raw.uTime) : null,
     failed_at: null,
   };
 }
 
-function parseOkxOrder(raw: OkxOrderInfo): Order {
-  const createdAt = new Date(Number(raw.cTime)).toISOString();
-  const updatedAt = new Date(Number(raw.uTime)).toISOString();
-  const symbol = raw.instId.replace("-", "/");
-  const filledAt = raw.state === "filled" ? updatedAt : null;
-  const canceledAt = raw.state === "canceled" ? updatedAt : null;
-  const failedAt = raw.state === "failed" ? updatedAt : null;
+function parseOrderResult(result: OrderResult, request: OrderRequest): Order {
+  const accepted = result.sCode === "0" || result.sCode === "";
 
   return {
-    id: raw.ordId,
-    client_order_id: raw.clOrdId || "",
-    symbol,
-    asset_id: "",
-    asset_class: "crypto",
-    qty: raw.sz,
-    filled_qty: raw.fillSz,
-    filled_avg_price: raw.avgPx ? raw.avgPx : null,
-    order_class: "",
-    order_type: raw.ordType,
-    type: raw.ordType,
-    side: raw.side,
-    time_in_force: "gtc",
-    limit_price: raw.px ?? null,
+    id: result.ordId,
+    client_order_id: result.clOrdId ?? request.clOrdId ?? "",
+    symbol: request.instId,
+    asset_id: request.instId,
+    asset_class: inferAssetClass(undefined),
+    qty: String(request.sz),
+    filled_qty: "0",
+    filled_avg_price: null,
+    order_class: "simple",
+    order_type: request.ordType,
+    type: request.ordType,
+    side: request.side,
+    time_in_force: mapTimeInForce(request.ordType),
+    limit_price: request.px ?? null,
     stop_price: null,
-    status: mapOrderState(raw.state),
+    status: accepted ? "accepted" : "rejected",
     extended_hours: false,
-    created_at: createdAt,
-    updated_at: updatedAt,
-    submitted_at: createdAt,
-    filled_at: filledAt,
+    created_at: toIsoTimestamp(result.ts),
+    updated_at: toIsoTimestamp(result.ts),
+    submitted_at: toIsoTimestamp(result.ts),
+    filled_at: null,
     expired_at: null,
-    canceled_at: canceledAt,
-    failed_at: failedAt,
+    canceled_at: null,
+    failed_at: accepted ? null : toIsoTimestamp(result.ts),
   };
 }
 
-export class OkxTradingProvider implements BrokerProvider {
-  constructor(
-    private client: OkxClient,
-    private defaultQuote: string,
-    private options: OkxTradingProviderOptions = {}
-  ) {}
+function parsePosition(raw: AccountPosition): Position {
+  const rawPos = parseNumber(raw.pos, 0);
+  const qty = Math.abs(rawPos);
+  const avgEntry = parseNumber(raw.avgPx, 0);
+  const markPrice = parseNumber(raw.markPx, parseNumber(raw.last, avgEntry));
 
-  async getAccount(): Promise<Account> {
-    const res = await this.client.request<OkxBalanceEntry>("GET", "/api/v5/account/balance");
-    const root = res.data[0];
-    const details = root?.details ?? [];
+  const side: Position["side"] = raw.posSide === "short" || rawPos < 0 ? "short" : "long";
 
-    const quote = this.defaultQuote.toUpperCase();
-    const quoteRow = details.find((d) => d.ccy.toUpperCase() === quote);
+  return {
+    asset_id: raw.instId,
+    symbol: raw.instId,
+    exchange: "OKX",
+    asset_class: "crypto",
+    avg_entry_price: avgEntry,
+    qty,
+    side,
+    market_value: qty * markPrice,
+    cost_basis: qty * avgEntry,
+    unrealized_pl: parseNumber(raw.upl, 0),
+    unrealized_plpc: parseNumber(raw.uplRatio, 0),
+    unrealized_intraday_pl: parseNumber(raw.upl, 0),
+    unrealized_intraday_plpc: parseNumber(raw.uplRatio, 0),
+    current_price: markPrice,
+    lastday_price: parseNumber(raw.last, markPrice),
+    change_today: 0,
+  };
+}
 
-    const availBal = parseNumber(quoteRow?.availBal);
-    const cashBal = parseNumber(quoteRow?.cashBal);
-    const quoteEq = parseNumber(quoteRow?.eq);
-    let cash = Math.max(availBal, cashBal, quoteEq);
+const DEMO_VIRTUAL_CASH = 25_000;
+const DEMO_VIRTUAL_BUYING_POWER = 40_000;
 
-    const isDemoVirtualEnabled =
-      this.options.simulatedTrading === true && (this.options.enableDemoVirtualBalances ?? true) === true;
-    if (isDemoVirtualEnabled && cash <= 0) {
-      const defaultSeed = 100_000;
-      const configuredSeed = this.options.demoVirtualCashUsd;
-      const seed = Number.isFinite(configuredSeed) ? Math.max(0, configuredSeed as number) : defaultSeed;
-      cash = seed;
-    }
+function parseAccount(raw: AccountBalance, defaultQuoteCcy: string, simulatedTrading: boolean = false): Account {
+  const details = Array.isArray(raw.details) ? raw.details : [];
+  const preferredCcy = details.find((detail) => detail.ccy === defaultQuoteCcy) ?? details[0];
 
-    let buyingPower = cash;
-    if (isDemoVirtualEnabled && buyingPower <= 0) {
-      const configuredBuyingPower = this.options.demoVirtualBuyingPowerUsd;
-      const fallbackBuyingPower = this.options.demoVirtualCashUsd;
-      const seed = Number.isFinite(configuredBuyingPower)
-        ? Math.max(0, configuredBuyingPower as number)
-        : Number.isFinite(fallbackBuyingPower)
-          ? Math.max(0, fallbackBuyingPower as number)
-          : 100_000;
-      buyingPower = seed;
-    }
+  const reportedCash = parseNumber(preferredCcy?.cashBal, 0);
+  const reportedEquity = parseNumber(raw.totalEq, 0);
+  const reportedBuyingPower = parseNumber(raw.adjEq, reportedEquity);
 
-    const exchangeEquity = parseNumber(root?.totalEq);
-    const equity = Math.max(exchangeEquity, cash);
+  const isDemoWithEmptyQuoteBalance = simulatedTrading && reportedCash <= 0;
+  const equity = isDemoWithEmptyQuoteBalance ? Math.max(reportedEquity, DEMO_VIRTUAL_CASH) : reportedEquity;
+  const cash = isDemoWithEmptyQuoteBalance ? equity : reportedCash;
+  const buyingPower = isDemoWithEmptyQuoteBalance
+    ? Math.max(reportedBuyingPower, equity, DEMO_VIRTUAL_BUYING_POWER)
+    : reportedBuyingPower;
 
-    return {
-      id: "okx",
-      account_number: "okx",
-      status: "ACTIVE",
-      currency: quote,
-      cash,
-      buying_power: buyingPower,
-      regt_buying_power: buyingPower,
-      daytrading_buying_power: buyingPower,
-      equity,
-      last_equity: equity,
-      long_market_value: Math.max(0, equity - cash),
-      short_market_value: 0,
-      portfolio_value: equity,
-      pattern_day_trader: false,
-      trading_blocked: false,
-      transfers_blocked: false,
-      account_blocked: false,
-      multiplier: "1",
-      shorting_enabled: false,
-      maintenance_margin: 0,
-      initial_margin: 0,
-      daytrade_count: 0,
-      created_at: nowISO(),
-    };
+  return {
+    id: "okx-account",
+    account_number: "okx-account",
+    status: "ACTIVE",
+    currency: preferredCcy?.ccy ?? defaultQuoteCcy,
+    cash,
+    buying_power: buyingPower,
+    regt_buying_power: buyingPower,
+    daytrading_buying_power: buyingPower,
+    equity,
+    last_equity: equity,
+    long_market_value: 0,
+    short_market_value: 0,
+    portfolio_value: equity,
+    pattern_day_trader: false,
+    trading_blocked: false,
+    transfers_blocked: false,
+    account_blocked: false,
+    multiplier: "1",
+    shorting_enabled: true,
+    maintenance_margin: parseNumber(raw.mmr, 0),
+    initial_margin: parseNumber(raw.imr, 0),
+    daytrade_count: 0,
+    created_at: toIsoTimestamp(raw.uTime),
+  };
+}
+
+function mapBrokerOrderToOkxType(params: OrderParams): OkxOrderType {
+  if (params.type === "market") {
+    return "market";
   }
 
-  async getPositions(): Promise<Position[]> {
-    const balance = await this.client.request<OkxBalanceEntry>("GET", "/api/v5/account/balance");
-    const root = balance.data[0];
-    const details = root?.details ?? [];
+  if (params.time_in_force === "fok") {
+    return "fok";
+  }
 
-    const quote = this.defaultQuote.toUpperCase();
-    const positions = details
-      .filter((d) => d.ccy.toUpperCase() !== quote)
-      .map((d) => ({
-        ccy: d.ccy.toUpperCase(),
-        qty: parseNumber(d.cashBal ?? d.eq),
-      }))
-      .filter((p) => p.qty > 0);
+  if (params.time_in_force === "ioc") {
+    return "ioc";
+  }
 
-    if (positions.length === 0) return [];
+  return "limit";
+}
 
-    // Fetch all SPOT tickers at once instead of individual calls
-    interface OkxTickerData {
-      instId: string;
-      last: string;
+function mapOrderParamsToOkxOrderRequest(params: OrderParams, defaultQuoteCcy: string): OrderRequest {
+  const hasQty = params.qty !== undefined;
+  const hasNotional = params.notional !== undefined;
+
+  if (!hasQty && !hasNotional) {
+    throw createError(ErrorCode.INVALID_INPUT, "Either qty or notional must be provided for createOrder()");
+  }
+
+  const request: OrderRequest = {
+    instId: normalizeOkxSymbol(params.symbol, defaultQuoteCcy).instId,
+    tdMode: "cash",
+    side: params.side,
+    ordType: mapBrokerOrderToOkxType(params),
+    sz: String(params.qty ?? params.notional ?? 0),
+    clOrdId: params.client_order_id,
+  };
+
+  if (params.limit_price !== undefined) {
+    request.px = String(params.limit_price);
+  }
+
+  if (params.notional !== undefined && params.qty === undefined) {
+    request.tgtCcy = "quote_ccy";
+  }
+
+  return request;
+}
+
+function mapInstTypeForAsset(instType: InstrumentType): Asset["class"] {
+  if (instType === "SPOT" || instType === "MARGIN") {
+    return "crypto";
+  }
+  return "crypto";
+}
+
+export interface OkxOrderByIdParams {
+  instId: string;
+  ordId?: string;
+  clOrdId?: string;
+}
+
+export interface OkxPlaceOrderParams {
+  instId: string;
+  side: "buy" | "sell";
+  ordType?: OkxOrderType;
+  tdMode?: OkxTradeMode;
+  sz: string | number;
+  px?: string | number;
+  ccy?: string;
+  clOrdId?: string;
+  tag?: string;
+  posSide?: PositionSide;
+  reduceOnly?: boolean;
+  tgtCcy?: "base_ccy" | "quote_ccy";
+  instType?: InstrumentType;
+}
+
+export interface OkxTransactionHistoryParams {
+  ccy?: string;
+  instType?: InstrumentType;
+  type?: string;
+  subType?: string;
+  after?: string;
+  before?: string;
+  begin?: string;
+  end?: string;
+  limit?: number;
+  archive?: boolean;
+}
+
+export interface OkxFillsParams extends FillsHistoryRequest {
+  archive?: boolean;
+}
+
+export interface OkxTradingProvider extends BrokerProvider {
+  placeOrder(params: OkxPlaceOrderParams): Promise<Order>;
+  placeSpotOrder(params: Omit<OkxPlaceOrderParams, "instType" | "tdMode"> & { tdMode?: "cash" }): Promise<Order>;
+  placeMarginOrder(
+    params: Omit<OkxPlaceOrderParams, "instType" | "tdMode"> & { tdMode?: "cross" | "isolated" }
+  ): Promise<Order>;
+  placeFuturesOrder(
+    params: Omit<OkxPlaceOrderParams, "instType" | "tdMode"> & {
+      instType?: "SWAP" | "FUTURES";
+      tdMode?: "cross" | "isolated";
     }
-
-    const tickersResponse = await this.client.request<OkxTickerData>(
-      "GET",
-      "/api/v5/market/tickers",
-      { instType: "SPOT" },
-      undefined,
-      { auth: false }
-    );
-
-    // Create a map of instId -> price for quick lookup
-    const priceMap = new Map<string, number>();
-    for (const ticker of tickersResponse.data) {
-      priceMap.set(ticker.instId, parseNumber(ticker.last));
+  ): Promise<Order>;
+  placeOptionOrder(
+    params: Omit<OkxPlaceOrderParams, "instType"> & {
+      instType?: "OPTION";
+      tdMode?: "cross" | "isolated";
     }
+  ): Promise<Order>;
 
-    return positions.map((p) => {
-      const symbolInfo = normalizeOkxSymbol(p.ccy, quote);
-      const price = priceMap.get(symbolInfo.instId) ?? 0;
-      const marketValue = p.qty * price;
-      const symbol = `${p.ccy}/${quote}`;
+  getOrderById(params: OkxOrderByIdParams): Promise<Order>;
+  cancelOrderById(params: OkxOrderByIdParams): Promise<void>;
+
+  listOrdersByInstrumentType(instType: InstrumentType, params?: ListOrdersParams): Promise<Order[]>;
+
+  getBalances(ccy?: string): Promise<AccountBalance[]>;
+  getTransactionHistory(params?: OkxTransactionHistoryParams): Promise<AccountBill[]>;
+  getFills(params?: OkxFillsParams): Promise<OrderFill[]>;
+  setLeverage(params: {
+    lever: string;
+    mgnMode: "cross" | "isolated";
+    instId?: string;
+    ccy?: string;
+    posSide?: PositionSide;
+  }): Promise<AccountLeverageResult[]>;
+}
+
+export function createOkxTradingProvider(client: OkxClient): OkxTradingProvider {
+  const orderInstrumentCache = new Map<string, string>();
+  const defaultQuoteCcy = client.config.defaultQuoteCcy ?? "USDT";
+  const toInstId = (symbol: string): string => normalizeOkxSymbol(symbol, defaultQuoteCcy).instId;
+
+  const rememberOrderInstrument = (orderId: string | undefined, instId: string | undefined) => {
+    if (orderId && instId) {
+      orderInstrumentCache.set(orderId, instId);
+    }
+  };
+
+  const resolveOrderIdentifier = (orderId: string): { ordId?: string; clOrdId?: string } => {
+    if (orderId.startsWith("cl:")) {
       return {
-        asset_id: "",
-        symbol,
-        exchange: "OKX",
-        asset_class: "crypto",
-        avg_entry_price: 0,
-        qty: p.qty,
-        side: "long",
-        market_value: marketValue,
-        cost_basis: marketValue,
-        unrealized_pl: 0,
-        unrealized_plpc: 0,
-        unrealized_intraday_pl: 0,
-        unrealized_intraday_plpc: 0,
-        current_price: price,
-        lastday_price: price,
-        change_today: 0,
+        clOrdId: orderId.slice(3),
       };
-    });
-  }
-
-  async getPosition(symbol: string): Promise<Position | null> {
-    const norm = normalizeOkxSymbol(symbol, this.defaultQuote);
-    const positions = await this.getPositions();
-    return positions.find((p) => normalizeOkxSymbol(p.symbol, this.defaultQuote).instId === norm.instId) ?? null;
-  }
-
-  async closePosition(symbol: string, qty?: number, percentage?: number): Promise<Order> {
-    const pos = await this.getPosition(symbol);
-    if (!pos) {
-      throw createError(ErrorCode.NOT_FOUND, `Position not found: ${symbol}`);
     }
 
-    let sellQty = pos.qty;
-    if (qty !== undefined) {
-      sellQty = Math.min(pos.qty, qty);
-    } else if (percentage !== undefined) {
-      sellQty = Math.max(0, Math.min(pos.qty, pos.qty * (percentage / 100)));
-    }
-
-    if (sellQty <= 0) {
-      throw createError(ErrorCode.INVALID_INPUT, "Sell quantity must be > 0");
-    }
-
-    return this.createOrder({
-      symbol: pos.symbol,
-      qty: sellQty,
-      side: "sell",
-      type: "market",
-      time_in_force: "gtc",
-    });
-  }
-
-  async createOrder(params: OrderParams): Promise<Order> {
-    const symbolInfo = normalizeOkxSymbol(params.symbol, this.defaultQuote);
-
-    const ordType = params.type === "market" ? "market" : params.type === "limit" ? "limit" : null;
-    if (!ordType) {
-      throw createError(ErrorCode.NOT_SUPPORTED, `OKX does not support order type: ${params.type}`);
-    }
-
-    const body: Record<string, unknown> = {
-      instId: symbolInfo.instId,
-      tdMode: "cash",
-      side: params.side,
-      ordType,
-    };
-
-    if (params.client_order_id) body.clOrdId = params.client_order_id;
-
-    if (ordType === "limit") {
-      if (params.limit_price === undefined) {
-        throw createError(ErrorCode.INVALID_INPUT, "limit_price is required for limit orders");
+    if (orderId.includes("|")) {
+      const [kind, id] = orderId.split("|");
+      if (kind === "cl" && id) {
+        return { clOrdId: id };
       }
-      body.px = String(params.limit_price);
     }
 
-    const tif = mapTimeInForce(params.time_in_force);
-    if (tif) body.tif = tif;
+    return { ordId: orderId };
+  };
 
-    if (params.qty !== undefined) {
-      body.sz = String(params.qty);
-    } else if (params.notional !== undefined) {
-      if (params.side !== "buy") {
-        throw createError(ErrorCode.INVALID_INPUT, "notional is only supported for buy orders on OKX");
-      }
-      if (ordType !== "market") {
-        throw createError(ErrorCode.INVALID_INPUT, "notional is only supported for market orders on OKX");
-      }
-      body.sz = String(params.notional);
-      body.tgtCcy = "quote_ccy";
-    } else {
-      throw createError(ErrorCode.INVALID_INPUT, "Either qty or notional is required");
+  const resolveInstrumentForOrder = async (orderId: string): Promise<string> => {
+    const cached = orderInstrumentCache.get(orderId);
+    if (cached) {
+      return cached;
     }
 
-    const placed = await this.client.request<{ ordId: string; clOrdId?: string; sCode: string; sMsg: string }>(
-      "POST",
-      "/api/v5/trade/order",
-      undefined,
-      body
+    const orderIdentifier = resolveOrderIdentifier(orderId);
+
+    const openOrderSearch = await Promise.all(
+      SUPPORTED_INST_TYPES.map(async (instType) => {
+        try {
+          const orders = await client.rest.getOrderList({ instType, limit: "100" } as OrderHistoryRequest);
+          const found = orders.find((order) =>
+            orderIdentifier.ordId ? order.ordId === orderIdentifier.ordId : order.clOrdId === orderIdentifier.clOrdId
+          );
+          return found?.instId;
+        } catch (error) {
+          client.logger.debug("Order search in open orders failed", {
+            instType,
+            orderId,
+            error: String(error),
+          });
+          return undefined;
+        }
+      })
     );
-    const result = placed.data[0];
 
-    if (!result || result.sCode !== "0") {
-      throw createError(ErrorCode.PROVIDER_ERROR, `OKX order rejected: ${result?.sMsg ?? "unknown"}`, {
-        sCode: result?.sCode,
+    const fromOpen = openOrderSearch.find((instId): instId is string => Boolean(instId));
+    if (fromOpen) {
+      rememberOrderInstrument(orderId, fromOpen);
+      return fromOpen;
+    }
+
+    const historicSearch = await Promise.all(
+      SUPPORTED_INST_TYPES.map(async (instType) => {
+        try {
+          const orders = await client.rest.getOrderHistory({ instType, limit: "100" } as OrderHistoryRequest);
+          const found = orders.find((order) =>
+            orderIdentifier.ordId ? order.ordId === orderIdentifier.ordId : order.clOrdId === orderIdentifier.clOrdId
+          );
+          return found?.instId;
+        } catch (error) {
+          client.logger.debug("Order search in history failed", {
+            instType,
+            orderId,
+            error: String(error),
+          });
+          return undefined;
+        }
+      })
+    );
+
+    const fromHistory = historicSearch.find((instId): instId is string => Boolean(instId));
+    if (fromHistory) {
+      rememberOrderInstrument(orderId, fromHistory);
+      return fromHistory;
+    }
+
+    throw createError(ErrorCode.NOT_FOUND, `Unable to resolve instrument for order ${orderId}`);
+  };
+
+  const placeOrderRequest = async (request: OrderRequest): Promise<Order> => {
+    const response = await client.rest.submitOrder(request);
+    const firstResult = response[0];
+
+    if (!firstResult) {
+      throw createError(ErrorCode.PROVIDER_ERROR, "OKX did not return order submission data");
+    }
+
+    rememberOrderInstrument(firstResult.ordId, request.instId);
+
+    if (firstResult.sCode !== "0" && firstResult.sCode !== "") {
+      handleOkxError({
+        code: firstResult.sCode,
+        msg: firstResult.sMsg || "Order submission failed",
       });
     }
 
-    const createdAt = nowISO();
-    return createSyntheticOrder({
-      id: result.ordId,
-      symbol: symbolInfo.normalizedSymbol,
-      side: params.side,
-      type: ordType,
-      timeInForce: params.time_in_force,
-      qty: params.qty !== undefined ? String(params.qty) : String(params.notional),
-      limitPrice: params.limit_price !== undefined ? String(params.limit_price) : null,
-      createdAt,
-    });
-  }
-
-  async getOrder(orderId: string): Promise<Order> {
-    const res = await this.client.request<OkxOrderInfo>("GET", "/api/v5/trade/order", { ordId: orderId });
-    const raw = res.data[0];
-    if (!raw) throw createError(ErrorCode.NOT_FOUND, `Order not found: ${orderId}`);
-    return parseOkxOrder(raw);
-  }
-
-  async listOrders(params?: ListOrdersParams): Promise<Order[]> {
-    const status = params?.status ?? "open";
-
-    if (status === "open") {
-      const res = await this.client.request<OkxOrderInfo>("GET", "/api/v5/trade/orders-pending", { instType: "SPOT" });
-      return (res.data || []).map(parseOkxOrder);
-    }
-
-    if (status === "closed") {
-      const res = await this.client.request<OkxOrderInfo>("GET", "/api/v5/trade/orders-history", { instType: "SPOT" });
-      return (res.data || []).map(parseOkxOrder);
-    }
-
-    const [open, closed] = await Promise.all([
-      this.listOrders({ ...params, status: "open" }),
-      this.listOrders({ ...params, status: "closed" }),
-    ]);
-    return [...open, ...closed];
-  }
-
-  async cancelOrder(orderId: string): Promise<void> {
-    const order = await this.getOrder(orderId);
-    const symbolInfo = normalizeOkxSymbol(order.symbol, this.defaultQuote);
-
-    const res = await this.client.request<{ sCode: string; sMsg: string }>(
-      "POST",
-      "/api/v5/trade/cancel-order",
-      undefined,
-      {
-        instId: symbolInfo.instId,
-        ordId: orderId,
+    try {
+      const details = await client.rest.getOrderDetails({ instId: request.instId, ordId: firstResult.ordId });
+      const orderDetails = details[0];
+      if (orderDetails) {
+        rememberOrderInstrument(orderDetails.ordId, orderDetails.instId);
+        return parseOrder(orderDetails);
       }
-    );
-
-    const result = res.data[0];
-    if (result && result.sCode !== "0") {
-      throw createError(ErrorCode.PROVIDER_ERROR, `OKX cancel rejected: ${result.sMsg}`, { sCode: result.sCode });
+    } catch (error) {
+      client.logger.debug("Order details fetch after placement failed, using fallback payload", {
+        instId: request.instId,
+        orderId: firstResult.ordId,
+        error: String(error),
+      });
     }
-  }
 
-  async cancelAllOrders(): Promise<void> {
-    const open = await this.listOrders({ status: "open" });
-    for (const order of open) {
-      await this.cancelOrder(order.id);
-    }
-  }
+    return parseOrderResult(firstResult, request);
+  };
 
-  async getClock(): Promise<MarketClock> {
-    const now = new Date();
-    return {
-      timestamp: now.toISOString(),
-      is_open: true,
-      next_open: now.toISOString(),
-      next_close: new Date(now.getTime() + 24 * 60 * 60 * 1000).toISOString(),
-    };
-  }
+  return {
+    async getAccount(): Promise<Account> {
+      try {
+        const balances = await client.rest.getBalance();
+        const first = balances[0];
 
-  async getCalendar(_start: string, _end: string): Promise<MarketDay[]> {
-    return [];
-  }
+        if (!first) {
+          throw createError(ErrorCode.PROVIDER_ERROR, "No account balance data returned by OKX");
+        }
 
-  async getAsset(symbol: string): Promise<Asset | null> {
-    const upper = symbol.toUpperCase();
-    if (upper.includes("/") || upper.includes("-") || /^[A-Z0-9]{2,10}(USD|USDT|USDC)$/.test(upper)) {
-      const info = normalizeOkxSymbol(symbol, this.defaultQuote);
+        return parseAccount(first, client.config.defaultQuoteCcy ?? "USDT", Boolean(client.config.simulatedTrading));
+      } catch (error) {
+        client.logger.error("Failed to fetch account", error);
+        throw handleOkxError(error);
+      }
+    },
+
+    async getPositions(): Promise<Position[]> {
+      try {
+        const positions = await client.rest.getPositions();
+        return positions.map(parsePosition);
+      } catch (error) {
+        client.logger.error("Failed to fetch positions", error);
+        throw handleOkxError(error);
+      }
+    },
+
+    async getPosition(symbol: string): Promise<Position | null> {
+      try {
+        const instId = toInstId(symbol);
+        const positions = await client.rest.getPositions({ instId });
+        const first = positions[0];
+        return first ? parsePosition(first) : null;
+      } catch (error) {
+        client.logger.error("Failed to fetch position", error, { symbol });
+        throw handleOkxError(error);
+      }
+    },
+
+    async closePosition(symbol: string, qty?: number, percentage?: number): Promise<Order> {
+      try {
+        const instId = toInstId(symbol);
+        const rawPositions = await client.rest.getPositions({ instId });
+        const rawPosition = rawPositions[0];
+
+        if (!rawPosition) {
+          throw createError(ErrorCode.NOT_FOUND, `No position found for ${symbol}`);
+        }
+
+        const currentSize = Math.abs(parseNumber(rawPosition.pos, 0));
+        const closeSize = qty ?? (percentage !== undefined ? currentSize * (percentage / 100) : currentSize);
+
+        if (closeSize <= 0) {
+          throw createError(ErrorCode.INVALID_INPUT, `Cannot close position with size ${closeSize}`);
+        }
+
+        const side: "buy" | "sell" =
+          rawPosition.posSide === "short" || parseNumber(rawPosition.pos, 0) < 0 ? "buy" : "sell";
+        const tdMode: OkxTradeMode =
+          rawPosition.instType === "SPOT" ? "cash" : rawPosition.mgnMode === "isolated" ? "isolated" : "cross";
+
+        return await placeOrderRequest({
+          instId,
+          tdMode,
+          side,
+          ordType: "market",
+          sz: String(closeSize),
+          posSide: rawPosition.posSide === "net" ? undefined : rawPosition.posSide,
+          reduceOnly: rawPosition.instType !== "SPOT",
+        });
+      } catch (error) {
+        client.logger.error("Failed to close position", error, { symbol, qty, percentage });
+        throw handleOkxError(error);
+      }
+    },
+
+    async createOrder(params: OrderParams): Promise<Order> {
+      try {
+        const request = mapOrderParamsToOkxOrderRequest(params, defaultQuoteCcy);
+        return await placeOrderRequest(request);
+      } catch (error) {
+        client.logger.error("Failed to create order", error, {
+          symbol: params.symbol,
+          side: params.side,
+          type: params.type,
+        });
+        throw handleOkxError(error);
+      }
+    },
+
+    async placeOrder(params: OkxPlaceOrderParams): Promise<Order> {
+      try {
+        const request: OrderRequest = {
+          instId: toInstId(params.instId),
+          side: params.side,
+          ordType: params.ordType ?? "market",
+          tdMode: params.tdMode ?? (params.instType === "SPOT" ? "cash" : "cross"),
+          sz: String(params.sz),
+          ccy: params.ccy,
+          clOrdId: params.clOrdId,
+          tag: params.tag,
+          posSide: params.posSide,
+          reduceOnly: params.reduceOnly,
+          tgtCcy: params.tgtCcy,
+        };
+
+        if (params.px !== undefined) {
+          request.px = String(params.px);
+        }
+
+        return await placeOrderRequest(request);
+      } catch (error) {
+        client.logger.error("Failed to place advanced order", error, {
+          instId: params.instId,
+          side: params.side,
+          ordType: params.ordType,
+          instType: params.instType,
+        });
+        throw handleOkxError(error);
+      }
+    },
+
+    async placeSpotOrder(params): Promise<Order> {
+      return this.placeOrder({
+        ...params,
+        instType: "SPOT",
+        tdMode: params.tdMode ?? "cash",
+      });
+    },
+
+    async placeMarginOrder(params): Promise<Order> {
+      return this.placeOrder({
+        ...params,
+        instType: "MARGIN",
+        tdMode: params.tdMode ?? "cross",
+      });
+    },
+
+    async placeFuturesOrder(params): Promise<Order> {
+      return this.placeOrder({
+        ...params,
+        instType: params.instType ?? "SWAP",
+        tdMode: params.tdMode ?? "cross",
+      });
+    },
+
+    async placeOptionOrder(params): Promise<Order> {
+      return this.placeOrder({
+        ...params,
+        instType: "OPTION",
+        tdMode: params.tdMode ?? "isolated",
+      });
+    },
+
+    async getOrder(orderId: string): Promise<Order> {
+      try {
+        const instId = await resolveInstrumentForOrder(orderId);
+        return await this.getOrderById({
+          instId,
+          ...resolveOrderIdentifier(orderId),
+        });
+      } catch (error) {
+        client.logger.error("Failed to fetch order", error, { orderId });
+        throw handleOkxError(error);
+      }
+    },
+
+    async getOrderById(params: OkxOrderByIdParams): Promise<Order> {
+      try {
+        if (!params.ordId && !params.clOrdId) {
+          throw createError(ErrorCode.INVALID_INPUT, "getOrderById requires ordId or clOrdId");
+        }
+
+        const details = await client.rest.getOrderDetails({
+          instId: params.instId,
+          ordId: params.ordId,
+          clOrdId: params.clOrdId,
+        });
+
+        const first = details[0];
+        if (!first) {
+          throw createError(ErrorCode.NOT_FOUND, `Order not found for instrument ${params.instId}`);
+        }
+
+        rememberOrderInstrument(first.ordId, first.instId);
+        return parseOrder(first);
+      } catch (error) {
+        client.logger.error("Failed to fetch order by id", error, {
+          instId: params.instId,
+          ordId: params.ordId,
+          clOrdId: params.clOrdId,
+        });
+        throw handleOkxError(error);
+      }
+    },
+
+    async listOrders(params?: ListOrdersParams): Promise<Order[]> {
+      try {
+        const includeOpen = params?.status !== "closed";
+        const includeClosed = params?.status !== "open";
+        const limit = String(params?.limit ?? 100);
+
+        const dedup = new Map<string, Order>();
+
+        for (const instType of SUPPORTED_INST_TYPES) {
+          if (includeOpen) {
+            const openOrders = await client.rest.getOrderList({
+              instType,
+              limit,
+              after: params?.after,
+              before: params?.until,
+            } as OrderHistoryRequest);
+
+            for (const order of openOrders) {
+              rememberOrderInstrument(order.ordId, order.instId);
+              dedup.set(order.ordId, parseOrder(order));
+            }
+          }
+
+          if (includeClosed) {
+            const historyOrders = await client.rest.getOrderHistory({
+              instType,
+              limit,
+              after: params?.after,
+              before: params?.until,
+            } as OrderHistoryRequest);
+
+            for (const order of historyOrders) {
+              rememberOrderInstrument(order.ordId, order.instId);
+              dedup.set(order.ordId, parseOrder(order));
+            }
+          }
+        }
+
+        let orders = Array.from(dedup.values());
+
+        if (params?.symbols && params.symbols.length > 0) {
+          const symbols = new Set(params.symbols.map((symbol) => symbol.toUpperCase()));
+          orders = orders.filter((order) => symbols.has(order.symbol.toUpperCase()));
+        }
+
+        if (params?.direction === "asc") {
+          orders.sort((a, b) => a.created_at.localeCompare(b.created_at));
+        } else {
+          orders.sort((a, b) => b.created_at.localeCompare(a.created_at));
+        }
+
+        if (params?.limit) {
+          orders = orders.slice(0, params.limit);
+        }
+
+        return orders;
+      } catch (error) {
+        client.logger.error("Failed to list orders", error, { params: params as unknown as Record<string, unknown> });
+        throw handleOkxError(error);
+      }
+    },
+
+    async listOrdersByInstrumentType(instType: InstrumentType, params?: ListOrdersParams): Promise<Order[]> {
+      try {
+        const includeOpen = params?.status !== "closed";
+        const includeClosed = params?.status !== "open";
+        const limit = String(params?.limit ?? 100);
+        const orders: Order[] = [];
+
+        if (includeOpen) {
+          const openOrders = await client.rest.getOrderList({
+            instType,
+            limit,
+            after: params?.after,
+            before: params?.until,
+          } as OrderHistoryRequest);
+
+          for (const order of openOrders) {
+            rememberOrderInstrument(order.ordId, order.instId);
+            orders.push(parseOrder(order));
+          }
+        }
+
+        if (includeClosed) {
+          const historyOrders = await client.rest.getOrderHistory({
+            instType,
+            limit,
+            after: params?.after,
+            before: params?.until,
+          } as OrderHistoryRequest);
+
+          for (const order of historyOrders) {
+            rememberOrderInstrument(order.ordId, order.instId);
+            orders.push(parseOrder(order));
+          }
+        }
+
+        return orders;
+      } catch (error) {
+        client.logger.error("Failed to list orders by instrument type", error, { instType });
+        throw handleOkxError(error);
+      }
+    },
+
+    async cancelOrder(orderId: string): Promise<void> {
+      try {
+        const instId = await resolveInstrumentForOrder(orderId);
+        await this.cancelOrderById({
+          instId,
+          ...resolveOrderIdentifier(orderId),
+        });
+      } catch (error) {
+        client.logger.error("Failed to cancel order", error, { orderId });
+        throw handleOkxError(error);
+      }
+    },
+
+    async cancelOrderById(params: OkxOrderByIdParams): Promise<void> {
+      try {
+        if (!params.ordId && !params.clOrdId) {
+          throw createError(ErrorCode.INVALID_INPUT, "cancelOrderById requires ordId or clOrdId");
+        }
+
+        await client.rest.cancelOrder({
+          instId: params.instId,
+          ordId: params.ordId,
+          clOrdId: params.clOrdId,
+        });
+
+        if (params.ordId) {
+          orderInstrumentCache.delete(params.ordId);
+        }
+      } catch (error) {
+        client.logger.error("Failed to cancel order by id", error, {
+          instId: params.instId,
+          ordId: params.ordId,
+          clOrdId: params.clOrdId,
+        });
+        throw handleOkxError(error);
+      }
+    },
+
+    async cancelAllOrders(): Promise<void> {
+      try {
+        const openOrders = await this.listOrders({ status: "open", limit: 200 });
+        await Promise.all(
+          openOrders.map(async (order) => {
+            try {
+              await this.cancelOrderById({ instId: order.symbol, ordId: order.id });
+            } catch (error) {
+              client.logger.warn("Failed to cancel order during cancelAllOrders", {
+                orderId: order.id,
+                symbol: order.symbol,
+                error: String(error),
+              });
+            }
+          })
+        );
+      } catch (error) {
+        client.logger.error("Failed to cancel all orders", error);
+        throw handleOkxError(error);
+      }
+    },
+
+    async getClock(): Promise<MarketClock> {
       return {
-        id: info.instId,
-        class: "crypto",
-        exchange: "OKX",
-        symbol: info.normalizedSymbol,
-        name: info.instId,
-        status: "active",
-        tradable: true,
-        marginable: false,
-        shortable: false,
-        fractionable: true,
+        timestamp: new Date().toISOString(),
+        is_open: true,
+        next_open: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+        next_close: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
       };
-    }
-    return null;
-  }
+    },
 
-  async getPortfolioHistory(_params?: PortfolioHistoryParams): Promise<PortfolioHistory> {
-    const account = await this.getAccount();
-    const ts = Math.floor(Date.now() / 1000);
-    return {
-      timestamp: [ts],
-      equity: [account.equity],
-      profit_loss: [0],
-      profit_loss_pct: [0],
-      base_value: account.equity,
-      timeframe: "1D",
-    };
-  }
-}
+    async getCalendar(_start: string, _end: string): Promise<MarketDay[]> {
+      return [];
+    },
 
-export function createOkxTradingProvider(
-  client: OkxClient,
-  defaultQuote: string,
-  options?: OkxTradingProviderOptions
-): OkxTradingProvider {
-  return new OkxTradingProvider(client, defaultQuote, options);
+    async getAsset(symbol: string): Promise<Asset | null> {
+      try {
+        const instId = toInstId(symbol);
+        for (const instType of SUPPORTED_INST_TYPES) {
+          const instruments = await client.rest.getInstruments({ instType, instId });
+          const matched: Instrument | undefined = instruments.find((instrument) => instrument.instId === instId);
+
+          if (matched) {
+            return {
+              id: matched.instId,
+              class: mapInstTypeForAsset(matched.instType),
+              exchange: "OKX",
+              symbol: matched.instId,
+              name: matched.instId,
+              status: matched.state === "live" ? "active" : "inactive",
+              tradable: matched.state === "live",
+              marginable: matched.instType === "MARGIN" || matched.instType === "SPOT",
+              shortable: matched.instType !== "SPOT",
+              fractionable: parseNumber(matched.minSz, 1) < 1,
+            };
+          }
+        }
+
+        return null;
+      } catch (error) {
+        client.logger.error("Failed to get asset", error, { symbol });
+        throw handleOkxError(error);
+      }
+    },
+
+    async getPortfolioHistory(_params?: PortfolioHistoryParams): Promise<PortfolioHistory> {
+      try {
+        const account = await this.getAccount();
+        const now = Date.now();
+
+        return {
+          timestamp: [Math.floor(now / 1000)],
+          equity: [account.equity],
+          profit_loss: [0],
+          profit_loss_pct: [0],
+          base_value: account.equity,
+          timeframe: "1D",
+        };
+      } catch (error) {
+        client.logger.error("Failed to build portfolio history", error);
+        throw handleOkxError(error);
+      }
+    },
+
+    async getBalances(ccy?: string): Promise<AccountBalance[]> {
+      try {
+        return client.rest.getBalance(ccy ? { ccy } : undefined);
+      } catch (error) {
+        client.logger.error("Failed to get balances", error, { ccy });
+        throw handleOkxError(error);
+      }
+    },
+
+    async getTransactionHistory(params?: OkxTransactionHistoryParams): Promise<AccountBill[]> {
+      try {
+        const query = {
+          ccy: params?.ccy,
+          instType: params?.instType,
+          type: params?.type,
+          subType: params?.subType,
+          after: params?.after,
+          before: params?.before,
+          begin: params?.begin,
+          end: params?.end,
+          limit: params?.limit ? String(params.limit) : undefined,
+        };
+
+        if (params?.archive) {
+          return client.rest.getBillsArchive(query);
+        }
+
+        return client.rest.getBills(query);
+      } catch (error) {
+        client.logger.error("Failed to get transaction history", error, {
+          archive: params?.archive,
+          ccy: params?.ccy,
+          instType: params?.instType,
+        });
+        throw handleOkxError(error);
+      }
+    },
+
+    async getFills(params?: OkxFillsParams): Promise<OrderFill[]> {
+      try {
+        const query = {
+          ...params,
+          limit: params?.limit ? String(params.limit) : undefined,
+        };
+
+        if (params?.archive) {
+          return client.rest.getFillsHistory(query);
+        }
+
+        return client.rest.getFills(query);
+      } catch (error) {
+        client.logger.error("Failed to get fills", error, {
+          archive: params?.archive,
+          instType: params?.instType,
+        });
+        throw handleOkxError(error);
+      }
+    },
+
+    async setLeverage(params: {
+      lever: string;
+      mgnMode: "cross" | "isolated";
+      instId?: string;
+      ccy?: string;
+      posSide?: PositionSide;
+    }): Promise<AccountLeverageResult[]> {
+      try {
+        const leveragePosSide = params.posSide === "long" || params.posSide === "short" ? params.posSide : undefined;
+
+        return client.rest.setLeverage({
+          lever: params.lever,
+          mgnMode: params.mgnMode,
+          instId: params.instId,
+          ccy: params.ccy,
+          posSide: leveragePosSide,
+        });
+      } catch (error) {
+        client.logger.error("Failed to set leverage", error, {
+          mgnMode: params.mgnMode,
+          instId: params.instId,
+          ccy: params.ccy,
+        });
+        throw handleOkxError(error);
+      }
+    },
+  };
 }

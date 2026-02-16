@@ -36,6 +36,17 @@ export function normalizeOkxSymbol(symbol: string, defaultQuote: string): OkxSym
   const normalizedDefaultQuote = defaultQuote.trim().toUpperCase();
   const resolveQuote = (quote: string): string => (quote === "USD" ? normalizedDefaultQuote : quote);
 
+  const aliasMatch = upper.match(/^([A-Z0-9]{2,15})(?:[.\-_]?X)$/);
+  if (aliasMatch) {
+    const base = aliasMatch[1]!;
+    return {
+      instId: `${base}-${normalizedDefaultQuote}`,
+      normalizedSymbol: `${base}/${normalizedDefaultQuote}`,
+      base,
+      quote: normalizedDefaultQuote,
+    };
+  }
+
   if (upper.includes("-")) {
     const [base, rawQuote] = upper.split("-", 2) as [string, string];
     const quote = resolveQuote(rawQuote);

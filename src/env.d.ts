@@ -29,6 +29,7 @@ export interface Env {
   OKX_DEFAULT_QUOTE_CCY?: string;
   OKX_MAX_REQUESTS_PER_SECOND?: string;
   OKX_MAX_RETRIES?: string;
+  OKX_LOG_LEVEL?: "debug" | "info" | "warn" | "error" | "silent";
 
   OPENAI_API_KEY?: string;
   OPENAI_BASE_URL?: string;
@@ -65,6 +66,9 @@ export interface Env {
 
   DEFAULT_MAX_POSITION_PCT: string;
   DEFAULT_MAX_NOTIONAL_PER_TRADE: string;
+  DEFAULT_MAX_SYMBOL_EXPOSURE_PCT?: string;
+  DEFAULT_MAX_CORRELATED_EXPOSURE_PCT?: string;
+  DEFAULT_MAX_PORTFOLIO_DRAWDOWN_PCT?: string;
   DEFAULT_MAX_DAILY_LOSS_PCT: string;
   DEFAULT_COOLDOWN_MINUTES: string;
   DEFAULT_MAX_OPEN_POSITIONS: string;

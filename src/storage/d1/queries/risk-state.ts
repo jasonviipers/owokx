@@ -8,6 +8,9 @@ export interface RiskState {
   daily_loss_usd: number;
   daily_loss_reset_at: string | null;
   daily_equity_start: number | null;
+  max_symbol_exposure_pct: number;
+  max_correlated_exposure_pct: number;
+  max_portfolio_drawdown_pct: number;
   last_loss_at: string | null;
   cooldown_until: string | null;
   updated_at: string;
@@ -24,6 +27,9 @@ export async function getRiskState(db: D1Client): Promise<RiskState> {
       daily_loss_usd: 0,
       daily_loss_reset_at: nowISO(),
       daily_equity_start: null,
+      max_symbol_exposure_pct: 0.25,
+      max_correlated_exposure_pct: 0.5,
+      max_portfolio_drawdown_pct: 0.15,
       last_loss_at: null,
       cooldown_until: null,
       updated_at: nowISO(),
@@ -37,6 +43,9 @@ export async function getRiskState(db: D1Client): Promise<RiskState> {
     daily_loss_usd: row.daily_loss_usd,
     daily_loss_reset_at: row.daily_loss_reset_at,
     daily_equity_start: row.daily_equity_start ?? null,
+    max_symbol_exposure_pct: row.max_symbol_exposure_pct ?? 0.25,
+    max_correlated_exposure_pct: row.max_correlated_exposure_pct ?? 0.5,
+    max_portfolio_drawdown_pct: row.max_portfolio_drawdown_pct ?? 0.15,
     last_loss_at: row.last_loss_at,
     cooldown_until: row.cooldown_until,
     updated_at: row.updated_at,

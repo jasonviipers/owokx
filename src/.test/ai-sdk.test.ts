@@ -285,6 +285,21 @@ describe("AI SDK Provider", () => {
       );
     });
 
+    it("omits temperature for OpenAI reasoning models", async () => {
+      const provider = createAISDKProvider({
+        model: "openai/gpt-5.2-2025-12-11",
+        apiKeys: { openai: "sk-test" },
+      });
+
+      await provider.complete({
+        messages: [{ role: "user", content: "Test" }],
+      });
+
+      const call = mockGenerateText.mock.calls[0]?.[0] as Record<string, unknown>;
+      expect(call).toBeTruthy();
+      expect(call.temperature).toBeUndefined();
+    });
+
     it("uses custom max_tokens when provided", async () => {
       const provider = createAISDKProvider({
         model: "openai/gpt-4o",
@@ -459,6 +474,44 @@ describe("AI SDK Provider", () => {
           model: expect.objectContaining({ provider: "deepseek", model: "deepseek-chat" }),
         })
       );
+    });
+
+    it("disables providers after auth failure and skips them on later calls", async () => {
+      mockGenerateText
+        .mockRejectedValueOnce(new Error("Authentication Fails, Your api key is invalid"))
+        .mockResolvedValueOnce({
+          text: "Fallback response",
+          usage: { inputTokens: 8, outputTokens: 4, totalTokens: 12 },
+        })
+        .mockResolvedValueOnce({
+          text: "Second response",
+          usage: { inputTokens: 6, outputTokens: 3, totalTokens: 9 },
+        });
+
+      const provider = createAISDKProvider({
+        model: "deepseek/deepseek-chat",
+        apiKeys: { deepseek: "invalid-key", openai: "sk-test" },
+      });
+
+      await provider.complete({
+        messages: [{ role: "user", content: "Test 1" }],
+      });
+
+      await provider.complete({
+        messages: [{ role: "user", content: "Test 2" }],
+      });
+
+      const first = mockGenerateText.mock.calls[0]?.[0] as { model?: { provider?: string; model?: string } };
+      const second = mockGenerateText.mock.calls[1]?.[0] as { model?: { provider?: string; model?: string } };
+      const third = mockGenerateText.mock.calls[2]?.[0] as { model?: { provider?: string; model?: string } };
+
+      expect(first.model?.provider).toBe("deepseek");
+      expect(first.model?.model).toBe("deepseek-chat");
+      expect(second.model?.provider).toBe("openai");
+      expect(second.model?.model).toBe(PROVIDER_MODELS.openai[0]);
+      expect(third.model?.provider).toBe("openai");
+      expect(third.model?.model).toBe(PROVIDER_MODELS.openai[0]);
+      expect(mockGenerateText).toHaveBeenCalledTimes(3);
     });
   });
 });

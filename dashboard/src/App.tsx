@@ -1,20 +1,34 @@
-import { useState, useEffect, useMemo, useCallback, useRef } from 'react'
-import { motion, AnimatePresence } from 'motion/react'
+import { useState, useEffect, useMemo, useCallback } from 'react'
+import { motion } from 'motion/react'
 import clsx from 'clsx'
 import { Panel } from './components/Panel'
 import { Metric, MetricInline } from './components/Metric'
 import { StatusIndicator, StatusBar } from './components/StatusIndicator'
-import { SettingsModal } from './components/SettingsModal'
 import { SetupWizard } from './components/SetupWizard'
 import { LineChart, Sparkline } from './components/LineChart'
 import { NotificationBell } from './components/NotificationBell'
 import { Tooltip, TooltipContent } from './components/Tooltip'
 import { AgentControls } from './components/AgentControls'
-import { SwarmDashboard } from './components/SwarmDashboard'
-import type { Status, Config, LogEntry, Signal, Position, SignalResearch, PortfolioSnapshot } from './types'
+import type { Config, LogEntry, Signal, Position, SignalResearch, PortfolioSnapshot } from './types'
 import { MobileNav } from './components/Mobilenav'
+import { ErrorBoundary } from './components/ErrorBoundary'
+import { OverviewPage } from './pages/OverviewPage'
+import { SettingsPage } from './pages/SettingsPage'
+import { SwarmPage } from './pages/SwarmPage'
+import { useAgentStatus } from './hooks/useAgentStatus'
+import { useLogs } from './hooks/useLogs'
+import { useSwarmMetrics } from './hooks/useSwarmMetrics'
+import {
+  clearSessionToken,
+  fetchPortfolioHistory,
+  fetchSetupStatus,
+  resetAgent,
+  saveSessionToken,
+  setAgentEnabled,
+  type SetupStatusData,
+  updateAgentConfig,
+} from './lib/api'
 
-const API_BASE = '/api'
 declare const __OWOKX_API_URL__: string | undefined
 const OWOKX_BROWSER_TOKEN_KEY = 'OWOKX_BEARER_TOKEN'
 
@@ -51,56 +65,6 @@ interface FinancialStreamPayload {
   total_pl: number | null
   total_pl_pct: number | null
   generated_at: string
-}
-
-interface SetupStatusData {
-  configured?: boolean
-  api_origin?: string
-  auth?: {
-    token_env_var?: string
-  }
-  commands?: {
-    enable?: {
-      curl?: string
-    }
-  }
-}
-
-interface SaveConfigResponse {
-  ok?: boolean
-  error?: string
-  details?: unknown
-  config?: Config
-  data?: Config
-  message?: string
-}
-
-function authFetch(url: string, options: RequestInit = {}): Promise<Response> {
-  const headers = new Headers(options.headers)
-  if (!headers.has('Content-Type') && options.body) {
-    headers.set('Content-Type', 'application/json')
-  }
-  if (!headers.has('Authorization')) {
-    const token = getBrowserToken()
-    if (token) {
-      headers.set('Authorization', `Bearer ${token}`)
-    }
-  }
-  return fetch(url, { ...options, headers, credentials: 'include' })
-}
-
-async function saveSessionToken(token: string): Promise<Response> {
-  const headers = new Headers({ 'Content-Type': 'application/json' })
-  const trimmed = token.trim()
-  if (trimmed) {
-    headers.set('Authorization', `Bearer ${trimmed}`)
-  }
-  return fetch('/auth/session', {
-    method: 'POST',
-    headers,
-    credentials: 'include',
-    body: JSON.stringify({ token }),
-  })
 }
 
 function resolveConfiguredApiOrigin(): string | null {
@@ -416,21 +380,6 @@ function getSentimentColor(score: unknown): string {
   return 'text-hud-warning'
 }
 
-async function fetchPortfolioHistory(period: string = '1D'): Promise<PortfolioSnapshot[]> {
-  try {
-    const timeframe = period === '1D' ? '15Min' : '1D'
-    const intraday = period === '1D' ? '&intraday_reporting=extended_hours' : ''
-    const res = await authFetch(`${API_BASE}/history?period=${period}&timeframe=${timeframe}${intraday}`)
-    const data = await res.json()
-    if (data.ok && data.data?.snapshots) {
-      return data.data.snapshots
-    }
-    return []
-  } catch {
-    return []
-  }
-}
-
 function generateMockPriceHistory(currentPrice: number, unrealizedPl: number, points: number = 20): number[] {
   if (!Number.isFinite(currentPrice) || currentPrice <= 0) return []
   const prices: number[] = []
@@ -448,10 +397,9 @@ function generateMockPriceHistory(currentPrice: number, unrealizedPl: number, po
 }
 
 export default function App() {
-  const [status, setStatus] = useState<Status | null>(null)
-  const [error, setError] = useState<string | null>(null)
   const [authTokenInput, setAuthTokenInput] = useState('')
   const [authSaving, setAuthSaving] = useState(false)
+  const [authError, setAuthError] = useState<string | null>(null)
   const [showSettings, setShowSettings] = useState(false)
   const [showSetup, setShowSetup] = useState(false)
   const [enableCommandHint, setEnableCommandHint] = useState(() =>
@@ -463,18 +411,26 @@ export default function App() {
   const [portfolioPeriod, setPortfolioPeriod] = useState<'1D' | '1W' | '1M'>('1D')
   const [agentBusy, setAgentBusy] = useState(false)
   const [agentMessage, setAgentMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
-  const [activityFeed, setActivityFeed] = useState<LogEntry[]>([])
-  const [activityFeedReady, setActivityFeedReady] = useState(false)
   const [activityEventTypeFilter, setActivityEventTypeFilter] = useState<ActivityEventTypeFilter>('all')
   const [activitySeverityFilter, setActivitySeverityFilter] = useState<ActivitySeverityFilter>('all')
   const [activityTimeRangeFilter, setActivityTimeRangeFilter] = useState<ActivityTimeRange>('24h')
   const [activityExpandedRows, setActivityExpandedRows] = useState<Record<string, boolean>>({})
-  const lastActivitySinceRef = useRef<number | null>(null)
   const [mobileView, setMobileView] = useState<'overview' | 'positions' | 'activity' | 'signals'>('overview')
-  const [statusStreamConnected, setStatusStreamConnected] = useState(false)
-  const statusStreamRef = useRef<EventSource | null>(null)
-  const statusStreamRetryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const configSaveInFlightRef = useRef(false)
+
+  const statusPollingEnabled = setupChecked && !showSetup
+  const { status, error, refresh: refreshStatus, setStatus } = useAgentStatus({
+    enabled: statusPollingEnabled,
+    pollMs: 5000,
+  })
+  const activityWindowMs = useMemo(() => timeRangeToMs(activityTimeRangeFilter), [activityTimeRangeFilter])
+  const { logs: activityFeed, ready: activityFeedReady } = useLogs({
+    enabled: statusPollingEnabled,
+    eventType: activityEventTypeFilter,
+    severity: activitySeverityFilter,
+    timeRangeMs: activityWindowMs,
+    pollMs: 10000,
+  })
+  const { metrics: swarmMetrics } = useSwarmMetrics({ enabled: statusPollingEnabled, pollMs: 10000 })
   
   const [wasConnected, setWasConnected] = useState(false)
   useEffect(() => {
@@ -487,8 +443,7 @@ export default function App() {
 
   const checkSetup = useCallback(async () => {
     try {
-      const res = await authFetch(`${API_BASE}/setup/status`)
-      const data = await res.json()
+      const data = await fetchSetupStatus()
       const setupData = (data?.data ?? {}) as SetupStatusData
       const backendEnableCommand = setupData.commands?.enable?.curl
       if (typeof backendEnableCommand === 'string' && backendEnableCommand.trim().length > 0) {
@@ -513,159 +468,14 @@ export default function App() {
     checkSetup()
   }, [checkSetup])
 
-  const fetchStatus = useCallback(async () => {
-    try {
-      const res = await authFetch(`${API_BASE}/status`)
-      const data = await res.json()
-      if (data.ok) {
-        setStatus(data.data)
-        setError(null)
-      } else {
-        setStatus(data.data || null)
-        setError(data.error || 'Failed to fetch status')
-      }
-    } catch {
-      setError('Connection failed - is the agent running?')
-    }
-  }, [])
-
   useEffect(() => {
-    if (setupChecked && !showSetup) {
-      fetchStatus()
-      const interval = setInterval(fetchStatus, statusStreamConnected ? 30000 : 5000)
-      const timeInterval = setInterval(() => setTime(new Date()), 1000)
-
-      return () => {
-        clearInterval(interval)
-        clearInterval(timeInterval)
-      }
-    }
-  }, [setupChecked, showSetup, fetchStatus, statusStreamConnected])
-
-  useEffect(() => {
-    if (!setupChecked || showSetup) return
-
-    let disposed = false
-    let retryMs = 1000
-
-    const closeStream = () => {
-      if (statusStreamRef.current) {
-        statusStreamRef.current.close()
-        statusStreamRef.current = null
-      }
-    }
-
-    const scheduleReconnect = () => {
-      if (disposed) return
-      if (statusStreamRetryTimerRef.current) {
-        clearTimeout(statusStreamRetryTimerRef.current)
-      }
-      const waitMs = retryMs
-      retryMs = Math.min(retryMs * 2, 15000)
-      statusStreamRetryTimerRef.current = setTimeout(connect, waitMs)
-    }
-
-    const connect = () => {
-      if (disposed) return
-      closeStream()
-
-      const stream = new EventSource(`${API_BASE}/status/stream`, { withCredentials: true })
-      statusStreamRef.current = stream
-
-      stream.addEventListener('open', () => {
-        if (disposed) return
-        retryMs = 1000
-        setStatusStreamConnected(true)
-      })
-
-      stream.addEventListener('financial_update', (event) => {
-        if (disposed) return
-        const messageEvent = event as MessageEvent<string>
-        try {
-          const payload = JSON.parse(messageEvent.data) as FinancialStreamPayload
-          setStatus((prev) => {
-            if (!prev) return prev
-            return {
-              ...prev,
-              account: payload.account ?? prev.account,
-              positions: Array.isArray(payload.positions) ? payload.positions : prev.positions,
-              clock: payload.clock ?? prev.clock,
-            }
-          })
-          setError(null)
-        } catch {
-          // Ignore malformed stream payloads and keep current state.
-        }
-      })
-
-      stream.addEventListener('error', () => {
-        if (disposed) return
-        setStatusStreamConnected(false)
-        closeStream()
-        scheduleReconnect()
-      })
-    }
-
-    connect()
-
-    return () => {
-      disposed = true
-      setStatusStreamConnected(false)
-      closeStream()
-      if (statusStreamRetryTimerRef.current) {
-        clearTimeout(statusStreamRetryTimerRef.current)
-        statusStreamRetryTimerRef.current = null
-      }
-    }
-  }, [setupChecked, showSetup])
-
-  const fetchActivityFeed = useCallback(async () => {
-    if (!setupChecked || showSetup) return
-
-    try {
-      const params = new URLSearchParams()
-      params.set('limit', activityTimeRangeFilter === 'all' ? '250' : '120')
-      if (activityEventTypeFilter !== 'all') {
-        params.set('event_type', activityEventTypeFilter)
-      }
-      if (activitySeverityFilter !== 'all') {
-        params.set('severity', activitySeverityFilter)
-      }
-
-      const windowMs = timeRangeToMs(activityTimeRangeFilter)
-      if (windowMs !== null) {
-        const windowStart = Date.now() - windowMs
-        const incrementalStart = lastActivitySinceRef.current
-        params.set('since', String(incrementalStart ? Math.max(windowStart, incrementalStart) : windowStart))
-      }
-
-      const res = await authFetch(`${API_BASE}/logs?${params.toString()}`)
-      const data = await res.json()
-      const logs = Array.isArray(data?.logs) ? data.logs as LogEntry[] : []
-      const sorted = [...logs].sort((a, b) => getActivityTimestampMs(b) - getActivityTimestampMs(a))
-      setActivityFeed(sorted)
-      setActivityFeedReady(true)
-      if (sorted.length > 0) {
-        const newestMs = getActivityTimestampMs(sorted[0]!)
-        if (Number.isFinite(newestMs)) {
-          lastActivitySinceRef.current = newestMs + 1
-        }
-      }
-    } catch {
-      // Fallback stays on status payload logs when dedicated feed fetch fails.
-    }
-  }, [setupChecked, showSetup, activityEventTypeFilter, activitySeverityFilter, activityTimeRangeFilter])
-
-  useEffect(() => {
-    if (!setupChecked || showSetup) return
-    fetchActivityFeed()
-    const interval = setInterval(fetchActivityFeed, 10000)
-    return () => clearInterval(interval)
-  }, [setupChecked, showSetup, fetchActivityFeed])
+    if (!statusPollingEnabled) return
+    const timeInterval = setInterval(() => setTime(new Date()), 1000)
+    return () => clearInterval(timeInterval)
+  }, [statusPollingEnabled])
 
   useEffect(() => {
     setActivityExpandedRows({})
-    lastActivitySinceRef.current = null
   }, [activityEventTypeFilter, activitySeverityFilter, activityTimeRangeFilter])
 
   useEffect(() => {
@@ -675,31 +485,33 @@ export default function App() {
   }, [agentMessage])
 
   useEffect(() => {
-    if (!setupChecked || showSetup) return
+    if (!statusPollingEnabled) return
 
     const loadPortfolioHistory = async () => {
-      const history = await fetchPortfolioHistory(portfolioPeriod)
-      if (history.length > 0) {
-        setPortfolioHistory(history)
+      try {
+        const history = await fetchPortfolioHistory(portfolioPeriod)
+        if (history.length > 0) {
+          setPortfolioHistory(history)
+        }
+      } catch {
+        // Keep existing chart data when history endpoint is temporarily unavailable.
       }
     }
 
-    loadPortfolioHistory()
+    void loadPortfolioHistory()
     const historyInterval = setInterval(loadPortfolioHistory, 60000)
     return () => clearInterval(historyInterval)
-  }, [setupChecked, showSetup, portfolioPeriod])
+  }, [statusPollingEnabled, portfolioPeriod])
 
   const handleResetAgent = async () => {
     setAgentMessage(null)
     try {
-      const res = await authFetch(`${API_BASE}/reset`, { method: 'POST' })
-      const data = await res.json().catch(() => ({} as { error?: string }))
-      
-      if (!res.ok) {
-        throw new Error(data.error || `Reset failed (HTTP ${res.status})`)
+      const data = await resetAgent()
+      if (data.ok === false) {
+        throw new Error(data.error || 'Reset failed')
       }
       
-      await fetchStatus()
+      await refreshStatus()
       setAgentMessage({ type: 'success', text: 'Agent reset successfully' })
       setPortfolioHistory([])
       setStatus(null)
@@ -712,52 +524,9 @@ export default function App() {
   }
 
   const handleSaveConfig = async (config: Config) => {
-    if (configSaveInFlightRef.current) {
-      throw new Error('A configuration save is already in progress. Please wait.')
-    }
-
-    const broker = config?.broker
-    if (broker !== 'alpaca' && broker !== 'okx') {
-      throw new Error('Invalid broker selection. Choose Alpaca or OKX.')
-    }
-
-    configSaveInFlightRef.current = true
-    setAgentMessage(null)
-
-    try {
-      const res = await authFetch(`${API_BASE}/config`, {
-        method: 'POST',
-        body: JSON.stringify(config),
-      })
-
-      const payload = (await res.json().catch(() => ({}))) as SaveConfigResponse
-      if (!res.ok || payload?.ok === false) {
-        const errorMessage =
-          payload?.error ||
-          (typeof payload?.details === 'string' ? payload.details : null) ||
-          `Failed to save configuration (HTTP ${res.status})`
-        throw new Error(errorMessage)
-      }
-
-      const savedConfig = payload.config ?? payload.data
-      if (!savedConfig || (savedConfig.broker !== 'alpaca' && savedConfig.broker !== 'okx')) {
-        throw new Error('Configuration saved but broker activation payload was invalid.')
-      }
-
-      setStatus(prev => (prev ? { ...prev, config: savedConfig } : prev))
-
-      // Refresh live broker/account state immediately after config save.
-      await fetchStatus()
-      setAgentMessage({
-        type: 'success',
-        text: `Configuration saved. Active broker switched to ${savedConfig.broker.toUpperCase()}.`,
-      })
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error)
-      setAgentMessage({ type: 'error', text: `Save failed: ${message}` })
-      throw error
-    } finally {
-      configSaveInFlightRef.current = false
+    const data = await updateAgentConfig(config)
+    if (data.ok && status) {
+      setStatus({ ...status, config: data.data ?? config })
     }
   }
 
@@ -850,28 +619,20 @@ export default function App() {
     setAgentBusy(true)
     setAgentMessage(null)
     try {
-      const endpoint = nextEnabled ? 'enable' : 'disable'
-      const res = await authFetch(`${API_BASE}/${endpoint}`, { method: 'POST' })
-      const data = await res.json().catch(() => null)
-
-      if (!res.ok) {
-        const msg = typeof data?.error === 'string' ? data.error : `Request failed (${res.status})`
-        throw new Error(msg)
-      }
-
-      if (data && typeof data === 'object' && data.ok === false) {
+      const data = await setAgentEnabled(nextEnabled)
+      if (data.ok === false) {
         const msg = typeof data.error === 'string' ? data.error : 'Request failed'
         throw new Error(msg)
       }
 
-      await fetchStatus()
+      await refreshStatus()
       setAgentMessage({ type: 'success', text: nextEnabled ? 'Agent enabled' : 'Agent disabled' })
     } catch (e) {
       setAgentMessage({ type: 'error', text: String(e) })
     } finally {
       setAgentBusy(false)
     }
-  }, [agentBusy, fetchStatus])
+  }, [agentBusy, refreshStatus])
 
   const configuredStartingEquity =
     Number.isFinite(config?.starting_equity) && (config?.starting_equity ?? 0) > 0
@@ -967,39 +728,48 @@ export default function App() {
   const handleAuthTokenSave = useCallback(async () => {
     const token = authTokenInput.trim()
     if (!token) {
-      setError('Token is required')
+      setAuthSaving(true)
+      try {
+        await clearSessionToken()
+        setAuthError('Session cleared')
+        await refreshStatus()
+      } catch (e) {
+        setAuthError(String(e))
+      } finally {
+        setAuthSaving(false)
+      }
       return
     }
     setAuthSaving(true)
     try {
-      const res = await saveSessionToken(token)
-      const data = await res.json().catch(() => ({}))
-      if (!res.ok || data?.ok === false) {
-        throw new Error(data?.error || 'Authentication failed')
-      }
-      setBrowserToken(token)
+      await saveSessionToken(token)
       setAuthTokenInput('')
-      setError(null)
-      await fetchStatus()
+      setAuthError(null)
+      await refreshStatus()
     } catch (e) {
-      setError(String(e))
+      setAuthError(String(e))
     } finally {
       setAuthSaving(false)
     }
-  }, [authTokenInput, fetchStatus])
+  }, [authTokenInput, refreshStatus])
 
   if (showSetup) {
-    return <SetupWizard onComplete={() => setShowSetup(false)} />
+    return (
+      <ErrorBoundary title="SETUP PANEL ERROR">
+        <SetupWizard onComplete={() => setShowSetup(false)} />
+      </ErrorBoundary>
+    )
   }
 
-  if (error && !status) {
-    const isAuthError = error.includes('Unauthorized')
+  const blockingError = authError ?? error
+  if (blockingError && !status) {
+    const isAuthError = blockingError.includes('Unauthorized')
     return (
       <div className="min-h-screen bg-hud-bg flex items-center justify-center p-4 md:p-6">
         <Panel title={isAuthError ? "AUTHENTICATION REQUIRED" : "CONNECTION ERROR"} className="max-w-md w-full">
           <div className="text-center py-8">
             <div className="text-hud-error text-2xl mb-4">{isAuthError ? "NO TOKEN" : "OFFLINE"}</div>
-            <p className="text-hud-text-dim text-sm mb-6">{error}</p>
+            <p className="text-hud-text-dim text-sm mb-6">{blockingError}</p>
             {isAuthError ? (
               <div className="space-y-4">
                 <div className="text-left bg-hud-panel p-4 border border-hud-line">
@@ -1131,6 +901,7 @@ export default function App() {
           <MobileNav view={mobileView} onViewChange={setMobileView} />
         </header>
 
+        <OverviewPage>
         {/* Desktop Grid Layout */}
         <div className="hidden md:grid grid-cols-4 md:grid-cols-8 lg:grid-cols-12 gap-4">
           {/* Row 1: Account, Positions, LLM Costs */}
@@ -1359,9 +1130,9 @@ export default function App() {
             </Panel>
           </div>
 
-          <div className="col-span-4 md:col-span-8 lg:col-span-12">
-             <SwarmDashboard swarm={status?.swarm} />
-          </div>
+          <ErrorBoundary title="SWARM PANEL ERROR">
+            <SwarmPage swarm={status?.swarm} metrics={swarmMetrics} />
+          </ErrorBoundary>
 
           <div className="col-span-4 md:col-span-8 lg:col-span-12">
             <Panel title="RISK & SIGNAL QUALITY" className="h-full">
@@ -1918,6 +1689,7 @@ export default function App() {
             </>
           )}
         </div>
+        </OverviewPage>
       </div>
 
       <footer className="mt-auto w-full border-t border-hud-line bg-hud-bg">
@@ -1950,22 +1722,15 @@ export default function App() {
         </div>
       </footer>
 
-      <AnimatePresence>
-        {showSettings && config && (
-          <motion.div
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
-          >
-            <SettingsModal
-              config={config}
-              onSave={handleSaveConfig}
-              onClose={() => setShowSettings(false)}
-              onReset={handleResetAgent}
-            />
-          </motion.div>
-        )}
-      </AnimatePresence>
+      <ErrorBoundary title="SETTINGS PANEL ERROR">
+        <SettingsPage
+          show={showSettings}
+          config={config}
+          onSave={handleSaveConfig}
+          onClose={() => setShowSettings(false)}
+          onReset={handleResetAgent}
+        />
+      </ErrorBoundary>
     </div>
   )
 }

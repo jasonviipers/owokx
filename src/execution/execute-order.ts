@@ -34,6 +34,10 @@ export interface ExecuteOrderResult {
   trade_id?: string;
 }
 
+export function isAcceptedSubmissionState(state: string): boolean {
+  return state === "SUBMITTED" || state === "SUBMITTING";
+}
+
 export async function executeOrder(params: ExecuteOrderParams): Promise<ExecuteOrderResult> {
   const request_json = JSON.stringify({ order: params.order, approval_id: params.approval_id ?? null });
   const submission = await reserveOrderSubmission(params.db, {
@@ -44,11 +48,7 @@ export async function executeOrder(params: ExecuteOrderParams): Promise<ExecuteO
     request_json,
   });
 
-  if (submission.state === "SUBMITTED") {
-    return { submission, broker_order_id: submission.broker_order_id ?? undefined };
-  }
-
-  if (submission.state === "SUBMITTING") {
+  if (isAcceptedSubmissionState(submission.state)) {
     return { submission, broker_order_id: submission.broker_order_id ?? undefined };
   }
 
@@ -65,7 +65,7 @@ export async function executeOrder(params: ExecuteOrderParams): Promise<ExecuteO
   if (!transitioned) {
     const latest = await getOrderSubmissionByIdempotencyKey(params.db, params.idempotency_key);
     if (latest) {
-      if (latest.state === "SUBMITTED" || latest.state === "SUBMITTING") {
+      if (isAcceptedSubmissionState(latest.state)) {
         return { submission: latest, broker_order_id: latest.broker_order_id ?? undefined };
       }
     }

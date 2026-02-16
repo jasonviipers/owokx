@@ -1,5 +1,10 @@
 import { nowISO } from "../../../lib/utils";
-import type { PolicyConfig } from "../../../policy/config";
+import {
+  getSafePolicyFallbackConfig,
+  mergePolicyConfigWithDefaults,
+  type PolicyConfig,
+  validatePolicyConfig,
+} from "../../../policy/config";
 import type { D1Client, PolicyConfigRow } from "../client";
 
 export async function getPolicyConfig(db: D1Client): Promise<PolicyConfig | null> {
@@ -9,7 +14,15 @@ export async function getPolicyConfig(db: D1Client): Promise<PolicyConfig | null
     return null;
   }
 
-  return JSON.parse(row.config_json) as PolicyConfig;
+  try {
+    const parsed = JSON.parse(row.config_json) as Partial<PolicyConfig>;
+    const merged = mergePolicyConfigWithDefaults(parsed);
+    validatePolicyConfig(merged);
+    return merged;
+  } catch {
+    const fallback = getSafePolicyFallbackConfig();
+    return fallback;
+  }
 }
 
 export async function savePolicyConfig(db: D1Client, config: PolicyConfig): Promise<void> {
