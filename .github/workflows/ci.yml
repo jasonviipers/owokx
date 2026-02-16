@@ -128,7 +128,12 @@ jobs:
           version: 10
 
       - name: Install dependencies
-        run: pnpm install --frozen-lockfile
+        run: |
+          if [ ! -f pnpm-lock.yaml ]; then
+            echo "::error::pnpm-lock.yaml missing at repository root. Deploy job requires locked dependencies."
+            exit 1
+          fi
+          pnpm install --frozen-lockfile
 
       - name: Check formatting and linting
         run: pnpm run check
@@ -142,4 +147,3 @@ jobs:
 
       - name: Deploy to Cloudflare
         run: pnpm run deploy -- --env=""
-
