@@ -47,6 +47,11 @@ interface MutableTimerBucket {
 
 const DIMENSION_ALL = "_all";
 
+/**
+ * Create a new MutableTimerAggregate with all numeric fields initialized to zero.
+ *
+ * @returns A MutableTimerAggregate with `count`, `totalMs`, `minMs`, `maxMs`, and `lastMs` set to 0
+ */
 function createTimerAggregate(): MutableTimerAggregate {
   return {
     count: 0,
@@ -57,6 +62,12 @@ function createTimerAggregate(): MutableTimerAggregate {
   };
 }
 
+/**
+ * Convert a telemetry tag map into a deterministic dimension key string.
+ *
+ * @param tags - Optional mapping of tag keys to values; entries with `null` or `undefined` values are ignored.
+ * @returns A dimension string consisting of sorted `key=value` pairs joined by commas, or `DIMENSION_ALL` if there are no valid tags.
+ */
 function normalizeDimension(tags?: TelemetryTags): string {
   if (!tags) return DIMENSION_ALL;
 
@@ -70,6 +81,12 @@ function normalizeDimension(tags?: TelemetryTags): string {
   return entries.map(([key, value]) => `${key}=${value}`).join(",");
 }
 
+/**
+ * Convert a mutable timer aggregate into a snapshot suitable for serialization, with millisecond fields rounded to three decimals.
+ *
+ * @param aggregate - The mutable timer aggregate to convert
+ * @returns A TelemetryTimerAggregateSnapshot containing `count`, `total_ms`, `avg_ms`, `min_ms`, `max_ms`, and `last_ms`; numeric millisecond fields are rounded to three decimal places and `avg_ms` is `0` when `count` is `0`.
+ */
 function toTimerSnapshot(aggregate: MutableTimerAggregate): TelemetryTimerAggregateSnapshot {
   const avgMs = aggregate.count > 0 ? aggregate.totalMs / aggregate.count : 0;
   return {
@@ -205,6 +222,12 @@ export class TelemetryRegistry {
   }
 }
 
+/**
+ * Create a telemetry registry scoped to the given name.
+ *
+ * @param scope - Identifier used as the registry's scope in produced snapshots
+ * @returns A TelemetryRegistry instance that collects counters and timers for the specified scope
+ */
 export function createTelemetry(scope: string): TelemetryRegistry {
   return new TelemetryRegistry(scope);
 }

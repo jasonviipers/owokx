@@ -57,10 +57,27 @@ const DEFAULT_THRESHOLDS: AlertRuleThresholds = {
 };
 const DEFAULT_DRAWDOWN_LIMIT = 0.15;
 
+/**
+ * Restricts a number to lie within the inclusive range defined by `min` and `max`.
+ *
+ * @param value - The number to clamp
+ * @param min - The lower bound of the range
+ * @param max - The upper bound of the range
+ * @returns The input value limited to the interval `[min, max]`
+ */
 function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
 }
 
+/**
+ * Merge provided threshold overrides with defaults and normalize each field to safe, validated values.
+ *
+ * @param overrides - Optional partial thresholds to override the defaults
+ * @returns The normalized thresholds:
+ * - `drawdownWarnRatio` clamped to the range 0.1–1
+ * - `deadLetterWarn` and `deadLetterCritical` floored to integers and constrained to be >= 0
+ * - `llmAuthFailureWindowMs` floored to an integer and constrained to be at least 60,000 (1 minute)
+ */
 function normalizeThresholds(overrides?: Partial<AlertRuleThresholds>): AlertRuleThresholds {
   const merged = {
     ...DEFAULT_THRESHOLDS,
@@ -75,10 +92,24 @@ function normalizeThresholds(overrides?: Partial<AlertRuleThresholds>): AlertRul
   };
 }
 
+/**
+ * Format a millisecond timestamp as an ISO 8601 string.
+ *
+ * @param nowMs - Milliseconds since the Unix epoch
+ * @returns The UTC ISO 8601 representation of `nowMs`
+ */
 function nowIso(nowMs: number): string {
   return new Date(nowMs).toISOString();
 }
 
+/**
+ * Produces a normalized fingerprint segment safe for use in alert IDs.
+ *
+ * Converts the input to lowercase, replaces runs of non-alphanumeric characters with single hyphens, trims leading/trailing hyphens, and truncates the result to at most 96 characters.
+ *
+ * @param value - The input string to normalize into a fingerprint part
+ * @returns A lowercase string containing only letters, digits, and hyphens, trimmed of edge hyphens and limited to 96 characters (may be empty)
+ */
 function normalizeFingerprintPart(value: string): string {
   return value
     .trim()
@@ -88,6 +119,18 @@ function normalizeFingerprintPart(value: string): string {
     .slice(0, 96);
 }
 
+/**
+ * Constructs an AlertEvent object from the provided fields and timestamp.
+ *
+ * @param nowMs - Timestamp (milliseconds since epoch) used to build the alert `id` and `occurred_at`
+ * @param rule - Alert rule identifier
+ * @param severity - Alert severity level
+ * @param title - Short, human-facing title for the alert
+ * @param message - Detailed human-facing message for the alert
+ * @param fingerprint - Normalized fingerprint segment used to group/deduplicate alerts
+ * @param details - Arbitrary structured metadata to include with the alert
+ * @returns The assembled AlertEvent with `id` formatted as `"<rule>:<nowMs>:<severity>"` and `occurred_at` set to the ISO timestamp for `nowMs`
+ */
 function createAlert(
   nowMs: number,
   rule: AlertRuleId,
@@ -109,6 +152,12 @@ function createAlert(
   };
 }
 
+/**
+ * Evaluate alerting rules against the provided environment, account, and service state and produce any triggered alerts.
+ *
+ * @param input - Evaluation context containing environment, timing, account, risk state, policy config, swarm and LLM status, and optional threshold overrides
+ * @returns An array of AlertEvent objects for each alert triggered by the input state (e.g., portfolio drawdown, kill switch activation, swarm dead-letter queue thresholds, recent LLM auth failures)
+ */
 export function evaluateAlertRules(input: AlertRuleInput): AlertEvent[] {
   const nowMs = input.nowMs ?? Date.now();
   const thresholds = normalizeThresholds(input.thresholds);

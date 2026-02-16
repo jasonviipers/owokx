@@ -47,10 +47,24 @@ export interface AlertNotifier {
 
 const ALL_CHANNELS: AlertChannel[] = ["console", "discord", "webhook"];
 
+/**
+ * Type guard that determines whether a string is a valid AlertChannel.
+ *
+ * @param value - The string to test
+ * @returns `true` if `value` is one of `"console"`, `"discord"`, or `"webhook"`, `false` otherwise.
+ */
 function isAlertChannel(value: string): value is AlertChannel {
   return value === "console" || value === "discord" || value === "webhook";
 }
 
+/**
+ * Parse a comma-separated string into a deduplicated list of alert channels.
+ *
+ * Trims whitespace, lowercases entries, validates channel names, and falls back to all channels when input is undefined or yields no valid entries.
+ *
+ * @param raw - Comma-separated channel names (e.g., "console,discord") or undefined to use all channels
+ * @returns A deduplicated array of valid `AlertChannel` values; defaults to all supported channels when input is missing or contains no valid channels
+ */
 function parseChannels(raw: string | undefined): AlertChannel[] {
   if (!raw) {
     return [...ALL_CHANNELS];
@@ -68,6 +82,12 @@ function parseChannels(raw: string | undefined): AlertChannel[] {
   return Array.from(new Set(parsed));
 }
 
+/**
+ * Builds an AlertNotifierConfig from environment variables, applying sensible defaults and minimum bounds.
+ *
+ * @param env - Environment variables used to configure the notifier.
+ * @returns The constructed AlertNotifierConfig containing enabled flag, resolved channels, deduplication window, rate-limit settings, and optional webhook URLs (or `null` when not provided).
+ */
 function notifierConfigFromEnv(env: Env): AlertNotifierConfig {
   const channels = parseChannels(env.ALERT_CHANNELS);
   return {
@@ -87,6 +107,12 @@ function notifierConfigFromEnv(env: Env): AlertNotifierConfig {
   };
 }
 
+/**
+ * Returns the subset of configured channels that can actually be used given available webhook URLs.
+ *
+ * @param config - Notifier configuration containing the requested channels and any webhook URLs
+ * @returns An array of `AlertChannel` values present in `config.channels` and usable: `discord` only if `config.discordWebhookUrl` is set, `webhook` only if `config.webhookUrl` is set, `console` always allowed
+ */
 function enabledChannels(config: AlertNotifierConfig): AlertChannel[] {
   return config.channels.filter((channel) => {
     if (channel === "discord") return Boolean(config.discordWebhookUrl);
@@ -95,6 +121,11 @@ function enabledChannels(config: AlertNotifierConfig): AlertChannel[] {
   });
 }
 
+/**
+ * Retrieve a value from a KV namespace by key, returning null when unavailable.
+ *
+ * @returns The stored string for `key`, or `null` if the `cache` is undefined, the key is missing, or an error occurs.
+ */
 async function kvGet(cache: KVNamespace | undefined, key: string): Promise<string | null> {
   if (!cache) return null;
   try {
@@ -104,6 +135,14 @@ async function kvGet(cache: KVNamespace | undefined, key: string): Promise<strin
   }
 }
 
+/**
+ * Writes a string value to a Workers KV namespace key with a time-to-live, performing a no-op if the KV namespace is not provided and suppressing any write errors.
+ *
+ * @param cache - Optional KVNamespace to write to; if undefined, the function does nothing
+ * @param key - The KV key under which to store the value
+ * @param value - The string value to store
+ * @param ttlSeconds - Time-to-live for the key, in seconds
+ */
 async function kvPut(cache: KVNamespace | undefined, key: string, value: string, ttlSeconds: number): Promise<void> {
   if (!cache) return;
   try {
@@ -113,23 +152,60 @@ async function kvPut(cache: KVNamespace | undefined, key: string, value: string,
   }
 }
 
+/**
+ * Builds a namespaced KV key for alert deduplication using the provided fingerprint.
+ *
+ * @param fingerprint - Unique identifier for an alert (e.g., a computed hash or fingerprint)
+ * @returns A namespaced key string for storing the alert's deduplication state in KV
+ */
 function dedupeKey(fingerprint: string): string {
   return `alerts:dedupe:${fingerprint}`;
 }
 
+/**
+ * Constructs a namespaced KV key for a channel's rate-limit counter for a specific time window.
+ *
+ * @param channel - The alert channel (e.g., "console", "discord", "webhook")
+ * @param windowStart - Numeric identifier for the time window (typically the window's start timestamp)
+ * @returns The namespaced KV key string for the channel's rate-limit counter in that window
+ */
 function rateLimitKey(channel: AlertChannel, windowStart: number): string {
   return `alerts:ratelimit:${channel}:${windowStart}`;
 }
 
+/**
+ * Determines whether a deduplication entry exists for the given fingerprint.
+ *
+ * @param fingerprint - The alert fingerprint used as the dedupe cache key
+ * @returns `true` if an entry for `fingerprint` exists in the dedupe cache, `false` otherwise
+ */
 async function isDuplicate(cache: KVNamespace | undefined, fingerprint: string): Promise<boolean> {
   const existing = await kvGet(cache, dedupeKey(fingerprint));
   return existing !== null;
 }
 
+/**
+ * Records an alert fingerprint in the key-value store to mark it as seen for a limited time.
+ *
+ * @param fingerprint - Unique fingerprint identifying the alert for deduplication
+ * @param ttlSeconds - Time-to-live for the deduplication entry, in seconds
+ */
 async function markDuplicate(cache: KVNamespace | undefined, fingerprint: string, ttlSeconds: number): Promise<void> {
   await kvPut(cache, dedupeKey(fingerprint), String(Date.now()), ttlSeconds);
 }
 
+/**
+ * Determines whether sending is permitted for a channel under the configured rate limit window.
+ *
+ * If the cache is unavailable or the stored counter is missing/invalid, sending is allowed.
+ *
+ * @param cache - KV namespace used to track per-window counters (may be `undefined`)
+ * @param channel - The alert channel being checked
+ * @param nowMs - Current time in milliseconds used to compute the active rate-limit window
+ * @param windowSeconds - Length of the rate-limit window in seconds
+ * @param maxPerWindow - Maximum allowed sends per channel within a single window
+ * @returns `true` if the channel has remaining capacity in the current window, `false` otherwise.
+ */
 async function canSendForRateLimit(
   cache: KVNamespace | undefined,
   channel: AlertChannel,
@@ -145,6 +221,12 @@ async function canSendForRateLimit(
   return count < maxPerWindow;
 }
 
+/**
+ * Increment the per-channel rate limit counter for the current time window and set its TTL.
+ *
+ * @param nowMs - Current timestamp in milliseconds used to compute the window start
+ * @param windowSeconds - Duration of the rate limit window in seconds
+ */
 async function bumpRateLimit(
   cache: KVNamespace | undefined,
   channel: AlertChannel,
@@ -159,6 +241,12 @@ async function bumpRateLimit(
   await kvPut(cache, key, String(next), Math.max(windowSeconds * 2, 120));
 }
 
+/**
+ * Logs an alert as a structured JSON object to the console.
+ *
+ * @param alert - The alert event to log
+ * @returns `true` if the alert was logged to the console, `false` otherwise
+ */
 async function sendConsole(alert: AlertEvent): Promise<boolean> {
   console.log(
     JSON.stringify({
@@ -176,6 +264,13 @@ async function sendConsole(alert: AlertEvent): Promise<boolean> {
   return true;
 }
 
+/**
+ * Send an alert to a Discord webhook as a formatted embed.
+ *
+ * @param webhookUrl - The Discord webhook URL to post the embed to
+ * @param alert - The alert event to include in the embed (title, message, severity, rule, fingerprint, occurred_at)
+ * @returns `true` if the HTTP response has a successful status (`response.ok`), `false` otherwise
+ */
 async function sendDiscord(webhookUrl: string, alert: AlertEvent): Promise<boolean> {
   const color = alert.severity === "critical" ? 0xef4444 : alert.severity === "warning" ? 0xf59e0b : 0x2563eb;
   const response = await fetch(webhookUrl, {
@@ -200,6 +295,15 @@ async function sendDiscord(webhookUrl: string, alert: AlertEvent): Promise<boole
   return response.ok;
 }
 
+/**
+ * Send an alert to a generic HTTP webhook endpoint.
+ *
+ * Posts a JSON payload with `type: "owokx.alert"` and the provided `alert` object.
+ *
+ * @param webhookUrl - Destination webhook URL
+ * @param alert - The alert event to include in the webhook payload
+ * @returns `true` if the HTTP response status is OK (2xx), `false` otherwise
+ */
 async function sendWebhook(webhookUrl: string, alert: AlertEvent): Promise<boolean> {
   const response = await fetch(webhookUrl, {
     method: "POST",
@@ -212,6 +316,16 @@ async function sendWebhook(webhookUrl: string, alert: AlertEvent): Promise<boole
   return response.ok;
 }
 
+/**
+ * Dispatches a single alert to the specified channel.
+ *
+ * Attempts to send the alert to the selected channel; for "discord" and "webhook" channels the corresponding webhook URL from the config must be present or the send will be skipped.
+ *
+ * @param config - Notifier configuration used to locate webhook URLs and other settings
+ * @param channel - Target channel to send the alert to ("console", "discord", or "webhook")
+ * @param alert - The alert event to dispatch
+ * @returns `true` if the alert was successfully sent to the target channel, `false` otherwise
+ */
 async function sendViaChannel(config: AlertNotifierConfig, channel: AlertChannel, alert: AlertEvent): Promise<boolean> {
   if (channel === "console") return sendConsole(alert);
   if (channel === "discord") {
@@ -225,6 +339,13 @@ async function sendViaChannel(config: AlertNotifierConfig, channel: AlertChannel
   return false;
 }
 
+/**
+ * Creates an AlertNotifier configured from the provided environment.
+ *
+ * The returned notifier's `notify` method dispatches each alert to the enabled channels determined from `env`, skips alerts already seen within the dedupe window, enforces per-channel rate limits, marks successfully delivered alerts for future deduplication, and returns an AlertDispatchSummary with counts of attempted, sent, deduped, rate-limited, and failed deliveries.
+ *
+ * @returns An AlertNotifier that dispatches alerts across enabled channels and produces an AlertDispatchSummary describing delivery outcomes
+ */
 export function createAlertNotifier(env: Env): AlertNotifier {
   const config = notifierConfigFromEnv(env);
   const channels = enabledChannels(config);
