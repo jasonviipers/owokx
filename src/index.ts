@@ -74,6 +74,8 @@ function parsePositiveInt(input: string | null, fallback: number, max: number): 
 const EXPERIMENTS_SCHEMA_HINT =
   "Experiment schema not initialized. Apply D1 migrations (including migrations/0008_experiments.sql).";
 const ALERTS_SCHEMA_HINT = "Alert schema not initialized. Apply D1 migrations (including migrations/0010_alerts.sql).";
+const ALERTS_DATA_HINT =
+  "Alert events query failed due malformed D1 payload serialization (error code 1031). Inspect or clean invalid alert_events rows.";
 
 function getErrorMessage(error: unknown): string {
   if (error instanceof Error && typeof error.message === "string" && error.message.trim().length > 0) {
@@ -95,6 +97,11 @@ function isMissingExperimentsSchemaError(error: unknown): boolean {
 function isMissingAlertsSchemaError(error: unknown): boolean {
   const message = getErrorMessage(error).toLowerCase();
   return message.includes("no such table") && (message.includes("alert_rules") || message.includes("alert_events"));
+}
+
+function isD1JsonParseBodyError(error: unknown): boolean {
+  const message = getErrorMessage(error).toLowerCase();
+  return message.includes("failed to parse body as json") && message.includes("1031");
 }
 
 function getRegistryStub(env: Env): DurableObjectStub {
@@ -671,6 +678,15 @@ export default {
               ok: true,
               data: { events: [] },
               warning: ALERTS_SCHEMA_HINT,
+            });
+          }
+          if (isD1JsonParseBodyError(error)) {
+            const message = getErrorMessage(error);
+            console.error("[alerts] history_query_failed", { error: message, route: "/agent/alerts/history" });
+            return jsonResponse({
+              ok: true,
+              data: { events: [] },
+              warning: ALERTS_DATA_HINT,
             });
           }
           return jsonResponse({ ok: false, error: getErrorMessage(error) }, 500);
