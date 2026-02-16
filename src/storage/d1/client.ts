@@ -200,6 +200,29 @@ export interface ExperimentMetricRow {
   recorded_at: string;
 }
 
+export interface DecisionTraceRow {
+  id: string;
+  trace_id: string;
+  parent_trace_id: string | null;
+  request_id: string | null;
+  source: string;
+  stage: string;
+  decision_kind: string;
+  model_provider: string | null;
+  model_name: string | null;
+  input_hash: string;
+  input_json: string;
+  output_json: string | null;
+  policy_json: string | null;
+  final_action: string;
+  status: string;
+  error_code: string | null;
+  error_message: string | null;
+  symbol: string | null;
+  metadata_json: string | null;
+  created_at: string;
+}
+
 export function createD1Client(db: D1Database | undefined | null): D1Client {
   if (!db || typeof db.prepare !== "function") {
     throw new Error(
