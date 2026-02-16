@@ -310,11 +310,19 @@ export function AlertsPage({ enabled = true, compact = false }: AlertsPageProps)
       {isCreateRuleModalOpen && (
         <div
           className='fixed inset-0 z-50 bg-black/70 flex items-center justify-center p-3'
+          role='dialog'
+          aria-modal='true'
+          aria-label='Create alert rule dialog'
           onClick={() => {
             if (!creating) setIsCreateRuleModalOpen(false)
           }}
         >
-          <div className='hud-panel w-full max-w-xl max-h-[90vh] overflow-y-auto' onClick={(event) => event.stopPropagation()}>
+          <div
+            className='hud-panel w-full max-w-xl max-h-[90vh] overflow-y-auto'
+            tabIndex={-1}
+            onClick={(event) => event.stopPropagation()}
+            onKeyDown={(event) => event.stopPropagation()}
+          >
             <div className='flex items-center justify-between px-4 py-2 border-b border-hud-line'>
               <span className='hud-label text-hud-primary'>Create Rule</span>
               <button

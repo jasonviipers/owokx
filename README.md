@@ -281,10 +281,10 @@ Apply migrations for your active D1:
 
 ```bash
 # local dev DB
-npx wrangler d1 migrations apply Okx-db --local
+npx wrangler d1 migrations apply owokx_db --local
 
 # remote DB
-npx wrangler d1 migrations apply Okx-db
+npx wrangler d1 migrations apply owokx_db
 ```
 
 ### LLM usage remains at 0 calls / 0 tokens
