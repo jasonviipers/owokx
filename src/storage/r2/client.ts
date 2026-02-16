@@ -27,6 +27,19 @@ export class R2Client {
     });
   }
 
+  async putExperimentArtifact<T = unknown>(key: string, value: T): Promise<R2Object> {
+    return this.bucket.put(key, JSON.stringify(value), {
+      httpMetadata: { contentType: "application/json" },
+      customMetadata: {
+        category: "experiment",
+      },
+    });
+  }
+
+  async getExperimentArtifact<T = unknown>(key: string): Promise<T | null> {
+    return this.getJson<T>(key);
+  }
+
   async putText(key: string, value: string): Promise<R2Object> {
     return this.bucket.put(key, value, {
       httpMetadata: { contentType: "text/plain" },

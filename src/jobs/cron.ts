@@ -1,5 +1,6 @@
 import type { Env } from "../env.d";
 import { getDefaultPolicyConfig } from "../policy/config";
+import { persistBacktestRunArtifacts } from "../providers/backtest";
 import { createBrokerProviders } from "../providers/broker-factory";
 import { createSECEdgarProvider } from "../providers/news/sec-edgar";
 import { createD1Client } from "../storage/d1/client";
@@ -270,6 +271,51 @@ async function runHourlyCacheRefresh(env: Env): Promise<void> {
         const filledAvgPrice = order.filled_avg_price ? parseFloat(order.filled_avg_price) : undefined;
         await updateTradeStatus(db, tradeId, order.status, filledQty, filledAvgPrice);
       }
+    }
+
+    try {
+      const snapshotAt = new Date().toISOString();
+      const openPositionsCount = (await broker.trading.getPositions()).length;
+      await persistBacktestRunArtifacts({
+        db,
+        artifacts: env.ARTIFACTS,
+        strategy: "live_hourly_snapshot",
+        variant_name: env.ENVIRONMENT,
+        seed: Math.floor(Date.now() / 3_600_000),
+        config: {
+          source: "cron.hourly",
+          broker: broker.broker,
+          environment: env.ENVIRONMENT,
+        },
+        summary: {
+          model: "live-snapshot",
+          strategy: "live_hourly_snapshot",
+          variant: env.ENVIRONMENT,
+          seed: Math.floor(Date.now() / 3_600_000),
+          steps: 1,
+          orders: missingTrades.length,
+          start_equity: account.equity,
+          end_equity: account.equity,
+          pnl: 0,
+          pnl_pct: 0,
+          max_drawdown_pct: 0,
+          created_at: snapshotAt,
+        },
+        equity_curve: [{ t_ms: Date.now(), equity: account.equity, cash: account.cash }],
+        metrics: [
+          { metric_name: "daily_loss_usd", metric_value: dailyLossUsd },
+          {
+            metric_name: "kill_switch_active",
+            metric_value: riskState.kill_switch_active ? 1 : 0,
+          },
+          { metric_name: "open_positions", metric_value: openPositionsCount },
+        ],
+        status: "completed",
+        started_at: snapshotAt,
+        finished_at: snapshotAt,
+      });
+    } catch (error) {
+      console.error("Hourly refresh experiment snapshot error:", error);
     }
   } catch (error) {
     console.error("Hourly refresh error:", error);

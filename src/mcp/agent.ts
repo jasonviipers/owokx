@@ -2,7 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { McpAgent } from "agents/mcp";
 import { z } from "zod";
 import type { Env } from "../env.d";
-import { type ExecuteOrderResult, executeOrder } from "../execution/execute-order";
+import { type ExecuteOrderResult, evaluateOrderPolicy, executeOrder } from "../execution/execute-order";
 import { ErrorCode } from "../lib/errors";
 import { generateId, hmacVerify } from "../lib/utils";
 import {
@@ -65,8 +65,7 @@ export class OwokxMcpAgent extends McpAgent<Env> {
     const db = createD1Client(this.env.DB);
     const broker = createBrokerProviders(this.env);
 
-    const storedPolicy = await getPolicyConfig(db);
-    this.policyConfig = storedPolicy ?? getDefaultPolicyConfig(this.env);
+    await this.loadPolicyConfig(db);
 
     if (this.env.FEATURE_LLM_RESEARCH === "true") {
       this.llm = createLLMProvider(this.env);
@@ -87,6 +86,12 @@ export class OwokxMcpAgent extends McpAgent<Env> {
     this.registerResearchTools(db, broker);
     this.registerOptionsTools();
     this.registerUtilityTools();
+  }
+
+  private async loadPolicyConfig(db: D1Client): Promise<PolicyConfig> {
+    const storedPolicy = await getPolicyConfig(db);
+    this.policyConfig = storedPolicy ?? getDefaultPolicyConfig(this.env);
+    return this.policyConfig;
   }
 
   private registerAuthTools(db: ReturnType<typeof createD1Client>, broker: BrokerProviders) {
@@ -147,7 +152,25 @@ export class OwokxMcpAgent extends McpAgent<Env> {
         });
         return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
       }
-    );
+    });
+
+    this.typedServer.tool("user-get", "Get user/session information and system configuration", {}, async () => {
+      const policyConfig = await this.loadPolicyConfig(db);
+      const result = success({
+        environment: this.env.ENVIRONMENT,
+        paper_trading: this.env.ALPACA_PAPER === "true",
+        features: {
+          llm_research: this.env.FEATURE_LLM_RESEARCH === "true",
+          options: this.env.FEATURE_OPTIONS === "true",
+        },
+        policy: {
+          max_position_pct_equity: policyConfig.max_position_pct_equity,
+          max_notional_per_trade: policyConfig.max_notional_per_trade,
+          max_daily_loss_pct: policyConfig.max_daily_loss_pct,
+        },
+      });
+      return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+    });
   }
 
   private registerAccountTools(db: ReturnType<typeof createD1Client>, broker: BrokerProviders) {
@@ -463,8 +486,18 @@ export class OwokxMcpAgent extends McpAgent<Env> {
             ...(estimatedCost ? { estimated_cost: estimatedCost } : {}),
           };
 
-          const policyEngine = new PolicyEngine(this.policyConfig!);
-          const policyResult = policyEngine.evaluate({ order: preview, account, positions, clock, riskState });
+          const policyConfig = await this.loadPolicyConfig(db);
+          const { policyResult } = await evaluateOrderPolicy({
+            env: this.env,
+            db,
+            broker,
+            order: preview,
+            account,
+            positions,
+            clock,
+            riskState,
+            policyConfig,
+          });
 
           if (policyResult.allowed) {
             const approvalSecret = this.env.APPROVAL_SIGNING_SECRET;
@@ -489,7 +522,7 @@ export class OwokxMcpAgent extends McpAgent<Env> {
               policyResult,
               secret: approvalSecret,
               db,
-              ttlSeconds: this.policyConfig!.approval_token_ttl_seconds,
+              ttlSeconds: policyConfig.approval_token_ttl_seconds,
             });
             policyResult.approval_token = approval.token;
             policyResult.approval_id = approval.approval_id;
@@ -756,6 +789,7 @@ export class OwokxMcpAgent extends McpAgent<Env> {
   private registerRiskTools(db: ReturnType<typeof createD1Client>, broker: BrokerProviders) {
     this.typedServer.registerTool("risk-status", { description: "Get current risk status and limits" }, async () => {
       try {
+        const policyConfig = await this.loadPolicyConfig(db);
         const [riskState, account, positions] = await Promise.all([
           getRiskState(db),
           broker.trading.getAccount(),
@@ -770,11 +804,11 @@ export class OwokxMcpAgent extends McpAgent<Env> {
           daily_loss: {
             usd: riskState.daily_loss_usd,
             pct: dailyLossPct,
-            limit_pct: this.policyConfig!.max_daily_loss_pct,
+            limit_pct: policyConfig.max_daily_loss_pct,
           },
           cooldown: { active: riskState.cooldown_until ? new Date(riskState.cooldown_until) > new Date() : false },
           exposure: { total_usd: totalExposure, position_count: positions.length },
-          limits: this.policyConfig,
+          limits: policyConfig,
         });
 
         return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
@@ -2106,7 +2140,8 @@ export class OwokxMcpAgent extends McpAgent<Env> {
             estimated_cost: estimatedCost,
           };
 
-          const policyEngine = new PolicyEngine(this.policyConfig!);
+          const policyConfig = await this.loadPolicyConfig(db);
+          const policyEngine = new PolicyEngine(policyConfig);
           const policyResult = policyEngine.evaluateOptionsOrder({
             order: preview,
             account,
@@ -2148,7 +2183,7 @@ export class OwokxMcpAgent extends McpAgent<Env> {
               policyResult,
               secret: approvalSecret,
               db,
-              ttlSeconds: this.policyConfig!.approval_token_ttl_seconds,
+              ttlSeconds: policyConfig.approval_token_ttl_seconds,
             });
             policyResult.approval_token = approval.token;
             policyResult.approval_id = approval.approval_id;

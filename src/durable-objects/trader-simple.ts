@@ -8,8 +8,12 @@ import type { Env } from "../env.d";
 import { executeOrder, isAcceptedSubmissionState } from "../execution/execute-order";
 import { AgentBase, type AgentBaseState } from "../lib/agents/base";
 import type { AgentMessage, AgentType } from "../lib/agents/protocol";
+import { getDefaultPolicyConfig, type PolicyConfig } from "../policy/config";
 import { createBrokerProviders } from "../providers/broker-factory";
+import type { Account, MarketClock, Position } from "../providers/types";
 import { createD1Client } from "../storage/d1/client";
+import { getPolicyConfig } from "../storage/d1/queries/policy-config";
+import { getRiskState, type RiskState } from "../storage/d1/queries/risk-state";
 
 interface TraderState extends AgentBaseState {
   tradeHistory: Array<{
@@ -45,6 +49,14 @@ const DEFAULT_STATE: Pick<TraderState, "tradeHistory" | "lastTradeTime" | "strat
 interface RiskValidationResult {
   approved: boolean;
   reason?: string;
+}
+
+interface RiskValidationContext {
+  account?: Account;
+  positions?: Position[];
+  clock?: MarketClock;
+  riskState?: RiskState;
+  policyConfig?: PolicyConfig;
 }
 
 export class TraderSimple extends AgentBase<TraderState> {
@@ -294,28 +306,45 @@ export class TraderSimple extends AgentBase<TraderState> {
       return false;
     }
 
-    const riskValidation = await this.validateOrderWithRiskManager({
-      symbol,
-      notional: positionSize,
-      side: "buy",
-    });
-
-    if (!riskValidation.approved) {
-      this.recordTrade(symbol, "buy", positionSize, false, riskValidation.reason ?? "Risk check rejected order");
-      await this.publishTradeOutcome({
-        symbol,
-        side: "buy",
-        notional: positionSize,
-        success: false,
-        confidence,
-        reason: riskValidation.reason ?? "Risk check rejected order",
-      });
-      return false;
-    }
-
     try {
       const broker = createBrokerProviders(this.env, "alpaca");
       const db = createD1Client(this.env.DB);
+      const [accountSnapshot, positions, clock, riskState, policyConfig] = await Promise.all([
+        broker.trading.getAccount(),
+        broker.trading.getPositions(),
+        broker.trading.getClock(),
+        getRiskState(db),
+        this.loadPolicyConfig(db),
+      ]);
+
+      const riskValidation = await this.validateOrderWithRiskManager(
+        {
+          symbol,
+          notional: positionSize,
+          side: "buy",
+        },
+        {
+          account: accountSnapshot,
+          positions,
+          clock,
+          riskState,
+          policyConfig,
+        }
+      );
+
+      if (!riskValidation.approved) {
+        this.recordTrade(symbol, "buy", positionSize, false, riskValidation.reason ?? "Risk check rejected order");
+        await this.publishTradeOutcome({
+          symbol,
+          side: "buy",
+          notional: positionSize,
+          success: false,
+          confidence,
+          reason: riskValidation.reason ?? "Risk check rejected order",
+        });
+        return false;
+      }
+
       const idempotency_key = this.buildIdempotencyKey("buy", symbol);
 
       const execution = await executeOrder({
@@ -596,11 +625,14 @@ export class TraderSimple extends AgentBase<TraderState> {
     return this.env.LEARNING_AGENT.get(learningId);
   }
 
-  private async validateOrderWithRiskManager(order: {
-    symbol: string;
-    notional: number;
-    side: "buy" | "sell";
-  }): Promise<RiskValidationResult> {
+  private async validateOrderWithRiskManager(
+    order: {
+      symbol: string;
+      notional: number;
+      side: "buy" | "sell";
+    },
+    context?: RiskValidationContext
+  ): Promise<RiskValidationResult> {
     if (!this.env.RISK_MANAGER) {
       return { approved: false, reason: "Risk manager namespace unavailable" };
     }
@@ -610,7 +642,14 @@ export class TraderSimple extends AgentBase<TraderState> {
       const riskManager = this.env.RISK_MANAGER.get(riskId);
       const response = await riskManager.fetch("http://risk-manager/validate", {
         method: "POST",
-        body: JSON.stringify(order),
+        body: JSON.stringify({
+          ...order,
+          account: context?.account,
+          positions: context?.positions,
+          clock: context?.clock,
+          riskState: context?.riskState,
+          policy_config: context?.policyConfig,
+        }),
       });
 
       if (!response.ok) {
@@ -622,6 +661,11 @@ export class TraderSimple extends AgentBase<TraderState> {
     } catch (error) {
       return { approved: false, reason: `Risk manager error: ${String(error)}` };
     }
+  }
+
+  private async loadPolicyConfig(db: ReturnType<typeof createD1Client>): Promise<PolicyConfig> {
+    const storedPolicy = await getPolicyConfig(db);
+    return storedPolicy ?? getDefaultPolicyConfig(this.env);
   }
 
   private buildIdempotencyKey(action: "buy" | "sell", symbol: string, suffix?: string): string {

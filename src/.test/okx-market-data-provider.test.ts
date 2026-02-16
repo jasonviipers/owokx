@@ -5,11 +5,13 @@ import { createOkxMarketDataProvider } from "../providers/okx/market-data";
 describe("OKX Market Data Provider", () => {
   let mockClient: OkxClient;
   let mockGetCandles: ReturnType<typeof vi.fn>;
+  let mockLoggerDebug: ReturnType<typeof vi.fn>;
   let mockLoggerWarn: ReturnType<typeof vi.fn>;
   let mockLoggerError: ReturnType<typeof vi.fn>;
 
   beforeEach(() => {
     mockGetCandles = vi.fn();
+    mockLoggerDebug = vi.fn();
     mockLoggerWarn = vi.fn();
     mockLoggerError = vi.fn();
 
@@ -26,7 +28,7 @@ describe("OKX Market Data Provider", () => {
       },
       rateLimiter: {} as OkxClient["rateLimiter"],
       logger: {
-        debug: vi.fn(),
+        debug: mockLoggerDebug,
         info: vi.fn(),
         warn: mockLoggerWarn,
         error: mockLoggerError,
@@ -50,8 +52,8 @@ describe("OKX Market Data Provider", () => {
     });
 
     expect(mockGetCandles).toHaveBeenCalledTimes(1);
-    expect(mockLoggerWarn).toHaveBeenCalledTimes(1);
-    expect(mockLoggerWarn).toHaveBeenCalledWith(
+    expect(mockLoggerDebug).toHaveBeenCalledTimes(1);
+    expect(mockLoggerDebug).toHaveBeenCalledWith(
       "OKX instrument unavailable; caching as unsupported",
       expect.objectContaining({
         symbol: "WEEDCOIN.X",
@@ -59,6 +61,7 @@ describe("OKX Market Data Provider", () => {
         okxCode: "51001",
       })
     );
+    expect(mockLoggerWarn).not.toHaveBeenCalled();
     expect(mockLoggerError).not.toHaveBeenCalled();
   });
 });

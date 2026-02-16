@@ -1,10 +1,11 @@
 import type { Env } from "../env.d";
 import { createError, ErrorCode } from "../lib/errors";
 import { sanitizeForLog, sha256Hex } from "../lib/utils";
-import type { OrderPreview } from "../mcp/types";
-import { getDefaultPolicyConfig } from "../policy/config";
+import type { OrderPreview, PolicyResult } from "../mcp/types";
+import { getDefaultPolicyConfig, type PolicyConfig } from "../policy/config";
 import { PolicyEngine } from "../policy/engine";
 import type { BrokerProviders } from "../providers/broker-factory";
+import type { Account, MarketClock, Position } from "../providers/types";
 import type { D1Client, OrderSubmissionRow } from "../storage/d1/client";
 import {
   getOrderSubmissionByIdempotencyKey,
@@ -13,7 +14,7 @@ import {
   tryTransitionOrderSubmissionState,
 } from "../storage/d1/queries/order-submissions";
 import { getPolicyConfig } from "../storage/d1/queries/policy-config";
-import { getRiskState } from "../storage/d1/queries/risk-state";
+import { getRiskState, type RiskState } from "../storage/d1/queries/risk-state";
 import { createTrade } from "../storage/d1/queries/trades";
 
 export type ExecutionSource = "mcp" | "harness";
@@ -34,8 +35,57 @@ export interface ExecuteOrderResult {
   trade_id?: string;
 }
 
+export interface EvaluateOrderPolicyParams {
+  env: Env;
+  db: D1Client;
+  broker: BrokerProviders;
+  order: OrderPreview;
+  account?: Account;
+  positions?: Position[];
+  clock?: MarketClock;
+  riskState?: RiskState;
+  policyConfig?: PolicyConfig;
+}
+
+export interface EvaluateOrderPolicyResult {
+  account: Account;
+  positions: Position[];
+  clock: MarketClock;
+  riskState: RiskState;
+  policyConfig: PolicyConfig;
+  policyResult: PolicyResult;
+}
+
 export function isAcceptedSubmissionState(state: string): boolean {
   return state === "SUBMITTED" || state === "SUBMITTING";
+}
+
+export async function evaluateOrderPolicy(params: EvaluateOrderPolicyParams): Promise<EvaluateOrderPolicyResult> {
+  const [account, positions, clock, riskState, policyConfig] = await Promise.all([
+    params.account ?? params.broker.trading.getAccount(),
+    params.positions ?? params.broker.trading.getPositions(),
+    params.clock ?? params.broker.trading.getClock(),
+    params.riskState ?? getRiskState(params.db),
+    params.policyConfig ?? (await getPolicyConfig(params.db)) ?? getDefaultPolicyConfig(params.env),
+  ]);
+
+  const policyEngine = new PolicyEngine(policyConfig);
+  const policyResult = policyEngine.evaluate({
+    order: params.order,
+    account,
+    positions,
+    clock,
+    riskState,
+  });
+
+  return {
+    account,
+    positions,
+    clock,
+    riskState,
+    policyConfig,
+    policyResult,
+  };
 }
 
 export async function executeOrder(params: ExecuteOrderParams): Promise<ExecuteOrderResult> {
@@ -73,27 +123,22 @@ export async function executeOrder(params: ExecuteOrderParams): Promise<ExecuteO
   }
 
   try {
-    const riskState = await getRiskState(params.db);
-
-    if (riskState.kill_switch_active) {
-      throw createError(ErrorCode.KILL_SWITCH_ACTIVE, riskState.kill_switch_reason ?? "Kill switch active");
+    const evaluation = await evaluateOrderPolicy({
+      env: params.env,
+      db: params.db,
+      broker: params.broker,
+      order: params.order,
+    });
+    if (evaluation.riskState.kill_switch_active) {
+      throw createError(ErrorCode.KILL_SWITCH_ACTIVE, evaluation.riskState.kill_switch_reason ?? "Kill switch active");
     }
-
-    const [account, positions, clock] = await Promise.all([
-      params.broker.trading.getAccount(),
-      params.broker.trading.getPositions(),
-      params.broker.trading.getClock(),
-    ]);
-
-    const config = (await getPolicyConfig(params.db)) ?? getDefaultPolicyConfig(params.env);
-    const engine = new PolicyEngine(config);
-    const policyResult = engine.evaluate({ order: params.order, account, positions, clock, riskState });
+    const policyResult = evaluation.policyResult;
     if (!policyResult.allowed) {
       throw createError(ErrorCode.POLICY_VIOLATION, "Policy blocked order", policyResult);
     }
 
     const isCrypto = params.order.asset_class === "crypto";
-    if (!isCrypto && !clock.is_open && params.order.time_in_force === "day") {
+    if (!isCrypto && !evaluation.clock.is_open && params.order.time_in_force === "day") {
       throw createError(ErrorCode.MARKET_CLOSED, "Market closed");
     }
 

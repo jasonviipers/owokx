@@ -28,8 +28,10 @@ export function useAgentStatus({ enabled, pollMs = 5000 }: UseAgentStatusParams)
         setStatus(payload.data ?? null);
         setError(payload.error || "Failed to fetch status");
       }
-    } catch {
-      setError("Connection failed - is the agent running?");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const normalized = message.trim();
+      setError(normalized.length > 0 ? normalized : "Connection failed - is the agent running?");
     }
   }, []);
 

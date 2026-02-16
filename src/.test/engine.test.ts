@@ -525,6 +525,149 @@ describe("PolicyEngine", () => {
       expect(result.allowed).toBe(false);
       expect(result.violations.some((v) => v.rule === "max_portfolio_drawdown")).toBe(true);
     });
+
+    it("warns when symbol exposure approaches limit", () => {
+      engine = new PolicyEngine(
+        createTestConfig({
+          max_position_pct_equity: 1,
+          max_notional_per_trade: 100000,
+          max_symbol_exposure_pct: 0.25,
+        })
+      );
+
+      const ctx = createTestContext({
+        account: createTestAccount({ equity: 100000 }),
+        positions: [createTestPosition({ symbol: "AAPL", market_value: 20000 })],
+        order: createTestOrder({ symbol: "AAPL", notional: 0 }),
+      });
+
+      const result = engine.evaluate(ctx);
+      expect(result.allowed).toBe(true);
+      expect(result.warnings.some((w) => w.rule === "symbol_exposure_warning")).toBe(true);
+    });
+
+    it("uses stricter runtime symbol exposure limit from risk state", () => {
+      engine = new PolicyEngine(
+        createTestConfig({
+          max_position_pct_equity: 1,
+          max_notional_per_trade: 100000,
+          max_symbol_exposure_pct: 0.5,
+        })
+      );
+
+      const ctx = createTestContext({
+        account: createTestAccount({ equity: 100000 }),
+        positions: [createTestPosition({ symbol: "AAPL", market_value: 19000 })],
+        order: createTestOrder({ symbol: "AAPL", notional: 2000 }),
+        riskState: createTestRiskState({ max_symbol_exposure_pct: 0.2 }),
+      });
+
+      const result = engine.evaluate(ctx);
+      expect(result.allowed).toBe(false);
+      expect(result.violations.some((v) => v.rule === "max_symbol_exposure")).toBe(true);
+    });
+
+    it("does not apply symbol exposure cap to sells", () => {
+      engine = new PolicyEngine(
+        createTestConfig({
+          max_position_pct_equity: 1,
+          max_notional_per_trade: 100000,
+          max_symbol_exposure_pct: 0.2,
+        })
+      );
+
+      const ctx = createTestContext({
+        account: createTestAccount({ equity: 100000 }),
+        positions: [createTestPosition({ symbol: "AAPL", market_value: 25000, qty: 100 })],
+        order: createTestOrder({ symbol: "AAPL", side: "sell", qty: 10, notional: 1000 }),
+      });
+
+      const result = engine.evaluate(ctx);
+      expect(result.violations.some((v) => v.rule === "max_symbol_exposure")).toBe(false);
+    });
+
+    it("warns when correlated exposure approaches limit", () => {
+      engine = new PolicyEngine(
+        createTestConfig({
+          max_position_pct_equity: 1,
+          max_notional_per_trade: 100000,
+          max_symbol_exposure_pct: 1,
+          max_correlated_exposure_pct: 0.4,
+        })
+      );
+
+      const ctx = createTestContext({
+        account: createTestAccount({ equity: 100000 }),
+        positions: [createTestPosition({ symbol: "MSFT", market_value: 32000 })],
+        order: createTestOrder({ symbol: "AAPL", notional: 0 }),
+      });
+
+      const result = engine.evaluate(ctx);
+      expect(result.allowed).toBe(true);
+      expect(result.warnings.some((w) => w.rule === "correlated_exposure_warning")).toBe(true);
+    });
+
+    it("does not block crypto order on equity correlated bucket limits", () => {
+      engine = new PolicyEngine(
+        createTestConfig({
+          max_position_pct_equity: 1,
+          max_notional_per_trade: 100000,
+          max_symbol_exposure_pct: 1,
+          max_correlated_exposure_pct: 0.3,
+        })
+      );
+
+      const ctx = createTestContext({
+        account: createTestAccount({ equity: 100000 }),
+        positions: [createTestPosition({ symbol: "AAPL", market_value: 25000 })],
+        order: createTestOrder({ symbol: "BTC/USD", asset_class: "crypto", notional: 5000, time_in_force: "gtc" }),
+      });
+
+      const result = engine.evaluate(ctx);
+      expect(result.violations.some((v) => v.rule === "max_correlated_exposure")).toBe(false);
+    });
+
+    it("warns when portfolio drawdown approaches limit", () => {
+      engine = new PolicyEngine(createTestConfig({ max_portfolio_drawdown_pct: 0.1, max_notional_per_trade: 100000 }));
+
+      const ctx = createTestContext({
+        account: createTestAccount({ equity: 91900, last_equity: 100000 }),
+        riskState: createTestRiskState({ daily_equity_start: 100000 }),
+      });
+
+      const result = engine.evaluate(ctx);
+      expect(result.allowed).toBe(true);
+      expect(result.warnings.some((w) => w.rule === "portfolio_drawdown_warning")).toBe(true);
+    });
+
+    it("falls back to last_equity for drawdown baseline when daily_equity_start is missing", () => {
+      engine = new PolicyEngine(createTestConfig({ max_portfolio_drawdown_pct: 0.1, max_notional_per_trade: 100000 }));
+
+      const ctx = createTestContext({
+        account: createTestAccount({ equity: 85000, last_equity: 100000 }),
+        riskState: createTestRiskState({ daily_equity_start: null }),
+      });
+
+      const result = engine.evaluate(ctx);
+      expect(result.allowed).toBe(false);
+      expect(result.violations.some((v) => v.rule === "max_portfolio_drawdown")).toBe(true);
+    });
+
+    it("uses stricter runtime drawdown limit from risk state", () => {
+      engine = new PolicyEngine(createTestConfig({ max_portfolio_drawdown_pct: 0.2, max_notional_per_trade: 100000 }));
+
+      const ctx = createTestContext({
+        account: createTestAccount({ equity: 87000, last_equity: 100000 }),
+        riskState: createTestRiskState({
+          daily_equity_start: 100000,
+          max_portfolio_drawdown_pct: 0.12,
+        }),
+      });
+
+      const result = engine.evaluate(ctx);
+      expect(result.allowed).toBe(false);
+      expect(result.violations.some((v) => v.rule === "max_portfolio_drawdown")).toBe(true);
+    });
   });
 
   describe("multiple violations", () => {

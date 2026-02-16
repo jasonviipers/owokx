@@ -45,7 +45,7 @@ import {
   periodWindowMs,
   timeframeBucketMs,
 } from "../lib/portfolio-history";
-import { resolveShardKey } from "../lib/sharding";
+import { getDefaultPolicyConfig } from "../policy/config";
 import { type BrokerProviders, createBrokerProviders } from "../providers/broker-factory";
 import { createLLMProvider } from "../providers/llm/factory";
 import type {
@@ -62,6 +62,8 @@ import type { D1Client } from "../storage/d1/client";
 import { createD1Client } from "../storage/d1/client";
 import { insertActivityLog, queryActivityLogs } from "../storage/d1/queries/activity-logs";
 import { createDecision } from "../storage/d1/queries/decisions";
+import { getPolicyConfig, savePolicyConfig } from "../storage/d1/queries/policy-config";
+import { getRiskState } from "../storage/d1/queries/risk-state";
 import { createHarnessContext } from "./harness/context";
 import { createExecutionService, type ExecutionService } from "./harness/execution-service";
 import { createResearchService, type ResearchService } from "./harness/research-service";
@@ -92,6 +94,9 @@ interface AgentConfig {
   take_profit_pct: number; // [TUNE] Take profit at this % gain
   stop_loss_pct: number; // [TUNE] Stop loss at this % loss
   position_size_pct_of_cash: number; // [TUNE] % of cash per trade
+  max_symbol_exposure_pct: number; // [TUNE] Max total symbol exposure as % of equity
+  max_correlated_exposure_pct: number; // [TUNE] Max correlated bucket exposure as % of equity
+  max_portfolio_drawdown_pct: number; // [TUNE] Max portfolio drawdown from session baseline
 
   // Stale position management - exit positions that have lost momentum
   stale_position_enabled: boolean;
@@ -137,6 +142,13 @@ interface AgentConfig {
 
   // Dev escape hatch - lets local runs continue when swarm quorum is degraded.
   allow_unhealthy_swarm?: boolean;
+
+  // Champion/challenger promotion thresholds for LearningAgent.
+  strategy_promotion_enabled: boolean;
+  strategy_promotion_min_samples: number;
+  strategy_promotion_min_win_rate: number;
+  strategy_promotion_min_avg_pnl: number;
+  strategy_promotion_min_win_rate_lift: number;
 }
 
 // [CUSTOMIZABLE] Add fields here when you add new data sources
@@ -576,6 +588,9 @@ const DEFAULT_CONFIG: AgentConfig = {
   take_profit_pct: 10,
   stop_loss_pct: 5,
   position_size_pct_of_cash: 25,
+  max_symbol_exposure_pct: 0.25,
+  max_correlated_exposure_pct: 0.5,
+  max_portfolio_drawdown_pct: 0.15,
   stale_position_enabled: true,
   stale_min_hold_hours: 24,
   stale_max_hold_days: 3,
@@ -606,6 +621,11 @@ const DEFAULT_CONFIG: AgentConfig = {
   ticker_blacklist: [],
   allowed_exchanges: ["NYSE", "NASDAQ", "ARCA", "AMEX", "BATS"],
   allow_unhealthy_swarm: false,
+  strategy_promotion_enabled: false,
+  strategy_promotion_min_samples: 30,
+  strategy_promotion_min_win_rate: 0.55,
+  strategy_promotion_min_avg_pnl: 5,
+  strategy_promotion_min_win_rate_lift: 0.03,
 };
 
 type GathererSource = "stocktwits" | "reddit" | "crypto" | "sec" | "scout";
@@ -1333,18 +1353,7 @@ export class OwokxHarness extends DurableObject<Env> {
   private lastLogPersistAt = 0;
   private logPersistTimerArmed = false;
   private lastSwarmBypassLogAt = 0;
-  private isAlarmRunning = false;
-  private alarmRunStartedAt = 0;
-  private readonly alarmReentrancyStaleMs = 5 * 60_000;
-  private readonly serviceShardKey: string;
-  private readonly l1ReadCache = new Map<string, { expiresAt: number; payload: unknown }>();
-  private readonly inFlightReads = new Map<string, Promise<unknown>>();
-  private readonly maxL1ReadCacheEntries = 128;
-  private cacheReadHits = 0;
-  private cacheReadMisses = 0;
-  private cacheCoalescingHitCount = 0;
-  private readonly d1QueryLatencySamplesMs: number[] = [];
-  private readonly maxD1LatencySamples = 256;
+  private lastLearningPromotionSyncAt = 0;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -1390,6 +1399,10 @@ export class OwokxHarness extends DurableObject<Env> {
       const stored = await this.ctx.storage.get<AgentState>("state");
       if (stored) {
         this.state = { ...DEFAULT_STATE, ...stored };
+        this.state.config = {
+          ...DEFAULT_CONFIG,
+          ...(stored.config ?? {}),
+        };
         if (!Array.isArray(this.state.memoryEpisodes)) {
           this.state.memoryEpisodes = [];
         }
@@ -1762,6 +1775,8 @@ export class OwokxHarness extends DurableObject<Env> {
       if (now - this.state.lastSwarmRoleSyncAt >= SWARM_ROLE_SYNC_INTERVAL_MS) {
         await this.syncSwarmRoleHealth();
       }
+
+      await this.syncLearningPromotionThresholds();
 
       const broker = createBrokerProviders(this.env, this.state.config.broker);
       const clock = await broker.trading.getClock();
@@ -2672,6 +2687,26 @@ export class OwokxHarness extends DurableObject<Env> {
     this.enforceProductionSwarmGuard();
     this.state.optimization.adaptiveDataPollIntervalMs = this.state.config.data_poll_interval_ms;
     this.state.optimization.adaptiveAnalystIntervalMs = this.state.config.analyst_interval_ms;
+
+    try {
+      const db = createD1Client(this.env.DB);
+      const storedPolicy = (await getPolicyConfig(db)) ?? getDefaultPolicyConfig(this.env);
+      await savePolicyConfig(db, {
+        ...storedPolicy,
+        max_symbol_exposure_pct: this.state.config.max_symbol_exposure_pct,
+        max_correlated_exposure_pct: this.state.config.max_correlated_exposure_pct,
+        max_portfolio_drawdown_pct: this.state.config.max_portfolio_drawdown_pct,
+      });
+    } catch (error) {
+      this.log("System", "policy_sync_failed", {
+        reason: "unable_to_persist_risk_fields",
+        error: String(error),
+        severity: "warning",
+        status: "warning",
+        event_type: "api",
+      });
+    }
+
     this.log("System", "config_updated", {
       changed_keys: changedKeys,
       change_count: changedKeys.length,
@@ -2679,6 +2714,7 @@ export class OwokxHarness extends DurableObject<Env> {
       event_type: "api",
     });
     this.initializeLLM();
+    await this.syncLearningPromotionThresholds(true);
     await this.persist();
     return this.jsonResponse({
       ok: true,
@@ -2686,6 +2722,51 @@ export class OwokxHarness extends DurableObject<Env> {
       config: this.state.config,
       data: this.state.config,
     });
+  }
+
+  private async syncLearningPromotionThresholds(force = false): Promise<void> {
+    if (!this.env.LEARNING_AGENT) {
+      return;
+    }
+
+    const now = Date.now();
+    if (!force && now - this.lastLearningPromotionSyncAt < 300_000) {
+      return;
+    }
+
+    try {
+      const learningId = this.env.LEARNING_AGENT.idFromName("default");
+      const learningAgent = this.env.LEARNING_AGENT.get(learningId);
+      const response = await learningAgent.fetch("http://learning/promotion/config", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          enabled: this.state.config.strategy_promotion_enabled,
+          min_samples: this.state.config.strategy_promotion_min_samples,
+          min_win_rate: this.state.config.strategy_promotion_min_win_rate,
+          min_avg_pnl: this.state.config.strategy_promotion_min_avg_pnl,
+          min_win_rate_lift: this.state.config.strategy_promotion_min_win_rate_lift,
+        }),
+      });
+
+      if (!response.ok) {
+        this.log("Learning", "promotion_threshold_sync_failed", {
+          status: response.status,
+          event_type: "swarm",
+          severity: "warning",
+          status_text: response.statusText,
+        });
+        return;
+      }
+
+      this.lastLearningPromotionSyncAt = now;
+    } catch (error) {
+      this.log("Learning", "promotion_threshold_sync_error", {
+        error: String(error),
+        event_type: "swarm",
+        severity: "warning",
+      });
+    }
   }
 
   private async handleEnable(): Promise<Response> {
@@ -7550,7 +7631,17 @@ Response format:
 
     if (this.env.RISK_MANAGER) {
       try {
-        const id = this.env.RISK_MANAGER.idFromName(this.serviceShardKey);
+        const db = createD1Client(this.env.DB);
+        const [accountSnapshot, positions, clock, riskState, storedPolicy] = await Promise.all([
+          broker.trading.getAccount(),
+          broker.trading.getPositions(),
+          broker.trading.getClock(),
+          getRiskState(db),
+          getPolicyConfig(db),
+        ]);
+        const policyConfig = storedPolicy ?? getDefaultPolicyConfig(this.env);
+
+        const id = this.env.RISK_MANAGER.idFromName("default");
         const stub = this.env.RISK_MANAGER.get(id);
         const res = await stub.fetch("http://risk/validate", {
           method: "POST",
@@ -7559,6 +7650,14 @@ Response format:
             symbol,
             notional: Math.round(positionSize * 100) / 100,
             side: "buy",
+            asset_class: isCrypto ? "crypto" : "us_equity",
+            order_type: "market",
+            time_in_force: isCrypto ? "gtc" : "day",
+            account: accountSnapshot,
+            positions,
+            clock,
+            riskState,
+            policy_config: policyConfig,
             volatility: riskProfile.realizedVolatility,
             drawdownPct: riskProfile.maxDrawdownPct,
             riskMultiplier: riskProfile.multiplier,

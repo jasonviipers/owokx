@@ -68,6 +68,9 @@ export interface Config {
   take_profit_pct: number
   stop_loss_pct: number
   position_size_pct_of_cash: number
+  max_symbol_exposure_pct?: number
+  max_correlated_exposure_pct?: number
+  max_portfolio_drawdown_pct?: number
   llm_provider?: 'openai-raw' | 'ai-sdk' | 'cloudflare-gateway'
   llm_model: string
   llm_analyst_model?: string
@@ -101,6 +104,12 @@ export interface Config {
   crypto_max_position_value?: number
   crypto_take_profit_pct?: number
   crypto_stop_loss_pct?: number
+
+  strategy_promotion_enabled?: boolean
+  strategy_promotion_min_samples?: number
+  strategy_promotion_min_win_rate?: number
+  strategy_promotion_min_avg_pnl?: number
+  strategy_promotion_min_win_rate_lift?: number
 
   // Custom ticker blacklist (insider trading restrictions, etc.)
   ticker_blacklist?: string[]

@@ -28,7 +28,7 @@ jobs:
           version: 10
 
       - name: Install dashboard dependencies
-        run: pnpm --dir dashboard install --frozen-lockfile
+        run: pnpm --dir dashboard install
 
       - name: Run dashboard checks
         run: pnpm --dir dashboard run check

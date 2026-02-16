@@ -11,6 +11,15 @@ export const R2Paths = {
     `scraped/${domain}/${encodeURIComponent(path)}/${timestamp}.html`,
 
   tradeSnapshot: (tradeId: string) => `trades/${tradeId}/snapshot.json`,
+
+  experimentRunSummary: (strategy: string, runId: string) =>
+    `experiments/${encodeURIComponent(strategy)}/${runId}/summary.json`,
+
+  experimentRunEquity: (strategy: string, runId: string) =>
+    `experiments/${encodeURIComponent(strategy)}/${runId}/equity.json`,
+
+  experimentRunMetrics: (strategy: string, runId: string) =>
+    `experiments/${encodeURIComponent(strategy)}/${runId}/metrics.json`,
 } as const;
 
 export function parseNewsPath(key: string): {
@@ -34,4 +43,20 @@ export function parseReportPath(key: string): {
   const [, symbol, timestamp] = match;
   if (!symbol || !timestamp) return null;
   return { symbol, timestamp };
+}
+
+export function parseExperimentArtifactPath(key: string): {
+  strategy: string;
+  runId: string;
+  artifact: "summary" | "equity" | "metrics";
+} | null {
+  const match = key.match(/^experiments\/([^/]+)\/([^/]+)\/(summary|equity|metrics)\.json$/);
+  if (!match) return null;
+  const [, strategy, runId, artifact] = match;
+  if (!strategy || !runId || !artifact) return null;
+  return {
+    strategy: decodeURIComponent(strategy),
+    runId,
+    artifact: artifact as "summary" | "equity" | "metrics",
+  };
 }
