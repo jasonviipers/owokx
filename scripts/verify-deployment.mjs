@@ -32,8 +32,18 @@ function toBoolean(value) {
   return normalized === "1" || normalized === "true" || normalized === "yes";
 }
 
+const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
+
+function isAbortLikeError(error) {
+  if (!(error instanceof Error)) return false;
+  if (error.name === "AbortError" || error.name === "TimeoutError") return true;
+  return typeof error.message === "string" && error.message.toLowerCase().includes("aborted");
+}
+
 async function checkEndpoint(input) {
   const startedAt = Date.now();
+  const timeoutMs = Number.isFinite(input.timeoutMs) && input.timeoutMs > 0 ? input.timeoutMs : DEFAULT_REQUEST_TIMEOUT_MS;
+  const signal = AbortSignal.timeout(timeoutMs);
   let response;
   let bodyText = "";
   let error = null;
@@ -43,10 +53,15 @@ async function checkEndpoint(input) {
       method: "GET",
       headers: input.headers,
       redirect: "follow",
+      signal,
     });
     bodyText = await response.text();
   } catch (fetchError) {
-    error = fetchError instanceof Error ? fetchError.message : String(fetchError);
+    if (isAbortLikeError(fetchError)) {
+      error = `Request timed out after ${timeoutMs}ms`;
+    } else {
+      error = fetchError instanceof Error ? fetchError.message : String(fetchError);
+    }
   }
 
   const durationMs = Date.now() - startedAt;
