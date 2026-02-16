@@ -44,13 +44,13 @@ npm install
 
 ```bash
 # D1
-npx wrangler d1 create Okx-db
+npx wrangler d1 create owokx_db
 
 # KV
-npx wrangler kv namespace create CACHE
+npx wrangler kv namespace create CACHE --preview
 
 # Apply migrations
-npx wrangler d1 migrations apply Okx-db
+npx wrangler d1 migrations apply owokx_db
 ```
 
 ### 3. Configure secrets
