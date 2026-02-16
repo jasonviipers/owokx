@@ -84,7 +84,13 @@ jobs:
           test -n "$CLOUDFLARE_API_TOKEN"
 
       - name: Install worker dependencies
-        run: pnpm install --frozen-lockfile
+        run: |
+          if [ -f pnpm-lock.yaml ]; then
+            pnpm install --frozen-lockfile
+          else
+            echo "::warning::pnpm-lock.yaml missing at repository root; falling back to non-frozen install."
+            pnpm install --no-frozen-lockfile
+          fi
 
       - name: Run worker quality gates
         run: |
