@@ -39,7 +39,15 @@ function resolveConfiguredApiOrigin(): string | null {
   const candidate = typeof __OWOKX_API_URL__ === 'string' ? __OWOKX_API_URL__.trim() : ''
   if (!candidate) return null
   try {
-    return new URL(candidate).origin
+    const parsed = new URL(candidate)
+    if (typeof window !== 'undefined') {
+      const candidateIsLocal = parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1'
+      const pageIsLocal = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
+      if (candidateIsLocal && !pageIsLocal) {
+        return null
+      }
+    }
+    return parsed.origin
   } catch {
     return null
   }
