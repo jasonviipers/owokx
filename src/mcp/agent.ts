@@ -22,6 +22,7 @@ import { extractFinancialData, isAllowedDomain, scrapeUrl } from "../providers/s
 import { computeTechnicals, detectSignals, type Signal, type TechnicalIndicators } from "../providers/technicals";
 import type { LLMProvider, OptionsProvider } from "../providers/types";
 import { createD1Client, type D1Client } from "../storage/d1/client";
+import { createDecisionTrace, getDecisionTraceById, listDecisionTraces } from "../storage/d1/queries/decisions";
 import {
   insertNewsItem,
   insertRawEvent,
@@ -85,13 +86,31 @@ export class OwokxMcpAgent extends McpAgent<Env> {
     this.registerNewsTools(db);
     this.registerResearchTools(db, broker);
     this.registerOptionsTools();
-    this.registerUtilityTools();
+    this.registerUtilityTools(db);
   }
 
   private async loadPolicyConfig(db: D1Client): Promise<PolicyConfig> {
     const storedPolicy = await getPolicyConfig(db);
     this.policyConfig = storedPolicy ?? getDefaultPolicyConfig(this.env);
     return this.policyConfig;
+  }
+
+  private isMissingDecisionTraceSchemaError(error: unknown): boolean {
+    const message = String(error).toLowerCase();
+    return message.includes("no such table") && message.includes("decision_traces");
+  }
+
+  private async recordDecisionTraceSafe(
+    db: D1Client,
+    params: Parameters<typeof createDecisionTrace>[1]
+  ): Promise<void> {
+    try {
+      await createDecisionTrace(db, params);
+    } catch (error) {
+      if (!this.isMissingDecisionTraceSchemaError(error)) {
+        console.warn("[decision-trace] Unable to persist MCP decision trace", String(error));
+      }
+    }
   }
 
   private registerAuthTools(db: ReturnType<typeof createD1Client>, broker: BrokerProviders) {
@@ -338,8 +357,23 @@ export class OwokxMcpAgent extends McpAgent<Env> {
       },
       async (input) => {
         const startTime = Date.now();
+        const previewTraceId = generateId();
         try {
           if (!input.qty && !input.notional) {
+            await this.recordDecisionTraceSafe(db, {
+              trace_id: previewTraceId,
+              request_id: this.requestId,
+              source: "mcp-agent",
+              stage: "orders_preview",
+              decision_kind: "policy",
+              input,
+              final_action: "rejected_invalid_input",
+              status: "blocked",
+              error_code: ErrorCode.INVALID_INPUT,
+              error_message: "Either qty or notional required",
+              symbol: input.symbol.toUpperCase(),
+              metadata: { tool_name: "orders-preview" },
+            });
             return {
               content: [
                 {
@@ -476,6 +510,22 @@ export class OwokxMcpAgent extends McpAgent<Env> {
           if (policyResult.allowed) {
             const approvalSecret = this.env.APPROVAL_SIGNING_SECRET;
             if (!approvalSecret) {
+              await this.recordDecisionTraceSafe(db, {
+                trace_id: previewTraceId,
+                request_id: this.requestId,
+                source: "mcp-agent",
+                stage: "orders_preview",
+                decision_kind: "policy",
+                input,
+                output: { preview },
+                policy: policyResult,
+                final_action: "rejected_missing_approval_secret",
+                status: "error",
+                error_code: ErrorCode.INTERNAL_ERROR,
+                error_message: "APPROVAL_SIGNING_SECRET is required",
+                symbol: preview.symbol,
+                metadata: { tool_name: "orders-preview" },
+              });
               return {
                 content: [
                   {
@@ -503,6 +553,24 @@ export class OwokxMcpAgent extends McpAgent<Env> {
             policyResult.expires_at = approval.expires_at;
           }
 
+          await this.recordDecisionTraceSafe(db, {
+            trace_id: policyResult.approval_id ?? previewTraceId,
+            request_id: this.requestId,
+            source: "mcp-agent",
+            stage: "orders_preview",
+            decision_kind: "policy",
+            input,
+            output: { preview },
+            policy: policyResult,
+            final_action: policyResult.allowed ? "preview_allowed" : "preview_blocked",
+            status: policyResult.allowed ? "success" : "blocked",
+            symbol: preview.symbol,
+            metadata: {
+              tool_name: "orders-preview",
+              approval_id: policyResult.approval_id ?? null,
+            },
+          });
+
           const result = success({ preview, policy: policyResult });
 
           await insertToolLog(db, {
@@ -516,6 +584,20 @@ export class OwokxMcpAgent extends McpAgent<Env> {
 
           return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
         } catch (error) {
+          await this.recordDecisionTraceSafe(db, {
+            trace_id: previewTraceId,
+            request_id: this.requestId,
+            source: "mcp-agent",
+            stage: "orders_preview",
+            decision_kind: "policy",
+            input,
+            final_action: "preview_error",
+            status: "error",
+            error_code: ErrorCode.INTERNAL_ERROR,
+            error_message: String(error),
+            symbol: input.symbol?.toUpperCase() ?? null,
+            metadata: { tool_name: "orders-preview" },
+          });
           return {
             content: [
               {
@@ -535,9 +617,24 @@ export class OwokxMcpAgent extends McpAgent<Env> {
       { approval_token: z.string().min(1) },
       async ({ approval_token }) => {
         const startTime = Date.now();
+        const submitTraceId = generateId();
         try {
           const riskState = await getRiskState(db);
           if (riskState.kill_switch_active) {
+            await this.recordDecisionTraceSafe(db, {
+              trace_id: submitTraceId,
+              request_id: this.requestId,
+              source: "mcp-agent",
+              stage: "orders_submit",
+              decision_kind: "execution",
+              input: { approval_token: "[REDACTED]" },
+              policy: { risk_state: riskState },
+              final_action: "blocked_kill_switch",
+              status: "blocked",
+              error_code: ErrorCode.KILL_SWITCH_ACTIVE,
+              error_message: riskState.kill_switch_reason ?? "Kill switch active",
+              metadata: { tool_name: "orders-submit" },
+            });
             return {
               content: [
                 {
@@ -558,6 +655,19 @@ export class OwokxMcpAgent extends McpAgent<Env> {
 
           const approvalSecret = this.env.APPROVAL_SIGNING_SECRET;
           if (!approvalSecret) {
+            await this.recordDecisionTraceSafe(db, {
+              trace_id: submitTraceId,
+              request_id: this.requestId,
+              source: "mcp-agent",
+              stage: "orders_submit",
+              decision_kind: "execution",
+              input: { approval_token: "[REDACTED]" },
+              final_action: "rejected_missing_approval_secret",
+              status: "error",
+              error_code: ErrorCode.INTERNAL_ERROR,
+              error_message: "APPROVAL_SIGNING_SECRET is required",
+              metadata: { tool_name: "orders-submit" },
+            });
             return {
               content: [
                 {
@@ -579,6 +689,19 @@ export class OwokxMcpAgent extends McpAgent<Env> {
             db,
           });
           if (!validation.valid) {
+            await this.recordDecisionTraceSafe(db, {
+              trace_id: submitTraceId,
+              request_id: this.requestId,
+              source: "mcp-agent",
+              stage: "orders_submit",
+              decision_kind: "execution",
+              input: { approval_token: "[REDACTED]" },
+              final_action: "rejected_invalid_approval_token",
+              status: "blocked",
+              error_code: ErrorCode.INVALID_APPROVAL_TOKEN,
+              error_message: validation.reason ?? "Invalid token",
+              metadata: { tool_name: "orders-submit" },
+            });
             return {
               content: [
                 {
@@ -598,6 +721,23 @@ export class OwokxMcpAgent extends McpAgent<Env> {
           const reservationId = generateId();
           const reserved = await reserveApprovalToken(db, validation.approval_id!, reservationId);
           if (!reserved) {
+            await this.recordDecisionTraceSafe(db, {
+              trace_id: validation.approval_id ?? submitTraceId,
+              request_id: this.requestId,
+              source: "mcp-agent",
+              stage: "orders_submit",
+              decision_kind: "execution",
+              input: {
+                approval_id: validation.approval_id ?? null,
+              },
+              policy: validation.policy_result ?? null,
+              final_action: "rejected_approval_token_not_reservable",
+              status: "blocked",
+              error_code: ErrorCode.INVALID_APPROVAL_TOKEN,
+              error_message: "Approval token already in use, expired, or already consumed",
+              symbol: validation.order_params?.symbol ?? null,
+              metadata: { tool_name: "orders-submit" },
+            });
             return {
               content: [
                 {
@@ -645,6 +785,30 @@ export class OwokxMcpAgent extends McpAgent<Env> {
             ).catch(() => {});
           }
 
+          await this.recordDecisionTraceSafe(db, {
+            trace_id: validation.approval_id ?? submitTraceId,
+            request_id: this.requestId,
+            source: "mcp-agent",
+            stage: "orders_submit",
+            decision_kind: "execution",
+            input: {
+              approval_id: validation.approval_id ?? null,
+              order: orderParams,
+            },
+            output: {
+              submission_id: execution.submission.id,
+              submission_state: execution.submission.state,
+              broker_order_id: execution.broker_order_id ?? null,
+              trade_id: execution.trade_id ?? null,
+              approval_consumed: approvalConsumed,
+            },
+            policy: validation.policy_result ?? null,
+            final_action: execution.submission.state === "SUBMITTED" ? "submitted" : "submission_not_submitted",
+            status: execution.submission.state === "SUBMITTED" ? "success" : "blocked",
+            symbol: orderParams.symbol,
+            metadata: { tool_name: "orders-submit" },
+          });
+
           const result = success({
             message:
               execution.submission.state === "SUBMITTED"
@@ -677,6 +841,19 @@ export class OwokxMcpAgent extends McpAgent<Env> {
 
           return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
         } catch (error) {
+          await this.recordDecisionTraceSafe(db, {
+            trace_id: submitTraceId,
+            request_id: this.requestId,
+            source: "mcp-agent",
+            stage: "orders_submit",
+            decision_kind: "execution",
+            input: { approval_token: "[REDACTED]" },
+            final_action: "submit_error",
+            status: "error",
+            error_code: ErrorCode.PROVIDER_ERROR,
+            error_message: String(error),
+            metadata: { tool_name: "orders-submit" },
+          });
           return {
             content: [
               {
@@ -878,7 +1055,7 @@ export class OwokxMcpAgent extends McpAgent<Env> {
     );
   }
 
-  private registerUtilityTools() {
+  private registerUtilityTools(db: D1Client) {
     this.typedServer.tool("help-usage", "Get help information about using Okx", {}, async () => {
       const result = success({
         name: "Okx MCP Trading Server",
@@ -888,6 +1065,90 @@ export class OwokxMcpAgent extends McpAgent<Env> {
       });
       return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
     });
+
+    this.typedServer.tool(
+      "decision-traces-list",
+      "List decision traces captured across analyst, trader, MCP, and execution paths",
+      {
+        trace_id: z.string().optional(),
+        request_id: z.string().optional(),
+        source: z.string().optional(),
+        stage: z.string().optional(),
+        symbol: z.string().optional(),
+        status: z.string().optional(),
+        limit: z.number().min(1).max(500).default(100),
+        offset: z.number().min(0).default(0),
+      },
+      async ({ trace_id, request_id, source, stage, symbol, status, limit, offset }) => {
+        try {
+          const traces = await listDecisionTraces(db, {
+            trace_id,
+            request_id,
+            source,
+            stage,
+            symbol: symbol ? symbol.toUpperCase() : undefined,
+            status,
+            limit,
+            offset,
+          });
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: JSON.stringify(success({ count: traces.length, traces }), null, 2),
+              },
+            ],
+          };
+        } catch (error) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: JSON.stringify(failure({ code: ErrorCode.INTERNAL_ERROR, message: String(error) }), null, 2),
+              },
+            ],
+            isError: true,
+          };
+        }
+      }
+    );
+
+    this.typedServer.tool(
+      "decision-trace-get",
+      "Get a single decision trace by id",
+      { id: z.string().min(1) },
+      async ({ id }) => {
+        try {
+          const trace = await getDecisionTraceById(db, id);
+          if (!trace) {
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: JSON.stringify(
+                    failure({ code: ErrorCode.NOT_FOUND, message: "Decision trace not found" }),
+                    null,
+                    2
+                  ),
+                },
+              ],
+              isError: true,
+            };
+          }
+          return { content: [{ type: "text" as const, text: JSON.stringify(success(trace), null, 2) }] };
+        } catch (error) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: JSON.stringify(failure({ code: ErrorCode.INTERNAL_ERROR, message: String(error) }), null, 2),
+              },
+            ],
+            isError: true,
+          };
+        }
+      }
+    );
 
     this.typedServer.tool("catalog-list", "List all available tools", {}, async () => {
       const catalog = [
@@ -924,6 +1185,7 @@ export class OwokxMcpAgent extends McpAgent<Env> {
             "options-order-submit",
           ],
         },
+        { category: "Decision Traces", tools: ["decision-traces-list", "decision-trace-get"] },
         { category: "Utility", tools: ["help-usage", "catalog-list"] },
       ];
       return { content: [{ type: "text" as const, text: JSON.stringify(success({ catalog }), null, 2) }] };

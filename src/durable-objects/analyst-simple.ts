@@ -9,6 +9,8 @@ import { AgentBase, type AgentBaseState } from "../lib/agents/base";
 import type { AgentMessage, AgentType } from "../lib/agents/protocol";
 import { createError, ErrorCode, OwokxError } from "../lib/errors";
 import { createLLMProvider } from "../providers/llm/factory";
+import { createD1Client } from "../storage/d1/client";
+import { type CreateDecisionTraceParams, createDecisionTrace } from "../storage/d1/queries/decisions";
 
 interface AnalysisCacheEntry {
   recommendations: unknown[];
@@ -29,6 +31,18 @@ interface AnalystMetrics {
   researchCalls: number;
   researchBatchCalls: number;
   researchCacheHits: number;
+}
+
+interface LlmExecutionResult<T> {
+  value: T;
+  status: "success" | "fallback";
+  finalAction: string;
+  error?: string;
+}
+
+function isMissingDecisionTraceSchemaError(error: unknown): boolean {
+  const message = String(error).toLowerCase();
+  return message.includes("no such table") && message.includes("decision_traces");
 }
 
 interface AnalystState extends AgentBaseState {
@@ -316,6 +330,23 @@ export class AnalystSimple extends AgentBase<AnalystState> {
     );
   }
 
+  private async recordDecisionTrace(params: Omit<CreateDecisionTraceParams, "source">): Promise<void> {
+    if (!this.env.DB || typeof this.env.DB.prepare !== "function") {
+      return;
+    }
+    try {
+      const db = createD1Client(this.env.DB);
+      await createDecisionTrace(db, {
+        source: "analyst-simple",
+        ...params,
+      });
+    } catch (error) {
+      if (!isMissingDecisionTraceSchemaError(error)) {
+        this.log("warn", "Unable to persist analyst decision trace", { error: String(error) });
+      }
+    }
+  }
+
   private async analyzeSignals(signals: unknown[]): Promise<any[]> {
     if (signals.length === 0) {
       return [];
@@ -366,7 +397,9 @@ Output JSON array of recommendations:
   }
 ]`;
 
-    const recommendations = await this.runLlmWithResilience<any[]>(
+    let analysisModelProvider: string | null = this.env.LLM_PROVIDER ?? null;
+    let analysisModelName: string | null = this.env.LLM_MODEL ?? null;
+    const recommendationsResult = await this.runLlmWithResilience<any[]>(
       async () => {
         const response = await this._llm.complete({
           messages: [
@@ -379,6 +412,8 @@ Output JSON array of recommendations:
           max_tokens: 500,
           temperature: 0.2,
         });
+        analysisModelProvider = response.provider ?? analysisModelProvider;
+        analysisModelName = response.model ?? analysisModelName;
 
         const parsed = this.parseJsonResponse(response.content || "{}");
         const output = Array.isArray(parsed.recommendations) ? parsed.recommendations : parsed;
@@ -387,6 +422,34 @@ Output JSON array of recommendations:
       [],
       "analyze_signals"
     );
+    const recommendations = recommendationsResult.value;
+
+    await this.recordDecisionTrace({
+      trace_id: `analyst:analyze:${Date.now()}`,
+      stage: "analyze_signals",
+      decision_kind: "llm",
+      model_provider: analysisModelProvider,
+      model_name: analysisModelName,
+      input: {
+        signal_count: topSignals.length,
+        signals: topSignals.map((signal) => ({
+          symbol: signal.symbol,
+          sentiment: signal.sentiment,
+          volume: signal.volume,
+          sources: signal.sources,
+        })),
+      },
+      output: {
+        recommendation_count: recommendations.length,
+        recommendations,
+      },
+      final_action: recommendationsResult.finalAction,
+      status: recommendationsResult.status,
+      error_message: recommendationsResult.error,
+      metadata: {
+        cache_key: cacheKey,
+      },
+    });
 
     this.state.analysisCache[cacheKey] = {
       recommendations,
@@ -467,7 +530,9 @@ Return JSON array:
   }
 ]`;
 
-      const batchResult = await this.runLlmWithResilience<
+      let batchModelProvider: string | null = this.env.LLM_PROVIDER ?? null;
+      let batchModelName: string | null = this.env.LLM_MODEL ?? null;
+      const batchResultTrace = await this.runLlmWithResilience<
         Array<{ symbol?: string; verdict?: "BUY" | "SKIP" | "WAIT"; confidence?: number; reasoning?: string }>
       >(
         async () => {
@@ -482,12 +547,34 @@ Return JSON array:
             max_tokens: 600,
             temperature: 0.25,
           });
+          batchModelProvider = response.provider ?? batchModelProvider;
+          batchModelName = response.model ?? batchModelName;
           const parsed = this.parseJsonResponse(response.content || "[]");
           return Array.isArray(parsed) ? parsed : [];
         },
         [],
         "research_signals_batch"
       );
+      const batchResult = batchResultTrace.value;
+
+      await this.recordDecisionTrace({
+        trace_id: `analyst:research:${Date.now()}`,
+        stage: "research_signals_batch",
+        decision_kind: "llm",
+        model_provider: batchModelProvider,
+        model_name: batchModelName,
+        input: {
+          chunk_size: chunk.length,
+          chunk,
+        },
+        output: {
+          result_count: batchResult.length,
+          results: batchResult,
+        },
+        final_action: batchResultTrace.finalAction,
+        status: batchResultTrace.status,
+        error_message: batchResultTrace.error,
+      });
 
       for (const item of batchResult) {
         if (!item || typeof item.symbol !== "string") continue;
@@ -628,22 +715,40 @@ Return JSON array:
     };
   }
 
-  private async runLlmWithResilience<T>(operation: () => Promise<T>, fallback: T, context: string): Promise<T> {
+  private async runLlmWithResilience<T>(
+    operation: () => Promise<T>,
+    fallback: T,
+    context: string
+  ): Promise<LlmExecutionResult<T>> {
     if (!this._llm) {
-      return fallback;
+      return {
+        value: fallback,
+        status: "fallback",
+        finalAction: "fallback_no_provider",
+        error: "LLM provider unavailable",
+      };
     }
     if (this.isLlmCircuitOpen()) {
       this.log("warn", "LLM circuit open; using fallback", {
         context,
         openUntil: this.state.llmHealth.circuitOpenUntil,
       });
-      return fallback;
+      return {
+        value: fallback,
+        status: "fallback",
+        finalAction: "fallback_circuit_open",
+        error: "LLM circuit open",
+      };
     }
 
     try {
       const result = await this.withTimeout(operation(), this.llmTimeoutMs);
       this.markLlmSuccess();
-      return result;
+      return {
+        value: result,
+        status: "success",
+        finalAction: "llm_success",
+      };
     } catch (error) {
       this.markLlmFailure(String(error));
       const details =
@@ -655,7 +760,12 @@ Return JSON array:
         error: String(error),
         ...details,
       });
-      return fallback;
+      return {
+        value: fallback,
+        status: "fallback",
+        finalAction: "fallback_error",
+        error: String(error),
+      };
     }
   }
 

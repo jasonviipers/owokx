@@ -7,6 +7,7 @@ import { PolicyEngine } from "../policy/engine";
 import type { BrokerProviders } from "../providers/broker-factory";
 import type { Account, MarketClock, Position } from "../providers/types";
 import type { D1Client, OrderSubmissionRow } from "../storage/d1/client";
+import { createDecisionTrace } from "../storage/d1/queries/decisions";
 import {
   getOrderSubmissionByIdempotencyKey,
   reserveOrderSubmission,
@@ -60,6 +61,21 @@ export function isAcceptedSubmissionState(state: string): boolean {
   return state === "SUBMITTED" || state === "SUBMITTING";
 }
 
+function isMissingDecisionTraceSchemaError(error: unknown): boolean {
+  const message = String(error).toLowerCase();
+  return message.includes("no such table") && message.includes("decision_traces");
+}
+
+async function recordDecisionTraceSafe(db: D1Client, params: Parameters<typeof createDecisionTrace>[1]): Promise<void> {
+  try {
+    await createDecisionTrace(db, params);
+  } catch (error) {
+    if (!isMissingDecisionTraceSchemaError(error)) {
+      console.warn("[decision-trace] Unable to persist execute-order trace", String(error));
+    }
+  }
+}
+
 export async function evaluateOrderPolicy(params: EvaluateOrderPolicyParams): Promise<EvaluateOrderPolicyResult> {
   const [account, positions, clock, riskState, policyConfig] = await Promise.all([
     params.account ?? params.broker.trading.getAccount(),
@@ -89,6 +105,7 @@ export async function evaluateOrderPolicy(params: EvaluateOrderPolicyParams): Pr
 }
 
 export async function executeOrder(params: ExecuteOrderParams): Promise<ExecuteOrderResult> {
+  const traceId = params.approval_id ?? params.idempotency_key;
   const request_json = JSON.stringify({ order: params.order, approval_id: params.approval_id ?? null });
   const submission = await reserveOrderSubmission(params.db, {
     idempotency_key: params.idempotency_key,
@@ -99,6 +116,23 @@ export async function executeOrder(params: ExecuteOrderParams): Promise<ExecuteO
   });
 
   if (isAcceptedSubmissionState(submission.state)) {
+    await recordDecisionTraceSafe(params.db, {
+      trace_id: traceId,
+      request_id: params.idempotency_key,
+      source: "execute-order",
+      stage: "idempotency_reuse",
+      decision_kind: "execution",
+      input: params.order,
+      final_action: "reuse_existing_submission",
+      status: "success",
+      symbol: params.order.symbol,
+      metadata: {
+        approval_id: params.approval_id ?? null,
+        source: params.source,
+        submission_id: submission.id,
+        submission_state: submission.state,
+      },
+    });
     return { submission, broker_order_id: submission.broker_order_id ?? undefined };
   }
 
@@ -123,22 +157,100 @@ export async function executeOrder(params: ExecuteOrderParams): Promise<ExecuteO
   }
 
   try {
+    let policyResultForTrace: PolicyResult | null = null;
+    let policyConfigForTrace: PolicyConfig | null = null;
+    let riskStateForTrace: RiskState | null = null;
+
     const evaluation = await evaluateOrderPolicy({
       env: params.env,
       db: params.db,
       broker: params.broker,
       order: params.order,
     });
+    policyResultForTrace = evaluation.policyResult;
+    policyConfigForTrace = evaluation.policyConfig;
+    riskStateForTrace = evaluation.riskState;
+
     if (evaluation.riskState.kill_switch_active) {
+      await recordDecisionTraceSafe(params.db, {
+        trace_id: traceId,
+        request_id: params.idempotency_key,
+        source: "execute-order",
+        stage: "policy_gate",
+        decision_kind: "policy",
+        input: params.order,
+        policy: {
+          policy_result: evaluation.policyResult,
+          policy_config: evaluation.policyConfig,
+          risk_state: evaluation.riskState,
+        },
+        final_action: "blocked_kill_switch",
+        status: "blocked",
+        error_code: ErrorCode.KILL_SWITCH_ACTIVE,
+        error_message: evaluation.riskState.kill_switch_reason ?? "Kill switch active",
+        symbol: params.order.symbol,
+        metadata: {
+          approval_id: params.approval_id ?? null,
+          source: params.source,
+          submission_id: submission.id,
+        },
+      });
       throw createError(ErrorCode.KILL_SWITCH_ACTIVE, evaluation.riskState.kill_switch_reason ?? "Kill switch active");
     }
     const policyResult = evaluation.policyResult;
     if (!policyResult.allowed) {
+      await recordDecisionTraceSafe(params.db, {
+        trace_id: traceId,
+        request_id: params.idempotency_key,
+        source: "execute-order",
+        stage: "policy_gate",
+        decision_kind: "policy",
+        input: params.order,
+        policy: {
+          policy_result: policyResult,
+          policy_config: evaluation.policyConfig,
+          risk_state: evaluation.riskState,
+        },
+        final_action: "blocked_policy_violation",
+        status: "blocked",
+        error_code: ErrorCode.POLICY_VIOLATION,
+        error_message: "Policy blocked order",
+        symbol: params.order.symbol,
+        metadata: {
+          approval_id: params.approval_id ?? null,
+          source: params.source,
+          submission_id: submission.id,
+        },
+      });
       throw createError(ErrorCode.POLICY_VIOLATION, "Policy blocked order", policyResult);
     }
 
     const isCrypto = params.order.asset_class === "crypto";
     if (!isCrypto && !evaluation.clock.is_open && params.order.time_in_force === "day") {
+      await recordDecisionTraceSafe(params.db, {
+        trace_id: traceId,
+        request_id: params.idempotency_key,
+        source: "execute-order",
+        stage: "market_gate",
+        decision_kind: "policy",
+        input: params.order,
+        policy: {
+          policy_result: policyResult,
+          policy_config: evaluation.policyConfig,
+          risk_state: evaluation.riskState,
+          market_clock: evaluation.clock,
+        },
+        final_action: "blocked_market_closed",
+        status: "blocked",
+        error_code: ErrorCode.MARKET_CLOSED,
+        error_message: "Market closed",
+        symbol: params.order.symbol,
+        metadata: {
+          approval_id: params.approval_id ?? null,
+          source: params.source,
+          submission_id: submission.id,
+        },
+      });
       throw createError(ErrorCode.MARKET_CLOSED, "Market closed");
     }
 
@@ -190,6 +302,34 @@ export async function executeOrder(params: ExecuteOrderParams): Promise<ExecuteO
       });
     }
 
+    await recordDecisionTraceSafe(params.db, {
+      trace_id: traceId,
+      request_id: params.idempotency_key,
+      source: "execute-order",
+      stage: "broker_submit",
+      decision_kind: "execution",
+      input: params.order,
+      output: {
+        submission_state: "SUBMITTED",
+        broker_order_id: order.id,
+        trade_id: tradeId ?? null,
+      },
+      policy: {
+        policy_result: policyResultForTrace,
+        policy_config: policyConfigForTrace,
+        risk_state: riskStateForTrace,
+      },
+      final_action: "submitted",
+      status: "success",
+      symbol: params.order.symbol,
+      metadata: {
+        approval_id: params.approval_id ?? null,
+        source: params.source,
+        submission_id: submission.id,
+        broker_provider: params.broker.broker,
+      },
+    });
+
     return {
       submission: { ...submission, state: "SUBMITTED", broker_order_id: order.id },
       broker_order_id: order.id,
@@ -211,6 +351,29 @@ export async function executeOrder(params: ExecuteOrderParams): Promise<ExecuteO
 
     await setOrderSubmissionState(params.db, submission.id, "FAILED", {
       last_error_json: JSON.stringify({ ...toolError, details: sanitizeForLog(toolError.details) }),
+    });
+
+    await recordDecisionTraceSafe(params.db, {
+      trace_id: traceId,
+      request_id: params.idempotency_key,
+      source: "execute-order",
+      stage: "broker_submit",
+      decision_kind: "execution",
+      input: params.order,
+      output: {
+        submission_state: "FAILED",
+      },
+      final_action: "submit_failed",
+      status: "error",
+      error_code: toolError.code,
+      error_message: toolError.message,
+      symbol: params.order.symbol,
+      metadata: {
+        approval_id: params.approval_id ?? null,
+        source: params.source,
+        submission_id: submission.id,
+        broker_provider: params.broker.broker,
+      },
     });
 
     if (err && typeof err === "object" && "code" in err && "message" in err) {

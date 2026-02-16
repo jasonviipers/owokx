@@ -23,6 +23,10 @@ let policyOverride: Record<string, unknown> | null = null;
 let riskStateOverride: Record<string, unknown> | null = null;
 let createdOrders: Array<{ client_order_id?: string; symbol: string }> = [];
 
+const mocks = vi.hoisted(() => ({
+  createDecisionTraceMock: vi.fn(async () => "trace_1"),
+}));
+
 vi.mock("../storage/d1/queries/order-submissions", () => {
   return {
     getOrderSubmissionByIdempotencyKey: vi.fn(async (_db: unknown, idempotencyKey: string) => {
@@ -119,6 +123,12 @@ vi.mock("../storage/d1/queries/trades", () => {
   };
 });
 
+vi.mock("../storage/d1/queries/decisions", () => {
+  return {
+    createDecisionTrace: mocks.createDecisionTraceMock,
+  };
+});
+
 import { executeOrder } from "../execution/execute-order";
 
 function envStub() {
@@ -195,6 +205,7 @@ beforeEach(() => {
   policyOverride = null;
   riskStateOverride = null;
   createdOrders = [];
+  mocks.createDecisionTraceMock.mockClear();
 });
 
 describe("executeOrder", () => {
@@ -239,6 +250,7 @@ describe("executeOrder", () => {
     expect(first.submission.state).toBe("SUBMITTED");
     expect(second.submission.state).toBe("SUBMITTED");
     expect(createdOrders.length).toBe(1);
+    expect(mocks.createDecisionTraceMock).toHaveBeenCalled();
   });
 
   it("blocks when kill switch is active", async () => {
@@ -268,6 +280,14 @@ describe("executeOrder", () => {
     expect(createdOrders.length).toBe(0);
     const sub = submissionsByKey.get("harness:buy:AAPL:deadbeef");
     expect(sub?.state).toBe("FAILED");
+    expect(mocks.createDecisionTraceMock).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        decision_kind: "policy",
+        final_action: "blocked_kill_switch",
+        status: "blocked",
+      })
+    );
   });
 
   it("blocks on policy violation", async () => {

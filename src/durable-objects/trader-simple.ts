@@ -12,6 +12,7 @@ import { getDefaultPolicyConfig, type PolicyConfig } from "../policy/config";
 import { createBrokerProviders } from "../providers/broker-factory";
 import type { Account, MarketClock, Position } from "../providers/types";
 import { createD1Client } from "../storage/d1/client";
+import { type CreateDecisionTraceParams, createDecisionTrace } from "../storage/d1/queries/decisions";
 import { getPolicyConfig } from "../storage/d1/queries/policy-config";
 import { getRiskState, type RiskState } from "../storage/d1/queries/risk-state";
 
@@ -57,6 +58,11 @@ interface RiskValidationContext {
   clock?: MarketClock;
   riskState?: RiskState;
   policyConfig?: PolicyConfig;
+}
+
+function isMissingDecisionTraceSchemaError(error: unknown): boolean {
+  const message = String(error).toLowerCase();
+  return message.includes("no such table") && message.includes("decision_traces");
 }
 
 export class TraderSimple extends AgentBase<TraderState> {
@@ -264,16 +270,49 @@ export class TraderSimple extends AgentBase<TraderState> {
     // Input validation
     if (!symbol || symbol.trim().length === 0) {
       this.recordTrade(symbol, "buy", 0, false, "Empty symbol");
+      await this.recordDecisionTrace({
+        trace_id: this.buildIdempotencyKey("buy", symbol || "UNKNOWN"),
+        request_id: this.buildIdempotencyKey("buy", symbol || "UNKNOWN"),
+        stage: "buy_intent",
+        decision_kind: "execution",
+        input: { symbol, confidence, cash: account.cash },
+        final_action: "rejected_empty_symbol",
+        status: "blocked",
+        error_message: "Empty symbol",
+        symbol: symbol || null,
+      });
       return false;
     }
 
     if (account.cash <= 0) {
       this.recordTrade(symbol, "buy", 0, false, "No cash available");
+      await this.recordDecisionTrace({
+        trace_id: this.buildIdempotencyKey("buy", symbol),
+        request_id: this.buildIdempotencyKey("buy", symbol),
+        stage: "buy_intent",
+        decision_kind: "execution",
+        input: { symbol, confidence, cash: account.cash },
+        final_action: "rejected_no_cash",
+        status: "blocked",
+        error_message: "No cash available",
+        symbol,
+      });
       return false;
     }
 
     if (confidence <= 0 || confidence > 1 || !Number.isFinite(confidence)) {
       this.recordTrade(symbol, "buy", 0, false, "Invalid confidence");
+      await this.recordDecisionTrace({
+        trace_id: this.buildIdempotencyKey("buy", symbol),
+        request_id: this.buildIdempotencyKey("buy", symbol),
+        stage: "buy_intent",
+        decision_kind: "execution",
+        input: { symbol, confidence, cash: account.cash },
+        final_action: "rejected_invalid_confidence",
+        status: "blocked",
+        error_message: "Invalid confidence",
+        symbol,
+      });
       return false;
     }
 
@@ -282,6 +321,17 @@ export class TraderSimple extends AgentBase<TraderState> {
 
     if (positionSize < 100) {
       this.recordTrade(symbol, "buy", positionSize, false, "Position too small");
+      await this.recordDecisionTrace({
+        trace_id: this.buildIdempotencyKey("buy", symbol),
+        request_id: this.buildIdempotencyKey("buy", symbol),
+        stage: "buy_sizing",
+        decision_kind: "execution",
+        input: { symbol, confidence, cash: account.cash, position_size: positionSize },
+        final_action: "rejected_position_too_small",
+        status: "blocked",
+        error_message: "Position too small",
+        symbol,
+      });
       await this.publishTradeOutcome({
         symbol,
         side: "buy",
@@ -295,6 +345,17 @@ export class TraderSimple extends AgentBase<TraderState> {
 
     if (positionSize <= 0 || positionSize > 5000 * 1.01 || !Number.isFinite(positionSize)) {
       this.recordTrade(symbol, "buy", positionSize, false, "Invalid position size");
+      await this.recordDecisionTrace({
+        trace_id: this.buildIdempotencyKey("buy", symbol),
+        request_id: this.buildIdempotencyKey("buy", symbol),
+        stage: "buy_sizing",
+        decision_kind: "execution",
+        input: { symbol, confidence, cash: account.cash, position_size: positionSize },
+        final_action: "rejected_invalid_position_size",
+        status: "blocked",
+        error_message: "Invalid position size",
+        symbol,
+      });
       await this.publishTradeOutcome({
         symbol,
         side: "buy",
@@ -316,6 +377,7 @@ export class TraderSimple extends AgentBase<TraderState> {
         getRiskState(db),
         this.loadPolicyConfig(db),
       ]);
+      const idempotency_key = this.buildIdempotencyKey("buy", symbol);
 
       const riskValidation = await this.validateOrderWithRiskManager(
         {
@@ -334,6 +396,31 @@ export class TraderSimple extends AgentBase<TraderState> {
 
       if (!riskValidation.approved) {
         this.recordTrade(symbol, "buy", positionSize, false, riskValidation.reason ?? "Risk check rejected order");
+        await this.recordDecisionTrace({
+          trace_id: idempotency_key,
+          request_id: idempotency_key,
+          stage: "risk_validation",
+          decision_kind: "policy",
+          input: {
+            symbol,
+            side: "buy",
+            notional: positionSize,
+          },
+          policy: {
+            approved: riskValidation.approved,
+            reason: riskValidation.reason ?? "Risk check rejected order",
+            policy_config: policyConfig,
+            risk_state: riskState,
+          },
+          final_action: "rejected_risk_validation",
+          status: "blocked",
+          error_message: riskValidation.reason ?? "Risk check rejected order",
+          symbol,
+          metadata: {
+            idempotency_key,
+            source: "harness",
+          },
+        });
         await this.publishTradeOutcome({
           symbol,
           side: "buy",
@@ -344,8 +431,6 @@ export class TraderSimple extends AgentBase<TraderState> {
         });
         return false;
       }
-
-      const idempotency_key = this.buildIdempotencyKey("buy", symbol);
 
       const execution = await executeOrder({
         env: this.env,
@@ -364,6 +449,31 @@ export class TraderSimple extends AgentBase<TraderState> {
       });
 
       const success = isAcceptedSubmissionState(execution.submission.state);
+      await this.recordDecisionTrace({
+        trace_id: idempotency_key,
+        request_id: idempotency_key,
+        stage: "order_submission",
+        decision_kind: "execution",
+        input: {
+          symbol,
+          side: "buy",
+          confidence,
+          notional: positionSize,
+        },
+        output: {
+          submission_id: execution.submission.id,
+          submission_state: execution.submission.state,
+          broker_order_id: execution.broker_order_id ?? null,
+          trade_id: execution.trade_id ?? null,
+        },
+        final_action: success ? "submitted" : "submission_not_accepted",
+        status: success ? "success" : "blocked",
+        symbol,
+        metadata: {
+          source: "harness",
+          approval_id: execution.submission.approval_id ?? null,
+        },
+      });
 
       this.recordTrade(symbol, "buy", positionSize, success, undefined);
 
@@ -384,6 +494,22 @@ export class TraderSimple extends AgentBase<TraderState> {
       return success;
     } catch (error) {
       this.recordTrade(symbol, "buy", positionSize, false, String(error));
+      await this.recordDecisionTrace({
+        trace_id: this.buildIdempotencyKey("buy", symbol),
+        request_id: this.buildIdempotencyKey("buy", symbol),
+        stage: "order_submission",
+        decision_kind: "execution",
+        input: {
+          symbol,
+          side: "buy",
+          confidence,
+          notional: positionSize,
+        },
+        final_action: "submit_failed",
+        status: "error",
+        error_message: String(error),
+        symbol,
+      });
       await this.publishTradeOutcome({
         symbol,
         side: "buy",
@@ -400,11 +526,33 @@ export class TraderSimple extends AgentBase<TraderState> {
     // Input validation
     if (!symbol || symbol.trim().length === 0) {
       this.recordTrade(symbol, "sell", 0, false, "Empty symbol");
+      await this.recordDecisionTrace({
+        trace_id: this.buildIdempotencyKey("sell", symbol || "UNKNOWN"),
+        request_id: this.buildIdempotencyKey("sell", symbol || "UNKNOWN"),
+        stage: "sell_intent",
+        decision_kind: "execution",
+        input: { symbol, reason },
+        final_action: "rejected_empty_symbol",
+        status: "blocked",
+        error_message: "Empty symbol",
+        symbol: symbol || null,
+      });
       return false;
     }
 
     if (!reason || reason.trim().length === 0) {
       this.recordTrade(symbol, "sell", 0, false, "No sell reason provided");
+      await this.recordDecisionTrace({
+        trace_id: this.buildIdempotencyKey("sell", symbol),
+        request_id: this.buildIdempotencyKey("sell", symbol),
+        stage: "sell_intent",
+        decision_kind: "execution",
+        input: { symbol, reason },
+        final_action: "rejected_missing_reason",
+        status: "blocked",
+        error_message: "No sell reason provided",
+        symbol,
+      });
       return false;
     }
 
@@ -414,6 +562,17 @@ export class TraderSimple extends AgentBase<TraderState> {
 
       if (!position) {
         this.recordTrade(symbol, "sell", 0, false, "Position not found");
+        await this.recordDecisionTrace({
+          trace_id: this.buildIdempotencyKey("sell", symbol),
+          request_id: this.buildIdempotencyKey("sell", symbol),
+          stage: "sell_position_lookup",
+          decision_kind: "execution",
+          input: { symbol, reason },
+          final_action: "rejected_position_not_found",
+          status: "blocked",
+          error_message: "Position not found",
+          symbol,
+        });
         await this.publishTradeOutcome({
           symbol,
           side: "sell",
@@ -444,6 +603,31 @@ export class TraderSimple extends AgentBase<TraderState> {
       });
 
       const success = isAcceptedSubmissionState(execution.submission.state);
+      await this.recordDecisionTrace({
+        trace_id: idempotency_key,
+        request_id: idempotency_key,
+        stage: "order_submission",
+        decision_kind: "execution",
+        input: {
+          symbol: position.symbol,
+          side: "sell",
+          qty: position.qty,
+          reason,
+        },
+        output: {
+          submission_id: execution.submission.id,
+          submission_state: execution.submission.state,
+          broker_order_id: execution.broker_order_id ?? null,
+          trade_id: execution.trade_id ?? null,
+        },
+        final_action: success ? "submitted" : "submission_not_accepted",
+        status: success ? "success" : "blocked",
+        symbol: position.symbol,
+        metadata: {
+          source: "harness",
+          approval_id: execution.submission.approval_id ?? null,
+        },
+      });
 
       this.recordTrade(position.symbol, "sell", position.market_value, success, undefined);
 
@@ -464,6 +648,17 @@ export class TraderSimple extends AgentBase<TraderState> {
       return success;
     } catch (error) {
       this.recordTrade(symbol, "sell", 0, false, String(error));
+      await this.recordDecisionTrace({
+        trace_id: this.buildIdempotencyKey("sell", symbol),
+        request_id: this.buildIdempotencyKey("sell", symbol),
+        stage: "order_submission",
+        decision_kind: "execution",
+        input: { symbol, reason },
+        final_action: "submit_failed",
+        status: "error",
+        error_message: String(error),
+        symbol,
+      });
       await this.publishTradeOutcome({
         symbol,
         side: "sell",
@@ -675,6 +870,23 @@ export class TraderSimple extends AgentBase<TraderState> {
       .replace(/[^A-Z0-9/_:-]/g, "_");
     const bucket = suffix ?? String(Math.floor(Date.now() / 300_000));
     return `trader:${action}:${normalizedSymbol}:${bucket}`;
+  }
+
+  private async recordDecisionTrace(params: Omit<CreateDecisionTraceParams, "source">): Promise<void> {
+    if (!this.env.DB || typeof this.env.DB.prepare !== "function") {
+      return;
+    }
+    try {
+      const db = createD1Client(this.env.DB);
+      await createDecisionTrace(db, {
+        source: "trader-simple",
+        ...params,
+      });
+    } catch (error) {
+      if (!isMissingDecisionTraceSchemaError(error)) {
+        this.log("warn", "Unable to persist trader decision trace", { error: String(error) });
+      }
+    }
   }
 
   private async publishTradeOutcome(outcome: {
