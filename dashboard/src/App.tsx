@@ -13,6 +13,7 @@ import type { Config, LogEntry, Signal, Position, SignalResearch, PortfolioSnaps
 import { MobileNav } from './components/Mobilenav'
 import { ErrorBoundary } from './components/ErrorBoundary'
 import { OverviewPage } from './pages/OverviewPage'
+import { ExperimentsPage } from './pages/ExperimentsPage'
 import { SettingsPage } from './pages/SettingsPage'
 import { SwarmPage } from './pages/SwarmPage'
 import { useAgentStatus } from './hooks/useAgentStatus'
@@ -379,7 +380,7 @@ export default function App() {
   const [activitySeverityFilter, setActivitySeverityFilter] = useState<ActivitySeverityFilter>('all')
   const [activityTimeRangeFilter, setActivityTimeRangeFilter] = useState<ActivityTimeRange>('24h')
   const [activityExpandedRows, setActivityExpandedRows] = useState<Record<string, boolean>>({})
-  const [mobileView, setMobileView] = useState<'overview' | 'positions' | 'activity' | 'signals'>('overview')
+  const [mobileView, setMobileView] = useState<'overview' | 'positions' | 'activity' | 'signals' | 'lab'>('overview')
 
   const statusPollingEnabled = setupChecked && !showSetup
   const { status, error, refresh: refreshStatus, setStatus } = useAgentStatus({
@@ -1087,6 +1088,10 @@ export default function App() {
             <SwarmPage swarm={status?.swarm} metrics={swarmMetrics} />
           </ErrorBoundary>
 
+          <ErrorBoundary title="EXPERIMENTS PANEL ERROR">
+            <ExperimentsPage enabled={statusPollingEnabled} />
+          </ErrorBoundary>
+
           <div className="col-span-4 md:col-span-8 lg:col-span-12">
             <Panel title="RISK & SIGNAL QUALITY" className="h-full">
               <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
@@ -1586,6 +1591,10 @@ export default function App() {
                 </div>
               </div>
             </Panel>
+          )}
+
+          {mobileView === 'lab' && (
+            <ExperimentsPage enabled={statusPollingEnabled} compact={true} />
           )}
 
           {mobileView === 'signals' && (

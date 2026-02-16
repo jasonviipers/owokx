@@ -1,4 +1,12 @@
-import type { Config, LogEntry, PortfolioSnapshot, Status } from "../types";
+import type {
+  Config,
+  ExperimentRun,
+  ExperimentRunDetails,
+  ExperimentVariant,
+  LogEntry,
+  PortfolioSnapshot,
+  Status,
+} from "../types";
 
 const API_BASE = "/api";
 const DEFAULT_TIMEOUT_MS = 8000;
@@ -29,6 +37,20 @@ export interface SwarmMetricsData {
     deadLettered: number;
     routingState: Record<string, number>;
   };
+}
+
+export interface ExperimentRunsResponse {
+  runs: ExperimentRun[];
+}
+
+export interface ExperimentVariantsResponse {
+  variants: ExperimentVariant[];
+}
+
+export interface ExperimentPromotionResponse {
+  strategy_name: string;
+  variant_id?: string;
+  promoted_variant?: ExperimentVariant;
 }
 
 interface ApiEnvelope<T> {
@@ -162,6 +184,65 @@ export async function fetchSwarmMetrics(): Promise<ApiEnvelope<SwarmMetricsData>
     method: "GET",
   });
   return payload;
+}
+
+export interface ExperimentRunsQuery {
+  strategy_name?: string;
+  date_from?: string;
+  date_to?: string;
+  limit?: number;
+  offset?: number;
+}
+
+function toQueryString(input: object): string {
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(input)) {
+    if (value === undefined || value === null) continue;
+    if (typeof value === "string" && value.trim().length === 0) continue;
+    params.set(key, String(value));
+  }
+  return params.toString();
+}
+
+export async function fetchExperimentRuns(query: ExperimentRunsQuery = {}): Promise<ExperimentRun[]> {
+  const qs = toQueryString(query);
+  const path = `${API_BASE}/experiments/runs${qs ? `?${qs}` : ""}`;
+  const { payload } = await requestJson<ApiEnvelope<ExperimentRunsResponse>>(path, { method: "GET" });
+  return Array.isArray(payload.data?.runs) ? payload.data.runs : [];
+}
+
+export async function fetchExperimentRunDetails(runId: string): Promise<ExperimentRunDetails> {
+  const encodedRunId = encodeURIComponent(runId);
+  const { payload } = await requestJson<ApiEnvelope<ExperimentRunDetails>>(
+    `${API_BASE}/experiments/runs/${encodedRunId}`,
+    { method: "GET" }
+  );
+  if (!payload.data) {
+    throw new Error(payload.error || "Experiment run details unavailable");
+  }
+  return payload.data;
+}
+
+export async function fetchExperimentVariants(strategy_name?: string): Promise<ExperimentVariant[]> {
+  const qs = toQueryString({ strategy_name });
+  const path = `${API_BASE}/experiments/variants${qs ? `?${qs}` : ""}`;
+  const { payload } = await requestJson<ApiEnvelope<ExperimentVariantsResponse>>(path, { method: "GET" });
+  return Array.isArray(payload.data?.variants) ? payload.data.variants : [];
+}
+
+export async function promoteExperimentRun(runId: string, variantName?: string): Promise<ExperimentPromotionResponse> {
+  const { payload } = await requestJson<ApiEnvelope<ExperimentPromotionResponse>>(`${API_BASE}/experiments/promote`, {
+    method: "POST",
+    body: JSON.stringify({
+      run_id: runId,
+      variant_name: variantName,
+    }),
+  });
+
+  if (!payload.ok || !payload.data) {
+    throw new Error(payload.error || "Promotion failed");
+  }
+  return payload.data;
 }
 
 export async function saveSessionToken(token: string): Promise<void> {

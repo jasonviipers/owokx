@@ -3,6 +3,17 @@ import type { Env } from "./env.d";
 import { handleCronEvent } from "./jobs/cron";
 import { isRequestAuthorized, isTokenAuthorized } from "./lib/auth";
 import { OwokxMcpAgent } from "./mcp/agent";
+import { createD1Client } from "./storage/d1/client";
+import {
+  getExperimentRunById,
+  listExperimentMetrics,
+  listExperimentRuns,
+  listExperimentVariants,
+  setExperimentChampionVariant,
+  upsertExperimentVariant,
+} from "./storage/d1/queries/experiments";
+import { createR2Client } from "./storage/r2/client";
+import { R2Paths } from "./storage/r2/paths";
 
 export { SessionDO } from "./durable-objects/session";
 export { OwokxMcpAgent, OwokxMcpAgent as owokxMcpAgent };
@@ -34,6 +45,40 @@ function buildSessionCookie(request: Request, token: string): string {
 
 function clearSessionCookie(): string {
   return "OWOKX_SESSION=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0";
+}
+
+function jsonResponse(payload: unknown, status = 200): Response {
+  return new Response(JSON.stringify(payload), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+function parsePositiveInt(input: string | null, fallback: number, max: number): number {
+  const parsed = Number.parseInt(input ?? "", 10);
+  if (!Number.isFinite(parsed)) return fallback;
+  if (parsed <= 0) return fallback;
+  return Math.min(parsed, max);
+}
+
+const EXPERIMENTS_SCHEMA_HINT =
+  "Experiment schema not initialized. Apply D1 migrations (including migrations/0008_experiments.sql).";
+
+function getErrorMessage(error: unknown): string {
+  if (error instanceof Error && typeof error.message === "string" && error.message.trim().length > 0) {
+    return error.message;
+  }
+  return String(error);
+}
+
+function isMissingExperimentsSchemaError(error: unknown): boolean {
+  const message = getErrorMessage(error).toLowerCase();
+  return (
+    message.includes("no such table") &&
+    (message.includes("experiment_runs") ||
+      message.includes("experiment_variants") ||
+      message.includes("experiment_metrics"))
+  );
 }
 
 function getRegistryStub(env: Env): DurableObjectStub {
@@ -130,6 +175,219 @@ export default {
         return unauthorizedResponse();
       }
       return OwokxMcpAgent.mount("/mcp", { binding: "MCP_AGENT" }).fetch(request, env, ctx);
+    }
+
+    if (url.pathname === "/agent/experiments/runs" && request.method === "GET") {
+      if (!isRequestAuthorized(request, env, "read")) {
+        return unauthorizedResponse();
+      }
+
+      const db = createD1Client(env.DB);
+      const strategyName = url.searchParams.get("strategy_name") ?? undefined;
+      const dateFrom = url.searchParams.get("date_from") ?? undefined;
+      const dateTo = url.searchParams.get("date_to") ?? undefined;
+      const limit = parsePositiveInt(url.searchParams.get("limit"), 50, 500);
+      const offsetRaw = Number.parseInt(url.searchParams.get("offset") ?? "0", 10);
+      const offset = Number.isFinite(offsetRaw) && offsetRaw >= 0 ? offsetRaw : 0;
+
+      try {
+        const runs = await listExperimentRuns(db, {
+          strategy_name: strategyName,
+          date_from: dateFrom,
+          date_to: dateTo,
+          limit,
+          offset,
+        });
+        return jsonResponse({ ok: true, data: { runs } });
+      } catch (error) {
+        if (isMissingExperimentsSchemaError(error)) {
+          return jsonResponse({
+            ok: true,
+            data: { runs: [] },
+            warning: EXPERIMENTS_SCHEMA_HINT,
+          });
+        }
+        return jsonResponse({ ok: false, error: getErrorMessage(error) }, 500);
+      }
+    }
+
+    if (url.pathname.startsWith("/agent/experiments/runs/") && request.method === "GET") {
+      if (!isRequestAuthorized(request, env, "read")) {
+        return unauthorizedResponse();
+      }
+
+      const runId = decodeURIComponent(url.pathname.slice("/agent/experiments/runs/".length));
+      if (!runId) {
+        return jsonResponse({ ok: false, error: "run_id is required" }, 400);
+      }
+
+      const db = createD1Client(env.DB);
+      const r2 = createR2Client(env.ARTIFACTS);
+
+      try {
+        const run = await getExperimentRunById(db, runId);
+        if (!run) {
+          return jsonResponse({ ok: false, error: "Experiment run not found" }, 404);
+        }
+
+        const metricsKey = R2Paths.experimentRunMetrics(run.strategy_name, run.id);
+        const [summaryArtifact, equityArtifact, metricsArtifact, metrics] = await Promise.all([
+          run.summary_artifact_key ? r2.getExperimentArtifact(run.summary_artifact_key) : Promise.resolve(null),
+          run.equity_artifact_key ? r2.getExperimentArtifact(run.equity_artifact_key) : Promise.resolve(null),
+          r2.getExperimentArtifact(metricsKey).catch(() => null),
+          listExperimentMetrics(db, { run_id: run.id, limit: 2000 }),
+        ]);
+
+        return jsonResponse({
+          ok: true,
+          data: {
+            run,
+            summary_artifact: summaryArtifact,
+            equity_artifact: equityArtifact,
+            metrics_artifact: metricsArtifact,
+            metrics,
+          },
+        });
+      } catch (error) {
+        if (isMissingExperimentsSchemaError(error)) {
+          return jsonResponse({ ok: false, error: EXPERIMENTS_SCHEMA_HINT }, 503);
+        }
+        return jsonResponse({ ok: false, error: getErrorMessage(error) }, 500);
+      }
+    }
+
+    if (url.pathname === "/agent/experiments/variants" && request.method === "GET") {
+      if (!isRequestAuthorized(request, env, "read")) {
+        return unauthorizedResponse();
+      }
+
+      const db = createD1Client(env.DB);
+      const strategyName = url.searchParams.get("strategy_name") ?? undefined;
+      const limit = parsePositiveInt(url.searchParams.get("limit"), 50, 500);
+      const offsetRaw = Number.parseInt(url.searchParams.get("offset") ?? "0", 10);
+      const offset = Number.isFinite(offsetRaw) && offsetRaw >= 0 ? offsetRaw : 0;
+
+      try {
+        const variants = await listExperimentVariants(db, {
+          strategy_name: strategyName,
+          limit,
+          offset,
+        });
+        return jsonResponse({ ok: true, data: { variants } });
+      } catch (error) {
+        if (isMissingExperimentsSchemaError(error)) {
+          return jsonResponse({
+            ok: true,
+            data: { variants: [] },
+            warning: EXPERIMENTS_SCHEMA_HINT,
+          });
+        }
+        return jsonResponse({ ok: false, error: getErrorMessage(error) }, 500);
+      }
+    }
+
+    if (url.pathname === "/agent/experiments/promote" && request.method === "POST") {
+      if (!isRequestAuthorized(request, env, "trade")) {
+        return unauthorizedResponse();
+      }
+
+      type PromoteBody = {
+        run_id?: string;
+        strategy_name?: string;
+        variant_id?: string;
+        variant_name?: string;
+        params?: Record<string, unknown>;
+      };
+
+      let body: PromoteBody = {};
+      try {
+        body = (await request.json()) as PromoteBody;
+      } catch {
+        return jsonResponse({ ok: false, error: "Invalid JSON payload" }, 400);
+      }
+
+      const db = createD1Client(env.DB);
+
+      try {
+        if (body.run_id) {
+          const run = await getExperimentRunById(db, body.run_id);
+          if (!run) {
+            return jsonResponse({ ok: false, error: "Experiment run not found" }, 404);
+          }
+
+          const config = run.config ?? {};
+          const derivedVariantName =
+            body.variant_name ??
+            (typeof config.variant === "string" && config.variant.trim().length > 0
+              ? config.variant.trim()
+              : `run-${run.id.slice(0, 8)}`);
+
+          const promotedVariant = await upsertExperimentVariant(db, {
+            strategy_name: run.strategy_name,
+            variant_name: derivedVariantName,
+            params: body.params ?? config,
+            status: "active",
+            is_champion: false,
+          });
+
+          await setExperimentChampionVariant(db, run.strategy_name, promotedVariant.id);
+          return jsonResponse({
+            ok: true,
+            data: {
+              strategy_name: run.strategy_name,
+              promoted_variant: {
+                ...promotedVariant,
+                is_champion: true,
+              },
+            },
+          });
+        }
+
+        if (body.strategy_name && body.variant_id) {
+          await setExperimentChampionVariant(db, body.strategy_name, body.variant_id);
+          return jsonResponse({
+            ok: true,
+            data: {
+              strategy_name: body.strategy_name,
+              variant_id: body.variant_id,
+            },
+          });
+        }
+
+        if (body.strategy_name && body.variant_name) {
+          const promotedVariant = await upsertExperimentVariant(db, {
+            strategy_name: body.strategy_name,
+            variant_name: body.variant_name,
+            params: body.params ?? {},
+            status: "active",
+            is_champion: false,
+          });
+          await setExperimentChampionVariant(db, body.strategy_name, promotedVariant.id);
+          return jsonResponse({
+            ok: true,
+            data: {
+              strategy_name: body.strategy_name,
+              promoted_variant: {
+                ...promotedVariant,
+                is_champion: true,
+              },
+            },
+          });
+        }
+
+        return jsonResponse(
+          {
+            ok: false,
+            error: "Provide either run_id or strategy_name + variant_id (or strategy_name + variant_name)",
+          },
+          400
+        );
+      } catch (error) {
+        if (isMissingExperimentsSchemaError(error)) {
+          return jsonResponse({ ok: false, error: EXPERIMENTS_SCHEMA_HINT }, 503);
+        }
+        return jsonResponse({ ok: false, error: getErrorMessage(error) }, 500);
+      }
     }
 
     if (url.pathname.startsWith("/agent")) {

@@ -234,6 +234,61 @@ export interface Status {
   signalPerformance?: SignalPerformance
 }
 
+export interface ExperimentVariant {
+  id: string
+  strategy_name: string
+  variant_name: string
+  params: Record<string, unknown>
+  status: string
+  is_champion: boolean
+  created_at: string
+  updated_at: string
+}
+
+export interface ExperimentRun {
+  id: string
+  strategy_name: string
+  variant_id: string | null
+  seed: number | null
+  status: string
+  config: Record<string, unknown>
+  summary: Record<string, unknown> | null
+  summary_artifact_key: string | null
+  equity_artifact_key: string | null
+  started_at: string
+  finished_at: string | null
+  created_at: string
+  updated_at: string
+}
+
+export interface ExperimentMetric {
+  id: string
+  run_id: string
+  metric_name: string
+  metric_value: number
+  step: number | null
+  tags: Record<string, unknown> | null
+  recorded_at: string
+}
+
+export interface ExperimentEquityPoint {
+  t_ms: number
+  equity: number
+  cash?: number
+}
+
+export interface ExperimentRunDetails {
+  run: ExperimentRun
+  summary_artifact?: Record<string, unknown> | null
+  equity_artifact?: {
+    run_id?: string
+    strategy?: string
+    points?: ExperimentEquityPoint[]
+  } | null
+  metrics_artifact?: Record<string, unknown> | null
+  metrics: ExperimentMetric[]
+}
+
 export interface AgentStatus {
   id: string
   type: string

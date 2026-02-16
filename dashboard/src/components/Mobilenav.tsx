@@ -1,16 +1,17 @@
 import clsx from 'clsx'
 
 interface MobileNavProps {
-  view: 'overview' | 'positions' | 'activity' | 'signals'
-  onViewChange: (view: 'overview' | 'positions' | 'activity' | 'signals') => void
+  view: 'overview' | 'positions' | 'activity' | 'signals' | 'lab'
+  onViewChange: (view: 'overview' | 'positions' | 'activity' | 'signals' | 'lab') => void
 }
 
 export function MobileNav({ view, onViewChange }: MobileNavProps) {
   const tabs = [
-    { id: 'overview' as const, label: 'Overview', icon: '📊' },
-    { id: 'positions' as const, label: 'Positions', icon: '💼' },
-    { id: 'activity' as const, label: 'Activity', icon: '📝' },
-    { id: 'signals' as const, label: 'Signals', icon: '📡' },
+    { id: 'overview' as const, label: 'Overview', icon: 'OVR' },
+    { id: 'positions' as const, label: 'Positions', icon: 'POS' },
+    { id: 'activity' as const, label: 'Activity', icon: 'ACT' },
+    { id: 'signals' as const, label: 'Signals', icon: 'SIG' },
+    { id: 'lab' as const, label: 'Lab', icon: 'LAB' },
   ]
 
   return (
@@ -26,7 +27,7 @@ export function MobileNav({ view, onViewChange }: MobileNavProps) {
               : 'text-hud-text-dim hover:text-hud-text hover:bg-hud-line/20'
           )}
         >
-          <span className="hidden xs:inline">{tab.icon} </span>
+          <span className="hidden xs:inline">[{tab.icon}] </span>
           {tab.label}
         </button>
       ))}
