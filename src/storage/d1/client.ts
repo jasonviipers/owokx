@@ -163,6 +163,43 @@ export interface StructuredEventRow {
   created_at: string;
 }
 
+export interface ExperimentVariantRow {
+  id: string;
+  strategy_name: string;
+  variant_name: string;
+  params_json: string;
+  status: string;
+  is_champion: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ExperimentRunRow {
+  id: string;
+  strategy_name: string;
+  variant_id: string | null;
+  seed: number | null;
+  status: string;
+  config_json: string;
+  summary_json: string | null;
+  summary_artifact_key: string | null;
+  equity_artifact_key: string | null;
+  started_at: string;
+  finished_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ExperimentMetricRow {
+  id: string;
+  run_id: string;
+  metric_name: string;
+  metric_value: number;
+  step: number | null;
+  tags_json: string | null;
+  recorded_at: string;
+}
+
 export function createD1Client(db: D1Database | undefined | null): D1Client {
   if (!db || typeof db.prepare !== "function") {
     throw new Error(

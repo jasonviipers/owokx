@@ -1,14 +1,25 @@
 #!/usr/bin/env npx tsx
 
-import { readFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import path from "node:path";
+import {
+  BacktestBrokerProvider,
+  BacktestMarketDataProvider,
+  computeMaxDrawdownPct,
+  createSeededRng,
+  normalizeDeterministicSeed,
+} from "../src/providers/backtest";
 import { createOpenAIProvider } from "../src/providers/llm/openai";
-import { BacktestBrokerProvider, BacktestMarketDataProvider } from "../src/providers/backtest";
-import type { Bar } from "../src/providers/types";
+import type { Bar, Position } from "../src/providers/types";
 
 function parseArgValue(args: string[], name: string): string | undefined {
   const idx = args.indexOf(name);
   if (idx === -1) return undefined;
   return args[idx + 1];
+}
+
+function hasFlag(args: string[], name: string): boolean {
+  return args.includes(name);
 }
 
 function requiredEnv(name: string): string {
@@ -33,16 +44,71 @@ type AnalystOutput = {
   high_conviction_plays?: string[];
 };
 
+function buildDeterministicRecommendations(params: {
+  momentumSignals: Array<{ symbol: string; ret: number }>;
+  positions: Position[];
+  minConfidence: number;
+  maxPositions: number;
+  rng: () => number;
+}): AnalystOutput["recommendations"] {
+  const held = new Set(params.positions.map((p) => p.symbol.toUpperCase()));
+  const buySlots = Math.max(0, params.maxPositions - params.positions.length);
+
+  const ranked = [...params.momentumSignals].sort((a, b) => {
+    const delta = b.ret - a.ret;
+    if (Math.abs(delta) > 1e-8) return delta;
+    return a.symbol.localeCompare(b.symbol);
+  });
+
+  const recs: NonNullable<AnalystOutput["recommendations"]> = [];
+
+  for (const candidate of ranked) {
+    const confidence = Math.min(0.99, Math.max(0.01, 0.5 + candidate.ret * 5 + (params.rng() - 0.5) * 0.02));
+
+    if (candidate.ret < -0.02 && held.has(candidate.symbol)) {
+      recs.push({
+        action: "SELL",
+        symbol: candidate.symbol,
+        confidence,
+        reasoning: `Momentum deterioration (${(candidate.ret * 100).toFixed(2)}%)`,
+      });
+      continue;
+    }
+
+    if (candidate.ret > 0.01 && !held.has(candidate.symbol) && buySlots > 0 && confidence >= params.minConfidence) {
+      recs.push({
+        action: "BUY",
+        symbol: candidate.symbol,
+        confidence,
+        reasoning: `Deterministic momentum breakout (${(candidate.ret * 100).toFixed(2)}%)`,
+        suggested_size_pct: Math.round(Math.min(30, Math.max(5, 12 + confidence * 10))),
+      });
+    }
+  }
+
+  return recs.slice(0, 12);
+}
+
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
   const dataPath = parseArgValue(args, "--data");
   if (!dataPath) {
-    throw new Error("Usage: scripts/backtest.ts --data path/to/bars.json [--model gpt-4o] [--cash 10000]");
+    throw new Error(
+      "Usage: scripts/backtest.ts --data path/to/bars.json [--model gpt-4o] [--cash 10000] [--seed 42] [--deterministic]"
+    );
   }
 
   const model = parseArgValue(args, "--model") ?? "gpt-4o";
   const initialCash = Number(parseArgValue(args, "--cash") ?? "10000");
   if (!Number.isFinite(initialCash) || initialCash <= 0) throw new Error("--cash must be a positive number");
+
+  const deterministicMode = hasFlag(args, "--deterministic");
+  const seed = normalizeDeterministicSeed(Number(parseArgValue(args, "--seed") ?? "42"));
+  const rng = createSeededRng(seed);
+
+  const strategy = parseArgValue(args, "--strategy") ?? (deterministicMode ? "momentum_deterministic" : "llm_momentum");
+  const variant = parseArgValue(args, "--variant") ?? (deterministicMode ? "seeded" : model);
+  const artifactDir = parseArgValue(args, "--artifact-dir") ?? "artifacts/backtests";
 
   const raw = await readFile(dataPath, "utf-8");
   const data = JSON.parse(raw) as BacktestDataFile;
@@ -56,7 +122,9 @@ async function main(): Promise<void> {
   const marketData = new BacktestMarketDataProvider(data.bars, { now_ms: startMs, spread_bps: 10 });
   const broker = new BacktestBrokerProvider({ now_ms: startMs, initial_cash: initialCash, marketData });
 
-  const llm = createOpenAIProvider({ apiKey: requiredEnv("OPENAI_API_KEY"), model });
+  const llm = deterministicMode
+    ? null
+    : createOpenAIProvider({ apiKey: requiredEnv("OPENAI_API_KEY"), model });
 
   const maxPositions = Number(parseArgValue(args, "--max-positions") ?? "5");
   const minConfidence = Number(parseArgValue(args, "--min-confidence") ?? "0.6");
@@ -98,8 +166,19 @@ async function main(): Promise<void> {
 
     if (momentumSignals.length === 0) continue;
 
-    const held = new Set(positions.map((p) => p.symbol));
-    const prompt = `Current Time: ${new Date(nowMs).toISOString()}
+    let recs: AnalystOutput["recommendations"] = [];
+
+    if (deterministicMode) {
+      recs = buildDeterministicRecommendations({
+        momentumSignals,
+        positions,
+        minConfidence,
+        maxPositions,
+        rng,
+      });
+    } else {
+      const held = new Set(positions.map((p) => p.symbol));
+      const prompt = `Current Time: ${new Date(nowMs).toISOString()}
 
 ACCOUNT STATUS:
 - Equity: $${account.equity.toFixed(2)}
@@ -117,12 +196,12 @@ Rules:
 - Min confidence to trade: ${minConfidence}
 - Output valid JSON only`;
 
-    const response = await llm.complete({
-      model,
-      messages: [
-        {
-          role: "system",
-          content: `You are a senior trading analyst AI. Provide BUY/SELL/HOLD recommendations based on the candidates.
+      const response = await llm!.complete({
+        model,
+        messages: [
+          {
+            role: "system",
+            content: `You are a senior trading analyst AI. Provide BUY/SELL/HOLD recommendations based on the candidates.
 Response format:
 {
   "recommendations": [
@@ -131,21 +210,22 @@ Response format:
   "market_summary": "brief",
   "high_conviction_plays": ["symbols"]
 }`,
-        },
-        { role: "user", content: prompt },
-      ],
-      temperature: 0,
-      max_tokens: 700,
-      response_format: { type: "json_object" },
-    });
+          },
+          { role: "user", content: prompt },
+        ],
+        temperature: 0,
+        max_tokens: 700,
+        response_format: { type: "json_object" },
+      });
 
-    let parsed: AnalystOutput | null = null;
-    try {
-      parsed = JSON.parse(String(response.content ?? "{}").replace(/```json\n?|```/g, "").trim()) as AnalystOutput;
-    } catch {
-      parsed = null;
+      let parsed: AnalystOutput | null = null;
+      try {
+        parsed = JSON.parse(String(response.content ?? "{}").replace(/```json\n?|```/g, "").trim()) as AnalystOutput;
+      } catch {
+        parsed = null;
+      }
+      recs = parsed?.recommendations ?? [];
     }
-    const recs = parsed?.recommendations ?? [];
 
     for (const rec of recs) {
       const symbol = rec.symbol?.toUpperCase?.() ?? "";
@@ -182,18 +262,61 @@ Response format:
   const endEquity = finalAccount.equity;
   const pnl = endEquity - startEquity;
   const pnlPct = startEquity > 0 ? (pnl / startEquity) * 100 : 0;
+  const equityPoints = history.timestamp.map((timestamp, idx) => ({
+    t_ms: timestamp * 1000,
+    equity: history.equity[idx] ?? 0,
+    cash: undefined,
+  }));
+
+  const summary = {
+    model: deterministicMode ? "deterministic-momentum" : model,
+    strategy,
+    variant,
+    seed,
+    deterministic: deterministicMode,
+    steps,
+    orders,
+    start_equity: startEquity,
+    end_equity: endEquity,
+    pnl,
+    pnl_pct: pnlPct,
+    max_drawdown_pct: computeMaxDrawdownPct(equityPoints),
+    open_positions: finalPositions.map((p) => ({ symbol: p.symbol, qty: p.qty, market_value: p.market_value })),
+    created_at: new Date().toISOString(),
+  };
+
+  const runId = `${Date.now()}-${seed}`;
+  const outDir = path.join(artifactDir, strategy, runId);
+  const summaryPath = path.join(outDir, "summary.json");
+  const equityPath = path.join(outDir, "equity.json");
+
+  await mkdir(outDir, { recursive: true });
+  await Promise.all([
+    writeFile(summaryPath, `${JSON.stringify(summary, null, 2)}\n`, "utf-8"),
+    writeFile(
+      equityPath,
+      `${JSON.stringify(
+        {
+          run_id: runId,
+          strategy,
+          seed,
+          points: equityPoints,
+        },
+        null,
+        2
+      )}\n`,
+      "utf-8"
+    ),
+  ]);
 
   process.stdout.write(
     JSON.stringify(
       {
-        model,
-        steps,
-        orders,
-        start_equity: startEquity,
-        end_equity: endEquity,
-        pnl,
-        pnl_pct: pnlPct,
-        open_positions: finalPositions.map((p) => ({ symbol: p.symbol, qty: p.qty, market_value: p.market_value })),
+        ...summary,
+        artifacts: {
+          summary: summaryPath,
+          equity: equityPath,
+        },
       },
       null,
       2
@@ -205,4 +328,3 @@ main().catch((err) => {
   process.stderr.write(String(err?.stack ?? err) + "\n");
   process.exitCode = 1;
 });
-

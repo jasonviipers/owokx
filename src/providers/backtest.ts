@@ -1,5 +1,13 @@
 import { createError, ErrorCode } from "../lib/errors";
 import { generateId } from "../lib/utils";
+import type { D1Client } from "../storage/d1/client";
+import {
+  createExperimentMetricsBatch,
+  createExperimentRun,
+  updateExperimentRun,
+} from "../storage/d1/queries/experiments";
+import { createR2Client } from "../storage/r2/client";
+import { R2Paths } from "../storage/r2/paths";
 import type {
   Account,
   Asset,
@@ -543,4 +551,157 @@ export class BacktestBrokerProvider implements BrokerProvider {
     const equityEstimate = this.cash + Array.from(this.positions.values()).reduce((sum, p) => sum + p.market_value, 0);
     this.equityTimeline.push({ t_ms: this.nowMs, equity: equityEstimate, cash: this.cash });
   }
+}
+
+export interface BacktestEquityPoint {
+  t_ms: number;
+  equity: number;
+  cash?: number;
+}
+
+export interface BacktestRunSummary {
+  model?: string;
+  strategy: string;
+  variant: string;
+  seed: number;
+  steps: number;
+  orders: number;
+  start_equity: number;
+  end_equity: number;
+  pnl: number;
+  pnl_pct: number;
+  max_drawdown_pct: number;
+  created_at: string;
+  open_positions?: Array<{ symbol: string; qty: number; market_value: number }>;
+}
+
+export interface PersistBacktestRunParams {
+  db: D1Client;
+  artifacts: R2Bucket;
+  strategy: string;
+  variant_id?: string | null;
+  variant_name?: string;
+  seed: number;
+  config?: Record<string, unknown>;
+  summary: BacktestRunSummary;
+  equity_curve: BacktestEquityPoint[];
+  metrics?: Array<{ metric_name: string; metric_value: number; step?: number; tags?: Record<string, unknown> }>;
+  status?: "completed" | "failed" | "running";
+  started_at?: string;
+  finished_at?: string;
+}
+
+export interface PersistBacktestRunResult {
+  run_id: string;
+  summary_key: string;
+  equity_key: string;
+  metrics_key: string;
+}
+
+export function normalizeDeterministicSeed(seed: number | null | undefined): number {
+  if (!Number.isFinite(seed)) {
+    return 42;
+  }
+  const normalized = Math.floor(Math.abs(Number(seed)));
+  return normalized === 0 ? 42 : normalized;
+}
+
+export function createSeededRng(seed: number): () => number {
+  let state = normalizeDeterministicSeed(seed) >>> 0;
+  return () => {
+    state += 0x6d2b79f5;
+    let t = state;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+export function computeMaxDrawdownPct(equityCurve: BacktestEquityPoint[]): number {
+  if (equityCurve.length === 0) return 0;
+  let peak = equityCurve[0]?.equity ?? 0;
+  let maxDrawdown = 0;
+  for (const point of equityCurve) {
+    if (point.equity > peak) peak = point.equity;
+    if (peak <= 0) continue;
+    const drawdown = (peak - point.equity) / peak;
+    if (drawdown > maxDrawdown) maxDrawdown = drawdown;
+  }
+  return maxDrawdown;
+}
+
+export async function persistBacktestRunArtifacts(params: PersistBacktestRunParams): Promise<PersistBacktestRunResult> {
+  const now = new Date().toISOString();
+  const runId = await createExperimentRun(params.db, {
+    strategy_name: params.strategy,
+    variant_id: params.variant_id ?? null,
+    seed: params.seed,
+    status: "running",
+    config: {
+      variant: params.variant_name ?? "default",
+      ...(params.config ?? {}),
+    },
+    started_at: params.started_at ?? now,
+  });
+
+  const r2 = createR2Client(params.artifacts);
+  const summaryKey = R2Paths.experimentRunSummary(params.strategy, runId);
+  const equityKey = R2Paths.experimentRunEquity(params.strategy, runId);
+  const metricsKey = R2Paths.experimentRunMetrics(params.strategy, runId);
+
+  const metricsJson = {
+    run_id: runId,
+    strategy: params.strategy,
+    metrics: params.metrics ?? [],
+  };
+
+  await Promise.all([
+    r2.putExperimentArtifact(summaryKey, params.summary),
+    r2.putExperimentArtifact(equityKey, {
+      run_id: runId,
+      strategy: params.strategy,
+      points: params.equity_curve,
+    }),
+    r2.putExperimentArtifact(metricsKey, metricsJson),
+  ]);
+
+  const baseMetrics: Array<{
+    metric_name: string;
+    metric_value: number;
+    step?: number;
+    tags?: Record<string, unknown>;
+  }> = [
+    { metric_name: "pnl_usd", metric_value: params.summary.pnl },
+    { metric_name: "pnl_pct", metric_value: params.summary.pnl_pct },
+    { metric_name: "max_drawdown_pct", metric_value: params.summary.max_drawdown_pct },
+    { metric_name: "orders", metric_value: params.summary.orders },
+    { metric_name: "steps", metric_value: params.summary.steps },
+    ...(params.metrics ?? []),
+  ];
+
+  await createExperimentMetricsBatch(
+    params.db,
+    baseMetrics.map((metric) => ({
+      run_id: runId,
+      metric_name: metric.metric_name,
+      metric_value: metric.metric_value,
+      step: metric.step,
+      tags: metric.tags,
+    }))
+  );
+
+  await updateExperimentRun(params.db, runId, {
+    status: params.status ?? "completed",
+    summary: params.summary as unknown as Record<string, unknown>,
+    summary_artifact_key: summaryKey,
+    equity_artifact_key: equityKey,
+    finished_at: params.finished_at ?? now,
+  });
+
+  return {
+    run_id: runId,
+    summary_key: summaryKey,
+    equity_key: equityKey,
+    metrics_key: metricsKey,
+  };
 }

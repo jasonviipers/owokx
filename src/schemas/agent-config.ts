@@ -14,6 +14,9 @@ export const AgentConfigSchema = z
     take_profit_pct: z.number().min(1).max(100),
     stop_loss_pct: z.number().min(1).max(50),
     position_size_pct_of_cash: z.number().min(1).max(100),
+    max_symbol_exposure_pct: z.number().min(0.01).max(1),
+    max_correlated_exposure_pct: z.number().min(0.01).max(1),
+    max_portfolio_drawdown_pct: z.number().min(0.01).max(1),
 
     stale_position_enabled: z.boolean(),
     stale_min_hold_hours: z.number().min(0).max(168),
@@ -47,6 +50,12 @@ export const AgentConfigSchema = z
     crypto_take_profit_pct: z.number().min(1).max(100),
     crypto_stop_loss_pct: z.number().min(1).max(50),
 
+    strategy_promotion_enabled: z.boolean(),
+    strategy_promotion_min_samples: z.number().int().min(1).max(5000),
+    strategy_promotion_min_win_rate: z.number().min(0).max(1),
+    strategy_promotion_min_avg_pnl: z.number().min(-100000).max(100000),
+    strategy_promotion_min_win_rate_lift: z.number().min(0).max(0.5),
+
     ticker_blacklist: z.array(z.string()),
     allowed_exchanges: z.array(z.string()),
     allow_unhealthy_swarm: z.boolean().optional(),
@@ -62,6 +71,10 @@ export const AgentConfigSchema = z
   .refine((data) => data.stale_mid_hold_days <= data.stale_max_hold_days, {
     message: "stale_mid_hold_days must be <= stale_max_hold_days",
     path: ["stale_mid_hold_days"],
+  })
+  .refine((data) => data.max_symbol_exposure_pct <= data.max_correlated_exposure_pct, {
+    message: "max_symbol_exposure_pct must be <= max_correlated_exposure_pct",
+    path: ["max_symbol_exposure_pct"],
   });
 
 export type AgentConfig = z.infer<typeof AgentConfigSchema>;

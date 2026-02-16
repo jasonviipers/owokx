@@ -171,6 +171,21 @@ export function createOkxMarketDataProvider(client: OkxClient): OkxMarketDataPro
     throw buildUnsupportedInstrumentError(symbol, instId);
   };
 
+  const logBatchSkip = (operation: string, symbol: string, error: unknown): void => {
+    if (isInstrumentUnavailableError(error)) {
+      client.logger.debug(`Skipping unsupported symbol while ${operation}`, {
+        symbol,
+        okxCode: "51001",
+      });
+      return;
+    }
+
+    client.logger.warn(`Skipping symbol while ${operation}`, {
+      symbol,
+      error: String(error),
+    });
+  };
+
   const handleMarketDataError = (
     message: string,
     error: unknown,
@@ -182,7 +197,7 @@ export function createOkxMarketDataProvider(client: OkxClient): OkxMarketDataPro
       unsupportedInstIds.add(instId);
 
       if (firstSeen) {
-        client.logger.warn("OKX instrument unavailable; caching as unsupported", {
+        client.logger.debug("OKX instrument unavailable; caching as unsupported", {
           ...context,
           instId,
           okxCode: "51001",
@@ -246,10 +261,7 @@ export function createOkxMarketDataProvider(client: OkxClient): OkxMarketDataPro
             const bar = await this.getLatestBar(symbol);
             return [symbol, bar] as const;
           } catch (error) {
-            client.logger.warn("Skipping symbol while fetching latest bars", {
-              symbol,
-              error: String(error),
-            });
+            logBatchSkip("fetching latest bars", symbol, error);
             return null;
           }
         })
@@ -287,10 +299,7 @@ export function createOkxMarketDataProvider(client: OkxClient): OkxMarketDataPro
             const quote = await this.getQuote(symbol);
             return [symbol, quote] as const;
           } catch (error) {
-            client.logger.warn("Skipping symbol while fetching quotes", {
-              symbol,
-              error: String(error),
-            });
+            logBatchSkip("fetching quotes", symbol, error);
             return null;
           }
         })
@@ -356,10 +365,7 @@ export function createOkxMarketDataProvider(client: OkxClient): OkxMarketDataPro
             const snapshot = await this.getSnapshot(symbol);
             return [symbol, snapshot] as const;
           } catch (error) {
-            client.logger.warn("Skipping symbol while fetching snapshots", {
-              symbol,
-              error: String(error),
-            });
+            logBatchSkip("fetching snapshots", symbol, error);
             return null;
           }
         })

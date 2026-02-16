@@ -7,6 +7,8 @@ const { executeOrderMock, createBrokerProvidersMock, createD1ClientMock } = vi.h
   createD1ClientMock: vi.fn(() => ({})),
 }));
 
+let lastRiskValidationPayload: Record<string, unknown> | null = null;
+
 vi.mock("../execution/execute-order", () => ({
   executeOrder: executeOrderMock,
   isAcceptedSubmissionState: (state: string) => state === "SUBMITTED" || state === "SUBMITTING",
@@ -18,6 +20,27 @@ vi.mock("../providers/broker-factory", () => ({
 
 vi.mock("../storage/d1/client", () => ({
   createD1Client: createD1ClientMock,
+}));
+
+vi.mock("../storage/d1/queries/policy-config", () => ({
+  getPolicyConfig: vi.fn(async () => null),
+}));
+
+vi.mock("../storage/d1/queries/risk-state", () => ({
+  getRiskState: vi.fn(async () => ({
+    kill_switch_active: false,
+    kill_switch_reason: null,
+    kill_switch_at: null,
+    daily_loss_usd: 0,
+    daily_loss_reset_at: new Date().toISOString(),
+    daily_equity_start: 10000,
+    max_symbol_exposure_pct: 0.25,
+    max_correlated_exposure_pct: 0.5,
+    max_portfolio_drawdown_pct: 0.15,
+    last_loss_at: null,
+    cooldown_until: null,
+    updated_at: new Date().toISOString(),
+  })),
 }));
 
 import { TraderSimple } from "../durable-objects/trader-simple";
@@ -84,6 +107,7 @@ function createTraderEnv(riskApproved: { current: boolean }): Env {
   );
   const riskNamespace = createNamespace(async (request: Request) => {
     if (new URL(request.url).pathname === "/validate") {
+      lastRiskValidationPayload = (await request.json()) as Record<string, unknown>;
       if (riskApproved.current) {
         return new Response(JSON.stringify({ approved: true }), { status: 200 });
       }
@@ -126,6 +150,7 @@ async function doFetch(trader: TraderSimple, url: string, init?: RequestInit): P
 
 describe("TraderSimple risk gating", () => {
   beforeEach(() => {
+    lastRiskValidationPayload = null;
     executeOrderMock.mockReset();
     createBrokerProvidersMock.mockReset();
     createD1ClientMock.mockReset();
@@ -134,7 +159,38 @@ describe("TraderSimple risk gating", () => {
     createBrokerProvidersMock.mockImplementation(() => ({
       broker: "alpaca",
       trading: {
-        getAccount: vi.fn(async () => ({ cash: 10_000 })),
+        getAccount: vi.fn(async () => ({
+          id: "acct-1",
+          account_number: "acct-1",
+          status: "ACTIVE",
+          currency: "USD",
+          cash: 10_000,
+          buying_power: 10_000,
+          regt_buying_power: 10_000,
+          daytrading_buying_power: 10_000,
+          equity: 10_000,
+          last_equity: 10_000,
+          long_market_value: 0,
+          short_market_value: 0,
+          portfolio_value: 10_000,
+          pattern_day_trader: false,
+          trading_blocked: false,
+          transfers_blocked: false,
+          account_blocked: false,
+          multiplier: "1",
+          shorting_enabled: false,
+          maintenance_margin: 0,
+          initial_margin: 0,
+          daytrade_count: 0,
+          created_at: new Date().toISOString(),
+        })),
+        getPositions: vi.fn(async () => []),
+        getClock: vi.fn(async () => ({
+          timestamp: new Date().toISOString(),
+          is_open: true,
+          next_open: new Date().toISOString(),
+          next_close: new Date().toISOString(),
+        })),
         getPosition: vi.fn(async () => null),
       },
       marketData: {},
@@ -188,6 +244,55 @@ describe("TraderSimple risk gating", () => {
     expect(executeOrderMock).toHaveBeenCalledTimes(1);
     const firstCall = executeOrderMock.mock.calls[0]?.[0] as { idempotency_key?: string } | undefined;
     expect(firstCall?.idempotency_key).toMatch(/^trader:buy:MSFT:\d+$/);
+  });
+
+  it("sends full context payload to risk manager validation", async () => {
+    const riskApproved = { current: true };
+    const { ctx, waitForInit } = createContext("trader-test-ctx");
+    const trader = new TraderSimple(ctx, createTraderEnv(riskApproved));
+    await waitForInit();
+
+    const response = await doFetch(trader, "http://trader/buy", {
+      method: "POST",
+      body: JSON.stringify({
+        symbol: "AAPL",
+        confidence: 0.82,
+        account: { cash: 10_000 },
+      }),
+    });
+    const payload = (await response.json()) as { success: boolean };
+
+    expect(payload.success).toBe(true);
+    expect(lastRiskValidationPayload).toBeTruthy();
+    expect(lastRiskValidationPayload?.symbol).toBe("AAPL");
+    expect(lastRiskValidationPayload?.side).toBe("buy");
+    expect(lastRiskValidationPayload?.account).toBeTruthy();
+    expect(lastRiskValidationPayload?.positions).toBeTruthy();
+    expect(lastRiskValidationPayload?.clock).toBeTruthy();
+    expect(lastRiskValidationPayload?.riskState).toBeTruthy();
+    expect(lastRiskValidationPayload?.policy_config).toBeTruthy();
+  });
+
+  it("includes unified exposure limits in policy_config for risk manager", async () => {
+    const riskApproved = { current: false };
+    const { ctx, waitForInit } = createContext("trader-test-policy");
+    const trader = new TraderSimple(ctx, createTraderEnv(riskApproved));
+    await waitForInit();
+
+    await doFetch(trader, "http://trader/buy", {
+      method: "POST",
+      body: JSON.stringify({
+        symbol: "AAPL",
+        confidence: 0.9,
+        account: { cash: 10_000 },
+      }),
+    });
+
+    const policyConfig = lastRiskValidationPayload?.policy_config as Record<string, unknown> | undefined;
+    expect(policyConfig).toBeTruthy();
+    expect(typeof policyConfig?.max_symbol_exposure_pct).toBe("number");
+    expect(typeof policyConfig?.max_correlated_exposure_pct).toBe("number");
+    expect(typeof policyConfig?.max_portfolio_drawdown_pct).toBe("number");
   });
 
   it("blocks analysis-driven BUY recommendations when risk manager rejects", async () => {

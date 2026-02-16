@@ -20,6 +20,12 @@ export default defineConfig(({ mode }) => {
     server: {
       port: 3000,
       proxy: {
+        '/api/swarm': {
+          target: apiTarget,
+          changeOrigin: true,
+          secure: apiTarget.startsWith('https'),
+          rewrite: (path) => path.replace(/^\/api/, ''),
+        },
         '/api': {
           target: apiTarget,
           changeOrigin: true,

@@ -13,6 +13,9 @@ function createValidConfig() {
     take_profit_pct: 10,
     stop_loss_pct: 5,
     position_size_pct_of_cash: 10,
+    max_symbol_exposure_pct: 0.25,
+    max_correlated_exposure_pct: 0.5,
+    max_portfolio_drawdown_pct: 0.15,
     stale_position_enabled: true,
     stale_min_hold_hours: 4,
     stale_max_hold_days: 7,
@@ -40,6 +43,11 @@ function createValidConfig() {
     crypto_max_position_value: 2000,
     crypto_take_profit_pct: 15,
     crypto_stop_loss_pct: 10,
+    strategy_promotion_enabled: false,
+    strategy_promotion_min_samples: 30,
+    strategy_promotion_min_win_rate: 0.55,
+    strategy_promotion_min_avg_pnl: 5,
+    strategy_promotion_min_win_rate_lift: 0.03,
     ticker_blacklist: [],
     allowed_exchanges: ["NYSE", "NASDAQ"],
   };
@@ -135,6 +143,24 @@ describe("AgentConfigSchema", () => {
       const result = AgentConfigSchema.safeParse(config);
       expect(result.success).toBe(false);
     });
+
+    it("rejects max_symbol_exposure_pct over 1", () => {
+      const config = { ...createValidConfig(), max_symbol_exposure_pct: 1.2 };
+      const result = AgentConfigSchema.safeParse(config);
+      expect(result.success).toBe(false);
+    });
+
+    it("rejects max_portfolio_drawdown_pct over 1", () => {
+      const config = { ...createValidConfig(), max_portfolio_drawdown_pct: 1.5 };
+      const result = AgentConfigSchema.safeParse(config);
+      expect(result.success).toBe(false);
+    });
+
+    it("rejects strategy_promotion_min_win_rate_lift over 0.5", () => {
+      const config = { ...createValidConfig(), strategy_promotion_min_win_rate_lift: 0.8 };
+      const result = AgentConfigSchema.safeParse(config);
+      expect(result.success).toBe(false);
+    });
   });
 
   describe("refinement validations", () => {
@@ -155,6 +181,12 @@ describe("AgentConfigSchema", () => {
 
     it("rejects stale_mid_hold_days > stale_max_hold_days", () => {
       const config = { ...createValidConfig(), stale_mid_hold_days: 10, stale_max_hold_days: 5 };
+      const result = AgentConfigSchema.safeParse(config);
+      expect(result.success).toBe(false);
+    });
+
+    it("rejects max_symbol_exposure_pct > max_correlated_exposure_pct", () => {
+      const config = { ...createValidConfig(), max_symbol_exposure_pct: 0.7, max_correlated_exposure_pct: 0.5 };
       const result = AgentConfigSchema.safeParse(config);
       expect(result.success).toBe(false);
     });

@@ -197,4 +197,98 @@ describe("LearningAgent", () => {
     expect(advice.approved).toBe(false);
     expect(advice.reasons.length).toBeGreaterThan(0);
   });
+
+  it("requires configured thresholds before promoting challenger strategy", async () => {
+    const { ctx, waitForInit } = createContext("learning-test-4");
+    const agent = new LearningAgent(ctx, createLearningEnv());
+    await waitForInit();
+
+    await doFetch(agent, "http://learning/promotion/config", {
+      method: "POST",
+      body: JSON.stringify({
+        enabled: true,
+        min_samples: 20,
+        min_win_rate: 0.7,
+        min_avg_pnl: 1,
+        min_win_rate_lift: 0.02,
+      }),
+    });
+
+    for (let i = 0; i < 12; i += 1) {
+      await doFetch(agent, "http://learning/record-outcome", {
+        method: "POST",
+        body: JSON.stringify({
+          symbol: "AAPL",
+          side: "buy",
+          notional: 1000,
+          success: true,
+          pnl: 20,
+        }),
+      });
+    }
+
+    const optimizeRes = await doFetch(agent, "http://learning/optimize", {
+      method: "POST",
+      body: JSON.stringify({ reason: "threshold-gated" }),
+    });
+    const optimize = (await optimizeRes.json()) as {
+      promoted?: boolean;
+      strategy: { minConfidenceBuy: number };
+      challenger?: unknown;
+    };
+
+    expect(optimize.promoted).toBe(false);
+    expect(optimize.strategy.minConfidenceBuy).toBe(0.7);
+
+    await doFetch(agent, "http://learning/promotion/config", {
+      method: "POST",
+      body: JSON.stringify({
+        enabled: true,
+        min_samples: 10,
+        min_win_rate: 0.5,
+        min_avg_pnl: 0,
+        min_win_rate_lift: 0,
+      }),
+    });
+
+    const promoteRes = await doFetch(agent, "http://learning/optimize", {
+      method: "POST",
+      body: JSON.stringify({ reason: "threshold-met" }),
+    });
+    const promoted = (await promoteRes.json()) as {
+      promoted?: boolean;
+      strategy: { minConfidenceBuy: number };
+      champion?: { id?: string };
+    };
+
+    expect(promoted.promoted).toBe(true);
+    expect(promoted.strategy.minConfidenceBuy).toBeLessThan(0.7);
+    expect(promoted.champion?.id).toContain("champion-v");
+  });
+
+  it("exposes active strategy id and promotion status without restart", async () => {
+    const { ctx, waitForInit } = createContext("learning-test-5");
+    const agent = new LearningAgent(ctx, createLearningEnv());
+    await waitForInit();
+
+    const strategyRes = await doFetch(agent, "http://learning/strategy", { method: "GET" });
+    const strategy = (await strategyRes.json()) as {
+      strategy_id?: string;
+      champion?: { id?: string };
+      source?: string;
+    };
+
+    expect(strategy.strategy_id).toBeDefined();
+    expect(strategy.champion?.id).toBeDefined();
+    expect(strategy.source).toBeDefined();
+
+    const promotionRes = await doFetch(agent, "http://learning/promotion", { method: "GET" });
+    const promotion = (await promotionRes.json()) as {
+      thresholds?: { enabled?: boolean };
+      champion?: { id?: string };
+    };
+
+    expect(promotion.thresholds).toBeDefined();
+    expect(promotion.champion?.id).toBeDefined();
+  });
 });

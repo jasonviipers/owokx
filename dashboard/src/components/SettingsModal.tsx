@@ -242,6 +242,36 @@ export function SettingsModal({ config, onSave, onClose, onReset }: SettingsModa
                   onChange={e => handleChange('stop_loss_pct', Number(e.target.value))}
                 />
               </div>
+              <div>
+                <label className="hud-label block mb-1">Max Symbol Exposure (0-1)</label>
+                <input
+                  type="number"
+                  step="0.01"
+                  className="hud-input w-full"
+                  value={localConfig.max_symbol_exposure_pct ?? 0.25}
+                  onChange={e => handleChange('max_symbol_exposure_pct', Number(e.target.value))}
+                />
+              </div>
+              <div>
+                <label className="hud-label block mb-1">Max Correlated Exposure (0-1)</label>
+                <input
+                  type="number"
+                  step="0.01"
+                  className="hud-input w-full"
+                  value={localConfig.max_correlated_exposure_pct ?? 0.5}
+                  onChange={e => handleChange('max_correlated_exposure_pct', Number(e.target.value))}
+                />
+              </div>
+              <div>
+                <label className="hud-label block mb-1">Max Portfolio Drawdown (0-1)</label>
+                <input
+                  type="number"
+                  step="0.01"
+                  className="hud-input w-full"
+                  value={localConfig.max_portfolio_drawdown_pct ?? 0.15}
+                  onChange={e => handleChange('max_portfolio_drawdown_pct', Number(e.target.value))}
+                />
+              </div>
             </div>
           </div>
 
@@ -681,6 +711,67 @@ export function SettingsModal({ config, onSave, onClose, onReset }: SettingsModa
                   disabled={!localConfig.stale_position_enabled}
                 />
                 <p className="text-[9px] text-hud-text-dim mt-1">Exit if volume drops to this % of entry</p>
+              </div>
+            </div>
+          </div>
+
+          {/* Strategy Promotion */}
+          <div>
+            <h3 className="hud-label mb-3 text-hud-primary">Strategy Promotion</h3>
+            <div className="grid grid-cols-2 gap-4">
+              <div className="col-span-2">
+                <label className="flex items-center gap-2 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    className="hud-input w-4 h-4"
+                    checked={localConfig.strategy_promotion_enabled ?? false}
+                    onChange={e => handleChange('strategy_promotion_enabled', e.target.checked)}
+                  />
+                  <span className="hud-label">Enable Champion/Challenger Promotion</span>
+                </label>
+              </div>
+              <div>
+                <label className="hud-label block mb-1">Min Samples</label>
+                <input
+                  type="number"
+                  className="hud-input w-full"
+                  value={localConfig.strategy_promotion_min_samples ?? 30}
+                  onChange={e => handleChange('strategy_promotion_min_samples', Number(e.target.value))}
+                  disabled={!localConfig.strategy_promotion_enabled}
+                />
+              </div>
+              <div>
+                <label className="hud-label block mb-1">Min Win Rate (0-1)</label>
+                <input
+                  type="number"
+                  step="0.01"
+                  className="hud-input w-full"
+                  value={localConfig.strategy_promotion_min_win_rate ?? 0.55}
+                  onChange={e => handleChange('strategy_promotion_min_win_rate', Number(e.target.value))}
+                  disabled={!localConfig.strategy_promotion_enabled}
+                />
+              </div>
+              <div>
+                <label className="hud-label block mb-1">Min Avg PnL ($)</label>
+                <input
+                  type="number"
+                  step="0.1"
+                  className="hud-input w-full"
+                  value={localConfig.strategy_promotion_min_avg_pnl ?? 5}
+                  onChange={e => handleChange('strategy_promotion_min_avg_pnl', Number(e.target.value))}
+                  disabled={!localConfig.strategy_promotion_enabled}
+                />
+              </div>
+              <div>
+                <label className="hud-label block mb-1">Min Win-Rate Lift (0-0.5)</label>
+                <input
+                  type="number"
+                  step="0.01"
+                  className="hud-input w-full"
+                  value={localConfig.strategy_promotion_min_win_rate_lift ?? 0.03}
+                  onChange={e => handleChange('strategy_promotion_min_win_rate_lift', Number(e.target.value))}
+                  disabled={!localConfig.strategy_promotion_enabled}
+                />
               </div>
             </div>
           </div>

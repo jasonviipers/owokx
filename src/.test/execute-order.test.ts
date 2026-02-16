@@ -20,6 +20,7 @@ const submissionsById = new Map<string, Submission>();
 
 let killSwitchActive = false;
 let policyOverride: Record<string, unknown> | null = null;
+let riskStateOverride: Record<string, unknown> | null = null;
 let createdOrders: Array<{ client_order_id?: string; symbol: string }> = [];
 
 vi.mock("../storage/d1/queries/order-submissions", () => {
@@ -100,6 +101,7 @@ vi.mock("../storage/d1/queries/risk-state", () => {
         last_loss_at: null,
         cooldown_until: null,
         updated_at: "now",
+        ...(riskStateOverride ?? {}),
       };
     }),
   };
@@ -141,13 +143,23 @@ function envStub() {
   };
 }
 
-function brokerStub() {
+function brokerStub(params?: {
+  account?: { cash?: number; equity?: number; buying_power?: number; last_equity?: number };
+  positions?: Array<Record<string, unknown>>;
+}) {
   createdOrders = [];
+  const account = {
+    cash: params?.account?.cash ?? 10_000,
+    equity: params?.account?.equity ?? 10_000,
+    buying_power: params?.account?.buying_power ?? 10_000,
+    last_equity: params?.account?.last_equity ?? 10_000,
+  };
+  const positions = (params?.positions ?? []) as any[];
   return {
     broker: "alpaca",
     trading: {
-      getAccount: vi.fn(async () => ({ cash: 10_000, equity: 10_000, buying_power: 10_000 }) as any),
-      getPositions: vi.fn(async () => [] as any[]),
+      getAccount: vi.fn(async () => account as any),
+      getPositions: vi.fn(async () => positions),
       getClock: vi.fn(async () => ({ is_open: true, timestamp: "now", next_open: "now", next_close: "later" }) as any),
       createOrder: vi.fn(async (req: any) => {
         createdOrders.push({ client_order_id: req.client_order_id, symbol: req.symbol });
@@ -181,6 +193,7 @@ beforeEach(() => {
   submissionsById.clear();
   killSwitchActive = false;
   policyOverride = null;
+  riskStateOverride = null;
   createdOrders = [];
 });
 
@@ -317,5 +330,133 @@ describe("executeOrder", () => {
     expect(createdOrders.length).toBe(0);
     const sub = submissionsByKey.get("approval:pol");
     expect(sub?.state).toBe("FAILED");
+  });
+
+  it("applies stricter runtime symbol exposure limit from risk state", async () => {
+    policyOverride = {
+      max_position_pct_equity: 1,
+      max_open_positions: 10,
+      max_notional_per_trade: 100000,
+      max_symbol_exposure_pct: 0.5,
+      max_correlated_exposure_pct: 1,
+      max_portfolio_drawdown_pct: 1,
+      allowed_order_types: ["market"],
+      max_daily_loss_pct: 1,
+      cooldown_minutes_after_loss: 0,
+      allowed_symbols: null,
+      deny_symbols: [],
+      min_avg_volume: 0,
+      min_price: 0,
+      trading_hours_only: false,
+      extended_hours_allowed: false,
+      approval_token_ttl_seconds: 300,
+      allow_short_selling: false,
+      use_cash_only: true,
+      options: {
+        options_enabled: false,
+        max_pct_per_option_trade: 0.02,
+        max_total_options_exposure_pct: 0.1,
+        min_dte: 30,
+        max_dte: 60,
+        min_delta: 0.3,
+        max_delta: 0.7,
+        allowed_strategies: ["long_call", "long_put"],
+        no_averaging_down: true,
+        max_option_positions: 3,
+        min_confidence_for_options: 0.8,
+      },
+    };
+    riskStateOverride = { max_symbol_exposure_pct: 0.2 };
+
+    const env = envStub() as any;
+    const broker = brokerStub({
+      account: { cash: 10000, equity: 10000, buying_power: 10000, last_equity: 10000 },
+      positions: [{ symbol: "AAPL", market_value: 1900, qty: 10, current_price: 190 }],
+    }) as any;
+
+    await expect(
+      executeOrder({
+        env,
+        db: {} as any,
+        broker,
+        source: "harness",
+        idempotency_key: "harness:buy:AAPL:strict-symbol",
+        order: {
+          symbol: "AAPL",
+          asset_class: "us_equity",
+          side: "buy",
+          notional: 1000,
+          order_type: "market",
+          time_in_force: "day",
+        },
+      })
+    ).rejects.toMatchObject({ code: ErrorCode.POLICY_VIOLATION });
+
+    expect(createdOrders.length).toBe(0);
+  });
+
+  it("applies stricter runtime drawdown limit from risk state", async () => {
+    policyOverride = {
+      max_position_pct_equity: 1,
+      max_open_positions: 10,
+      max_notional_per_trade: 100000,
+      max_symbol_exposure_pct: 1,
+      max_correlated_exposure_pct: 1,
+      max_portfolio_drawdown_pct: 0.5,
+      allowed_order_types: ["market"],
+      max_daily_loss_pct: 1,
+      cooldown_minutes_after_loss: 0,
+      allowed_symbols: null,
+      deny_symbols: [],
+      min_avg_volume: 0,
+      min_price: 0,
+      trading_hours_only: false,
+      extended_hours_allowed: false,
+      approval_token_ttl_seconds: 300,
+      allow_short_selling: false,
+      use_cash_only: true,
+      options: {
+        options_enabled: false,
+        max_pct_per_option_trade: 0.02,
+        max_total_options_exposure_pct: 0.1,
+        min_dte: 30,
+        max_dte: 60,
+        min_delta: 0.3,
+        max_delta: 0.7,
+        allowed_strategies: ["long_call", "long_put"],
+        no_averaging_down: true,
+        max_option_positions: 3,
+        min_confidence_for_options: 0.8,
+      },
+    };
+    riskStateOverride = {
+      max_portfolio_drawdown_pct: 0.1,
+      daily_equity_start: 10000,
+    };
+
+    const env = envStub() as any;
+    const broker = brokerStub({
+      account: { cash: 8800, equity: 8800, buying_power: 8800, last_equity: 10000 },
+    }) as any;
+
+    await expect(
+      executeOrder({
+        env,
+        db: {} as any,
+        broker,
+        source: "harness",
+        idempotency_key: "harness:buy:AAPL:strict-drawdown",
+        order: {
+          symbol: "AAPL",
+          asset_class: "us_equity",
+          side: "buy",
+          notional: 100,
+          order_type: "market",
+          time_in_force: "day",
+        },
+      })
+    ).rejects.toMatchObject({ code: ErrorCode.POLICY_VIOLATION });
+
+    expect(createdOrders.length).toBe(0);
   });
 });

@@ -722,7 +722,7 @@ export default function App() {
 
   const blockingError = authError ?? error
   if (blockingError && !status) {
-    const isAuthError = blockingError.includes('Unauthorized')
+    const isAuthError = /unauthorized|invalid token|401/i.test(blockingError)
     return (
       <div className="min-h-screen bg-hud-bg flex items-center justify-center p-4 md:p-6">
         <Panel title={isAuthError ? "AUTHENTICATION REQUIRED" : "CONNECTION ERROR"} className="max-w-md w-full">

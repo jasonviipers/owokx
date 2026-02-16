@@ -35,6 +35,30 @@ interface StrategyAdjustments {
   rationale: string;
 }
 
+interface PromotionThresholds {
+  enabled: boolean;
+  min_samples: number;
+  min_win_rate: number;
+  min_avg_pnl: number;
+  min_win_rate_lift: number;
+}
+
+interface StrategyRecord {
+  id: string;
+  strategy: StrategyAdjustments;
+  promotedAt: number;
+  source: "baseline" | "promoted";
+  metrics: PerformanceMetrics;
+}
+
+interface ChallengerRecord {
+  id: string;
+  strategy: StrategyAdjustments;
+  createdAt: number;
+  reason: string;
+  metrics: PerformanceMetrics;
+}
+
 interface TradeAdvice {
   approved: boolean;
   adjustedConfidence: number;
@@ -47,6 +71,9 @@ interface LearningState extends AgentBaseState {
   performance: PerformanceMetrics;
   symbolPerformance: Record<string, SymbolPerformance>;
   strategy: StrategyAdjustments;
+  champion: StrategyRecord;
+  challenger: ChallengerRecord | null;
+  promotionThresholds: PromotionThresholds;
   lastOptimizationTime: number;
 }
 
@@ -67,6 +94,14 @@ const DEFAULT_STRATEGY: StrategyAdjustments = {
   rationale: "Baseline strategy",
 };
 
+const DEFAULT_PROMOTION_THRESHOLDS: PromotionThresholds = {
+  enabled: false,
+  min_samples: 30,
+  min_win_rate: 0.55,
+  min_avg_pnl: 5,
+  min_win_rate_lift: 0.03,
+};
+
 const OUTCOME_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 const MAX_OUTCOMES = 1000;
 const OPTIMIZATION_INTERVAL_MS = 15 * 60 * 1000;
@@ -76,12 +111,31 @@ export class LearningAgent extends AgentBase<LearningState> {
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
+    const strategy = { ...DEFAULT_STRATEGY, ...(this.state.strategy ?? {}) };
+    const champion = this.state.champion ?? {
+      id: "champion-v1",
+      strategy,
+      promotedAt: 0,
+      source: "baseline" as const,
+      metrics: { ...DEFAULT_PERFORMANCE },
+    };
+
     this.state = {
       ...this.state,
       outcomes: this.state.outcomes ?? [],
       performance: { ...DEFAULT_PERFORMANCE, ...(this.state.performance ?? {}) },
       symbolPerformance: this.state.symbolPerformance ?? {},
-      strategy: { ...DEFAULT_STRATEGY, ...(this.state.strategy ?? {}) },
+      strategy,
+      champion: {
+        ...champion,
+        strategy: { ...strategy, ...(champion.strategy ?? {}) },
+        metrics: { ...DEFAULT_PERFORMANCE, ...(champion.metrics ?? {}) },
+      },
+      challenger: this.state.challenger ?? null,
+      promotionThresholds: {
+        ...DEFAULT_PROMOTION_THRESHOLDS,
+        ...(this.state.promotionThresholds ?? {}),
+      },
       lastOptimizationTime: this.state.lastOptimizationTime ?? 0,
     };
   }
@@ -111,10 +165,14 @@ export class LearningAgent extends AgentBase<LearningState> {
         return this.buildSummary();
       case "get_strategy_adjustments":
         return this.state.strategy;
+      case "get_promotion_status":
+        return this.getPromotionStatus();
       case "get_trade_advice":
         return this.getTradeAdvice(message.payload as { symbol?: string; confidence?: number });
       case "optimize_strategy":
         return this.optimizeStrategy(String((message.payload as { reason?: string })?.reason ?? "message"));
+      case "set_promotion_thresholds":
+        return this.setPromotionThresholds(message.payload as Partial<PromotionThresholds>);
       default:
         return { error: `Unknown topic: ${message.topic}` };
     }
@@ -129,7 +187,30 @@ export class LearningAgent extends AgentBase<LearningState> {
     }
 
     if (path === "/strategy" && request.method === "GET") {
-      return new Response(JSON.stringify(this.state.strategy), {
+      return new Response(
+        JSON.stringify({
+          ...this.state.strategy,
+          strategy_id: this.state.champion.id,
+          source: this.state.champion.source,
+          champion: this.state.champion,
+          challenger: this.state.challenger,
+        }),
+        {
+          headers: { "Content-Type": "application/json" },
+        }
+      );
+    }
+
+    if (path === "/promotion" && request.method === "GET") {
+      return new Response(JSON.stringify(this.getPromotionStatus()), {
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+
+    if (path === "/promotion/config" && request.method === "POST") {
+      const payload = (await request.json().catch(() => ({}))) as Partial<PromotionThresholds>;
+      const result = await this.setPromotionThresholds(payload);
+      return new Response(JSON.stringify(result), {
         headers: { "Content-Type": "application/json" },
       });
     }
@@ -167,6 +248,9 @@ export class LearningAgent extends AgentBase<LearningState> {
         samples: this.state.performance.samples,
         winRate: this.state.performance.winRate,
         strategy: this.state.strategy,
+        champion: this.state.champion,
+        challenger: this.state.challenger,
+        promotionThresholds: this.state.promotionThresholds,
         lastOptimizationTime: this.state.lastOptimizationTime,
       }),
       {
@@ -274,13 +358,74 @@ export class LearningAgent extends AgentBase<LearningState> {
     performance: PerformanceMetrics;
     strategy: StrategyAdjustments;
     symbols: SymbolPerformance[];
+    champion: StrategyRecord;
+    challenger: ChallengerRecord | null;
+    promotionThresholds: PromotionThresholds;
   } {
     return {
       performance: this.state.performance,
       strategy: this.state.strategy,
+      champion: this.state.champion,
+      challenger: this.state.challenger,
+      promotionThresholds: this.state.promotionThresholds,
       symbols: Object.values(this.state.symbolPerformance)
         .sort((a, b) => b.samples - a.samples)
         .slice(0, 20),
+    };
+  }
+
+  private getPromotionStatus(): {
+    thresholds: PromotionThresholds;
+    champion: StrategyRecord;
+    challenger: ChallengerRecord | null;
+    performance: PerformanceMetrics;
+  } {
+    return {
+      thresholds: this.state.promotionThresholds,
+      champion: this.state.champion,
+      challenger: this.state.challenger,
+      performance: this.state.performance,
+    };
+  }
+
+  private normalizePromotionThresholds(input: Partial<PromotionThresholds>): PromotionThresholds {
+    const current = this.state.promotionThresholds ?? DEFAULT_PROMOTION_THRESHOLDS;
+    const enabled = typeof input.enabled === "boolean" ? input.enabled : current.enabled;
+    const min_samples =
+      typeof input.min_samples === "number" && Number.isFinite(input.min_samples)
+        ? Math.max(1, Math.min(5000, Math.round(input.min_samples)))
+        : current.min_samples;
+    const min_win_rate =
+      typeof input.min_win_rate === "number" && Number.isFinite(input.min_win_rate)
+        ? Math.max(0, Math.min(1, input.min_win_rate))
+        : current.min_win_rate;
+    const min_avg_pnl =
+      typeof input.min_avg_pnl === "number" && Number.isFinite(input.min_avg_pnl)
+        ? Math.max(-100000, Math.min(100000, input.min_avg_pnl))
+        : current.min_avg_pnl;
+    const min_win_rate_lift =
+      typeof input.min_win_rate_lift === "number" && Number.isFinite(input.min_win_rate_lift)
+        ? Math.max(0, Math.min(0.5, input.min_win_rate_lift))
+        : current.min_win_rate_lift;
+
+    return {
+      enabled,
+      min_samples,
+      min_win_rate,
+      min_avg_pnl,
+      min_win_rate_lift,
+    };
+  }
+
+  private async setPromotionThresholds(payload: Partial<PromotionThresholds>): Promise<{
+    ok: boolean;
+    thresholds: PromotionThresholds;
+  }> {
+    this.state.promotionThresholds = this.normalizePromotionThresholds(payload);
+    await this.saveState();
+    return {
+      ok: true,
+      thresholds: this.state.promotionThresholds,
     };
   }
 
@@ -326,8 +471,11 @@ export class LearningAgent extends AgentBase<LearningState> {
 
   private async optimizeStrategy(reason: string): Promise<{
     updated: boolean;
+    promoted?: boolean;
     strategy: StrategyAdjustments;
     performance: PerformanceMetrics;
+    challenger?: ChallengerRecord | null;
+    champion?: StrategyRecord;
   }> {
     const perf = this.state.performance;
     let minConfidenceBuy = this.state.strategy.minConfidenceBuy;
@@ -349,31 +497,126 @@ export class LearningAgent extends AgentBase<LearningState> {
       }
     }
 
-    if (updated) {
-      this.state.strategy = {
-        minConfidenceBuy,
-        maxPositionNotional,
-        riskMultiplier,
-        updatedAt: Date.now(),
-        rationale: `Optimized from ${reason}. winRate=${(perf.winRate * 100).toFixed(1)}%, avgPnl=${perf.avgPnl.toFixed(2)}`,
+    if (!updated) {
+      return {
+        updated: false,
+        strategy: this.state.strategy,
+        performance: this.state.performance,
+        challenger: this.state.challenger,
+        champion: this.state.champion,
       };
-      this.state.lastOptimizationTime = Date.now();
+    }
+
+    const optimizedStrategy: StrategyAdjustments = {
+      minConfidenceBuy,
+      maxPositionNotional,
+      riskMultiplier,
+      updatedAt: Date.now(),
+      rationale: `Optimized from ${reason}. winRate=${(perf.winRate * 100).toFixed(1)}%, avgPnl=${perf.avgPnl.toFixed(2)}`,
+    };
+
+    const promotion = this.state.promotionThresholds;
+    const challenger: ChallengerRecord = {
+      id: `challenger-${Date.now()}`,
+      strategy: optimizedStrategy,
+      createdAt: Date.now(),
+      reason,
+      metrics: { ...perf },
+    };
+    this.state.lastOptimizationTime = Date.now();
+
+    if (!promotion.enabled) {
+      this.state.strategy = optimizedStrategy;
+      this.state.champion = {
+        id: this.state.champion.id,
+        strategy: optimizedStrategy,
+        promotedAt: Date.now(),
+        source: "promoted",
+        metrics: { ...perf },
+      };
+      this.state.challenger = null;
       await this.saveState();
 
       try {
         await this.publishEvent("strategy_updated", {
           strategy: this.state.strategy,
+          strategy_id: this.state.champion.id,
           performance: this.state.performance,
         });
       } catch (error) {
         this.log("warn", "Unable to publish strategy_updated", { error: String(error) });
       }
+
+      return {
+        updated: true,
+        promoted: true,
+        strategy: this.state.strategy,
+        performance: this.state.performance,
+        challenger: this.state.challenger,
+        champion: this.state.champion,
+      };
     }
 
+    this.state.challenger = challenger;
+
+    const championMetrics = this.state.champion.metrics ?? DEFAULT_PERFORMANCE;
+    const eligibleBySamples = perf.samples >= promotion.min_samples;
+    const eligibleByWinRate = perf.winRate >= promotion.min_win_rate;
+    const eligibleByAvgPnl = perf.avgPnl >= promotion.min_avg_pnl;
+    const needsLiftCheck = championMetrics.samples >= promotion.min_samples;
+    const eligibleByLift = !needsLiftCheck || perf.winRate - championMetrics.winRate >= promotion.min_win_rate_lift;
+    const shouldPromote = eligibleBySamples && eligibleByWinRate && eligibleByAvgPnl && eligibleByLift;
+
+    if (shouldPromote) {
+      const nextChampionVersion = (() => {
+        const match = this.state.champion.id.match(/champion-v(\d+)/);
+        const current = match ? Number.parseInt(match[1] ?? "1", 10) : 1;
+        return Number.isFinite(current) ? current + 1 : 2;
+      })();
+
+      this.state.champion = {
+        id: `champion-v${nextChampionVersion}`,
+        strategy: optimizedStrategy,
+        promotedAt: Date.now(),
+        source: "promoted",
+        metrics: { ...perf },
+      };
+      this.state.strategy = optimizedStrategy;
+      this.state.challenger = null;
+      await this.saveState();
+
+      try {
+        await this.publishEvent("strategy_updated", {
+          strategy: this.state.strategy,
+          strategy_id: this.state.champion.id,
+          performance: this.state.performance,
+          promotion: {
+            promoted: true,
+            reason,
+          },
+        });
+      } catch (error) {
+        this.log("warn", "Unable to publish strategy_updated", { error: String(error) });
+      }
+
+      return {
+        updated: true,
+        promoted: true,
+        strategy: this.state.strategy,
+        performance: this.state.performance,
+        challenger: this.state.challenger,
+        champion: this.state.champion,
+      };
+    }
+
+    await this.saveState();
     return {
-      updated,
+      updated: true,
+      promoted: false,
       strategy: this.state.strategy,
       performance: this.state.performance,
+      challenger: this.state.challenger,
+      champion: this.state.champion,
     };
   }
 
