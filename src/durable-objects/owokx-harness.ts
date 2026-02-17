@@ -661,6 +661,16 @@ const DEFAULT_STATE: AgentState = {
   enabled: false,
 };
 
+function defaultBrokerFromEnv(env: Env): AgentConfig["broker"] {
+  const normalized = String(env.BROKER_PROVIDER ?? "")
+    .trim()
+    .toLowerCase();
+  if (normalized === "alpaca" || normalized === "okx" || normalized === "polymarket") {
+    return normalized;
+  }
+  return "alpaca";
+}
+
 // Blacklist for ticker extraction - common English words and trading slang
 const TICKER_BLACKLIST = new Set([
   // Finance/trading terms
@@ -1227,10 +1237,14 @@ export class OwokxHarness extends DurableObject<Env> {
 
     this.ctx.blockConcurrencyWhile(async () => {
       const stored = await this.ctx.storage.get<AgentState>("state");
+      const baseDefaultConfig: AgentConfig = {
+        ...DEFAULT_CONFIG,
+        broker: defaultBrokerFromEnv(this.env),
+      };
       if (stored) {
         this.state = { ...DEFAULT_STATE, ...stored };
         this.state.config = {
-          ...DEFAULT_CONFIG,
+          ...baseDefaultConfig,
           ...(stored.config ?? {}),
         };
         if (!Array.isArray(this.state.memoryEpisodes)) {
@@ -1283,6 +1297,11 @@ export class OwokxHarness extends DurableObject<Env> {
             await this.persist();
           }
         }
+      } else {
+        this.state = {
+          ...DEFAULT_STATE,
+          config: baseDefaultConfig,
+        };
       }
       if (this.enforceProductionSwarmGuard()) {
         await this.persist();
@@ -2347,6 +2366,8 @@ export class OwokxHarness extends DurableObject<Env> {
     }
 
     this.state.config = parsedConfig.data;
+    // Credentials/broker may have changed; force the next status call to re-probe broker auth.
+    this.state.lastBrokerAuthError = undefined;
     this.enforceProductionSwarmGuard();
     this.state.optimization.adaptiveDataPollIntervalMs = this.state.config.data_poll_interval_ms;
     this.state.optimization.adaptiveAnalystIntervalMs = this.state.config.analyst_interval_ms;
@@ -2445,7 +2466,14 @@ export class OwokxHarness extends DurableObject<Env> {
 
   private async handleReset(): Promise<Response> {
     await this.ctx.storage.deleteAll();
-    this.state = { ...DEFAULT_STATE };
+    this.state = {
+      ...DEFAULT_STATE,
+      config: {
+        ...DEFAULT_CONFIG,
+        broker: defaultBrokerFromEnv(this.env),
+      },
+      lastBrokerAuthError: undefined,
+    };
     this.log("System", "agent_reset", { timestamp: new Date().toISOString() });
     await this.persist();
     return this.jsonResponse({
