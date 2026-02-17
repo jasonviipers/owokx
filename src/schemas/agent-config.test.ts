@@ -70,6 +70,15 @@ describe("AgentConfigSchema", () => {
       }
     });
 
+    it("accepts all broker values", () => {
+      const brokers = ["alpaca", "okx", "polymarket"] as const;
+      for (const broker of brokers) {
+        const config = { ...createValidConfig(), broker };
+        const result = AgentConfigSchema.safeParse(config);
+        expect(result.success).toBe(true);
+      }
+    });
+
     it("accepts empty ticker_blacklist", () => {
       const config = { ...createValidConfig(), ticker_blacklist: [] };
       const result = AgentConfigSchema.safeParse(config);

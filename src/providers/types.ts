@@ -68,6 +68,7 @@ export interface Order {
   expired_at: string | null;
   canceled_at: string | null;
   failed_at: string | null;
+  broker_provider?: string;
 }
 
 export type OrderStatus =

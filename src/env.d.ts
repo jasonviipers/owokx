@@ -12,7 +12,9 @@ export interface Env {
   RISK_MANAGER: DurableObjectNamespace;
   LEARNING_AGENT?: DurableObjectNamespace;
 
-  BROKER_PROVIDER?: "alpaca" | "okx";
+  BROKER_PROVIDER?: "alpaca" | "okx" | "polymarket";
+  BROKER_FALLBACK_PROVIDER?: "alpaca" | "okx" | "polymarket";
+  BROKER_FALLBACK_ALLOW_TRADING?: string;
 
   ALPACA_API_KEY: string;
   ALPACA_API_SECRET: string;
@@ -27,6 +29,22 @@ export interface Env {
   OKX_MAX_REQUESTS_PER_SECOND?: string;
   OKX_MAX_RETRIES?: string;
   OKX_LOG_LEVEL?: "debug" | "info" | "warn" | "error" | "silent";
+
+  POLYMARKET_API_URL?: string;
+  POLYMARKET_DATA_API_URL?: string;
+  POLYMARKET_API_KEY?: string;
+  POLYMARKET_API_SECRET?: string;
+  POLYMARKET_API_PASSPHRASE?: string;
+  POLYMARKET_ADDRESS?: string;
+  POLYMARKET_CHAIN_ID?: string;
+  POLYMARKET_SIGNATURE_TYPE?: string;
+  POLYMARKET_REQUEST_TIMEOUT_MS?: string;
+  POLYMARKET_MAX_REQUESTS_PER_SECOND?: string;
+  POLYMARKET_MAX_RETRIES?: string;
+  POLYMARKET_SYMBOL_MAP_JSON?: string;
+  POLYMARKET_ORDER_SIGNER_URL?: string;
+  POLYMARKET_ORDER_SIGNER_TIMEOUT_MS?: string;
+  POLYMARKET_ORDER_SIGNER_BEARER_TOKEN?: string;
 
   OPENAI_API_KEY?: string;
   OPENAI_BASE_URL?: string;

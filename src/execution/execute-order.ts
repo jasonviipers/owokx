@@ -34,6 +34,8 @@ export interface ExecuteOrderResult {
   submission: OrderSubmissionRow;
   broker_order_id?: string;
   trade_id?: string;
+  broker_provider?: string;
+  asset_class?: OrderPreview["asset_class"];
 }
 
 export interface EvaluateOrderPolicyParams {
@@ -133,7 +135,12 @@ export async function executeOrder(params: ExecuteOrderParams): Promise<ExecuteO
         submission_state: submission.state,
       },
     });
-    return { submission, broker_order_id: submission.broker_order_id ?? undefined };
+    return {
+      submission,
+      broker_order_id: submission.broker_order_id ?? undefined,
+      broker_provider: submission.broker_provider,
+      asset_class: params.order.asset_class,
+    };
   }
 
   if (submission.state !== "RESERVED" && submission.state !== "FAILED") {
@@ -150,7 +157,12 @@ export async function executeOrder(params: ExecuteOrderParams): Promise<ExecuteO
     const latest = await getOrderSubmissionByIdempotencyKey(params.db, params.idempotency_key);
     if (latest) {
       if (isAcceptedSubmissionState(latest.state)) {
-        return { submission: latest, broker_order_id: latest.broker_order_id ?? undefined };
+        return {
+          submission: latest,
+          broker_order_id: latest.broker_order_id ?? undefined,
+          broker_provider: latest.broker_provider,
+          asset_class: params.order.asset_class,
+        };
       }
     }
     throw createError(ErrorCode.CONFLICT, "Unable to transition submission to SUBMITTING");
@@ -270,23 +282,29 @@ export async function executeOrder(params: ExecuteOrderParams): Promise<ExecuteO
       stop_price: params.order.stop_price,
       client_order_id: clientOrderId,
     });
+    const effectiveBrokerProvider = order.broker_provider ?? params.broker.broker;
+    const effectiveAssetClass: OrderPreview["asset_class"] = order.asset_class === "us_equity" ? "us_equity" : "crypto";
 
-    await setOrderSubmissionState(params.db, submission.id, "SUBMITTED", { broker_order_id: order.id });
+    await setOrderSubmissionState(params.db, submission.id, "SUBMITTED", {
+      broker_order_id: order.id,
+      broker_provider: effectiveBrokerProvider,
+    });
 
     let tradeId: string | undefined;
     try {
+      const isExecutedCrypto = effectiveAssetClass === "crypto";
       tradeId = await createTrade(params.db, {
         approval_id: params.approval_id ?? undefined,
         submission_id: submission.id,
-        broker_provider: params.broker.broker,
+        broker_provider: effectiveBrokerProvider,
         broker_order_id: order.id,
         alpaca_order_id: order.id,
         symbol: order.symbol,
         side: order.side,
         qty: order.qty ? parseFloat(order.qty) : undefined,
         notional: params.order.notional,
-        asset_class: params.order.asset_class,
-        quote_ccy: isCrypto ? params.env.OKX_DEFAULT_QUOTE_CCY : undefined,
+        asset_class: effectiveAssetClass,
+        quote_ccy: isExecutedCrypto ? params.env.OKX_DEFAULT_QUOTE_CCY : undefined,
         order_type: order.type,
         status: order.status,
         limit_price: params.order.limit_price,
@@ -326,14 +344,21 @@ export async function executeOrder(params: ExecuteOrderParams): Promise<ExecuteO
         approval_id: params.approval_id ?? null,
         source: params.source,
         submission_id: submission.id,
-        broker_provider: params.broker.broker,
+        broker_provider: effectiveBrokerProvider,
       },
     });
 
     return {
-      submission: { ...submission, state: "SUBMITTED", broker_order_id: order.id },
+      submission: {
+        ...submission,
+        state: "SUBMITTED",
+        broker_order_id: order.id,
+        broker_provider: effectiveBrokerProvider,
+      },
       broker_order_id: order.id,
       trade_id: tradeId,
+      broker_provider: effectiveBrokerProvider,
+      asset_class: effectiveAssetClass,
     };
   } catch (err) {
     const toolError =
@@ -346,7 +371,12 @@ export async function executeOrder(params: ExecuteOrderParams): Promise<ExecuteO
       await setOrderSubmissionState(params.db, latest.id, "SUBMITTED", {
         last_error_json: JSON.stringify({ ...toolError, details: sanitizeForLog(toolError.details) }),
       });
-      return { submission: latest, broker_order_id: latest.broker_order_id ?? undefined };
+      return {
+        submission: latest,
+        broker_order_id: latest.broker_order_id ?? undefined,
+        broker_provider: latest.broker_provider,
+        asset_class: params.order.asset_class,
+      };
     }
 
     await setOrderSubmissionState(params.db, submission.id, "FAILED", {

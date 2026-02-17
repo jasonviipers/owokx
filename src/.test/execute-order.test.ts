@@ -77,13 +77,14 @@ vi.mock("../storage/d1/queries/order-submissions", () => {
         _db: unknown,
         id: string,
         state: string,
-        extra?: { broker_order_id?: string | null; last_error_json?: string | null }
+        extra?: { broker_order_id?: string | null; last_error_json?: string | null; broker_provider?: string | null }
       ) => {
         const row = submissionsById.get(id);
         if (!row) throw new Error("submission not found");
         row.state = state;
         if (extra?.broker_order_id !== undefined) row.broker_order_id = extra.broker_order_id ?? null;
         if (extra?.last_error_json !== undefined) row.last_error_json = extra.last_error_json ?? null;
+        if (extra?.broker_provider !== undefined) row.broker_provider = extra.broker_provider ?? row.broker_provider;
       }
     ),
   };

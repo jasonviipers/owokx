@@ -102,6 +102,12 @@ Worker runtime secrets and vars remain defined in:
 - `wrangler.jsonc`
 - `wrangler secret put ...`
 
+Broker rollout note:
+
+- To stage a Polymarket rollout safely, deploy with `BROKER_PROVIDER=polymarket` and set `BROKER_FALLBACK_PROVIDER` to your current broker.
+- Keep `BROKER_FALLBACK_ALLOW_TRADING=false` during initial bake-in so only read paths fail over.
+- Set `POLYMARKET_DATA_API_URL` only if you need a non-default Polymarket Data API endpoint.
+
 ## Deployment Orchestration Flow
 
 `deploy-oneclick.yml` executes:
@@ -142,6 +148,7 @@ Health endpoints:
 Operational endpoints:
 
 - Backend swarm/metrics/status endpoints under `/swarm/*` and `/agent/*`
+- Broker failover events are emitted as structured logs with `[broker-fallback]` prefix for alerting/search.
 
 Automated feedback:
 

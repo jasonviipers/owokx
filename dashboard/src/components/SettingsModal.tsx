@@ -53,7 +53,7 @@ export function SettingsModal({ config, onSave, onClose, onReset }: SettingsModa
     setLocalConfig(prev => ({ ...prev, [key]: value }))
   }
 
-  const handleBrokerChange = (broker: 'alpaca' | 'okx') => {
+  const handleBrokerChange = (broker: Config['broker']) => {
     setIsDirty(true)
     setLocalConfig(prev => {
       const next: Config = { ...prev, broker }
@@ -145,16 +145,19 @@ export function SettingsModal({ config, onSave, onClose, onReset }: SettingsModa
                 <select
                   className="hud-input w-full"
                   value={localConfig.broker || 'alpaca'}
-                  onChange={e => handleBrokerChange(e.target.value as 'alpaca' | 'okx')}
+                  onChange={e => handleBrokerChange(e.target.value as Config['broker'])}
                 >
                   <option value="alpaca">Alpaca</option>
                   <option value="okx">OKX</option>
+                  <option value="polymarket">Polymarket</option>
                 </select>
               </div>
               <div className="text-[9px] text-hud-text-dim flex items-end">
-                {localConfig.broker === 'okx'
-                  ? 'OKX supports crypto spot trading (recommended pairs: BTC/USDT, ETH/USDT).'
-                  : 'Alpaca supports US equities, crypto, and options (if enabled).'}
+                {localConfig.broker === 'okx' && 'OKX supports crypto spot trading (recommended pairs: BTC/USDT, ETH/USDT).'}
+                {localConfig.broker === 'polymarket' &&
+                  'Polymarket supports CLOB prediction-market trading. Configure POLYMARKET_* secrets and symbol mapping/token IDs.'}
+                {(localConfig.broker === undefined || localConfig.broker === 'alpaca') &&
+                  'Alpaca supports US equities, crypto, and options (if enabled).'}
               </div>
             </div>
           </div>

@@ -52,7 +52,7 @@ export async function setOrderSubmissionState(
   db: D1Client,
   id: string,
   state: OrderSubmissionState,
-  extra: { broker_order_id?: string | null; last_error_json?: string | null } = {}
+  extra: { broker_order_id?: string | null; last_error_json?: string | null; broker_provider?: string | null } = {}
 ): Promise<void> {
   const now = nowISO();
   await db.run(
@@ -60,9 +60,10 @@ export async function setOrderSubmissionState(
      SET state = ?,
          broker_order_id = COALESCE(?, broker_order_id),
          last_error_json = COALESCE(?, last_error_json),
+         broker_provider = COALESCE(?, broker_provider),
          updated_at = ?
      WHERE id = ?`,
-    [state, extra.broker_order_id ?? null, extra.last_error_json ?? null, now, id]
+    [state, extra.broker_order_id ?? null, extra.last_error_json ?? null, extra.broker_provider ?? null, now, id]
   );
 }
 
