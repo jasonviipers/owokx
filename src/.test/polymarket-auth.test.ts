@@ -50,4 +50,9 @@ describe("Polymarket symbol mapping", () => {
     expect(resolvePolymarketTokenId("POLY:333", map)).toBe("333");
     expect(resolvePolymarketTokenId("444", map)).toBe("444");
   });
+
+  it("throws for unmapped non-numeric symbols", () => {
+    const map = createPolymarketSymbolMap('{"AAPL":"111","NVDA":"222"}');
+    expect(() => resolvePolymarketTokenId("UNKNOWN", map)).toThrow();
+  });
 });

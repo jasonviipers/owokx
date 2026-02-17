@@ -75,7 +75,7 @@ const EXPERIMENTS_SCHEMA_HINT =
   "Experiment schema not initialized. Apply D1 migrations (including migrations/0008_experiments.sql).";
 const ALERTS_SCHEMA_HINT = "Alert schema not initialized. Apply D1 migrations (including migrations/0010_alerts.sql).";
 const ALERTS_DATA_HINT =
-  "Alert events query failed due malformed D1 payload serialization (error code 1031). Inspect or clean invalid alert_events rows.";
+  "Alert events query failed due to malformed D1 payload serialization (error code 1031). Inspect or clean invalid alert_events rows.";
 
 function getErrorMessage(error: unknown): string {
   if (error instanceof Error && typeof error.message === "string" && error.message.trim().length > 0) {

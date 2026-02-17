@@ -1,5 +1,4 @@
-import type { ErrorCode } from "../../lib/errors";
-import { ErrorCode as OwokxErrorCode } from "../../lib/errors";
+import { ErrorCode } from "../../lib/errors";
 
 export class PolymarketClientError extends Error {
   constructor(
@@ -43,21 +42,21 @@ export function extractPolymarketErrorMessage(payload: unknown): string | null {
 function inferCodeByMessage(message: string): ErrorCode {
   const normalized = message.toLowerCase();
   if (normalized.includes("insufficient") || normalized.includes("not enough balance")) {
-    return OwokxErrorCode.INSUFFICIENT_BUYING_POWER;
+    return ErrorCode.INSUFFICIENT_BUYING_POWER;
   }
   if (normalized.includes("rate limit") || normalized.includes("too many requests")) {
-    return OwokxErrorCode.RATE_LIMITED;
+    return ErrorCode.RATE_LIMITED;
   }
   if (normalized.includes("not found")) {
-    return OwokxErrorCode.NOT_FOUND;
+    return ErrorCode.NOT_FOUND;
   }
   if (normalized.includes("invalid") || normalized.includes("bad request")) {
-    return OwokxErrorCode.INVALID_INPUT;
+    return ErrorCode.INVALID_INPUT;
   }
   if (normalized.includes("unauthorized") || normalized.includes("forbidden")) {
-    return OwokxErrorCode.UNAUTHORIZED;
+    return ErrorCode.UNAUTHORIZED;
   }
-  return OwokxErrorCode.PROVIDER_ERROR;
+  return ErrorCode.PROVIDER_ERROR;
 }
 
 export function mapPolymarketError(
@@ -74,21 +73,21 @@ export function mapPolymarketError(
 
   if (status === 400) {
     return {
-      code: messageCode === OwokxErrorCode.PROVIDER_ERROR ? OwokxErrorCode.INVALID_INPUT : messageCode,
+      code: messageCode === ErrorCode.PROVIDER_ERROR ? ErrorCode.INVALID_INPUT : messageCode,
       message,
       retryable: false,
     };
   }
-  if (status === 401) return { code: OwokxErrorCode.UNAUTHORIZED, message, retryable: false };
-  if (status === 403) return { code: OwokxErrorCode.FORBIDDEN, message, retryable: false };
-  if (status === 404) return { code: OwokxErrorCode.NOT_FOUND, message, retryable: false };
-  if (status === 409) return { code: OwokxErrorCode.CONFLICT, message, retryable: false };
-  if (status === 429) return { code: OwokxErrorCode.RATE_LIMITED, message, retryable: true };
+  if (status === 401) return { code: ErrorCode.UNAUTHORIZED, message, retryable: false };
+  if (status === 403) return { code: ErrorCode.FORBIDDEN, message, retryable: false };
+  if (status === 404) return { code: ErrorCode.NOT_FOUND, message, retryable: false };
+  if (status === 409) return { code: ErrorCode.CONFLICT, message, retryable: false };
+  if (status === 429) return { code: ErrorCode.RATE_LIMITED, message, retryable: true };
   if (typeof status === "number" && status >= 500) {
-    return { code: OwokxErrorCode.PROVIDER_ERROR, message, retryable: true };
+    return { code: ErrorCode.PROVIDER_ERROR, message, retryable: true };
   }
 
-  if (messageCode === OwokxErrorCode.RATE_LIMITED) {
+  if (messageCode === ErrorCode.RATE_LIMITED) {
     return { code: messageCode, message, retryable: true };
   }
 

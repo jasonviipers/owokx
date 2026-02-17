@@ -53,7 +53,7 @@ export function SettingsModal({ config, onSave, onClose, onReset }: SettingsModa
     setLocalConfig(prev => ({ ...prev, [key]: value }))
   }
 
-  const handleBrokerChange = (broker: 'alpaca' | 'okx' | 'polymarket') => {
+  const handleBrokerChange = (broker: Config['broker']) => {
     setIsDirty(true)
     setLocalConfig(prev => {
       const next: Config = { ...prev, broker }
@@ -145,7 +145,7 @@ export function SettingsModal({ config, onSave, onClose, onReset }: SettingsModa
                 <select
                   className="hud-input w-full"
                   value={localConfig.broker || 'alpaca'}
-                  onChange={e => handleBrokerChange(e.target.value as 'alpaca' | 'okx' | 'polymarket')}
+                  onChange={e => handleBrokerChange(e.target.value as Config['broker'])}
                 >
                   <option value="alpaca">Alpaca</option>
                   <option value="okx">OKX</option>

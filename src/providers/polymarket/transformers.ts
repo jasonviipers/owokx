@@ -8,17 +8,7 @@ import type {
   PolymarketOrderBook,
   PolymarketOrderType,
 } from "./types";
-
-function parseNumber(value: unknown, fallback = 0): number {
-  if (typeof value === "number") {
-    return Number.isFinite(value) ? value : fallback;
-  }
-  if (typeof value === "string") {
-    const parsed = Number.parseFloat(value);
-    return Number.isFinite(parsed) ? parsed : fallback;
-  }
-  return fallback;
-}
+import { parseNumber } from "./utils";
 
 function parseIsoTimestamp(value: unknown, fallbackMs = Date.now()): string {
   if (typeof value === "string" && value.trim().length > 0) {
@@ -157,6 +147,7 @@ export function toOrder(raw: PolymarketOpenOrder, symbolMap: PolymarketSymbolMap
   const filledQty = parseNumber(raw.size_matched ?? raw.sizeMatched, 0);
   const createdAt = parseIsoTimestamp(raw.created_at, nowMs);
   const orderType = raw.order_type ?? raw.orderType;
+  const status = resolveOrderStatus(raw.status);
 
   return {
     id: raw.id ?? raw.order_id ?? raw.orderID ?? "",
@@ -174,15 +165,15 @@ export function toOrder(raw: PolymarketOpenOrder, symbolMap: PolymarketSymbolMap
     time_in_force: resolveTimeInForce(orderType),
     limit_price: raw.price ?? null,
     stop_price: null,
-    status: resolveOrderStatus(raw.status),
+    status,
     extended_hours: false,
     created_at: createdAt,
     updated_at: createdAt,
     submitted_at: createdAt,
-    filled_at: resolveOrderStatus(raw.status) === "filled" ? createdAt : null,
+    filled_at: status === "filled" ? createdAt : null,
     expired_at: null,
-    canceled_at: resolveOrderStatus(raw.status) === "canceled" ? createdAt : null,
-    failed_at: resolveOrderStatus(raw.status) === "rejected" ? createdAt : null,
+    canceled_at: status === "canceled" ? createdAt : null,
+    failed_at: status === "rejected" ? createdAt : null,
   };
 }
 
@@ -216,7 +207,7 @@ export function toCreatedOrder(
     order_type: normalizedType,
     type: normalizedType,
     side: input.side,
-    time_in_force: input.orderType === "FOK" ? "fok" : "gtc",
+    time_in_force: resolveTimeInForce(input.orderType),
     limit_price: String(input.price),
     stop_price: null,
     status,

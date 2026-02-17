@@ -16,11 +16,14 @@ function createJsonResponse(payload: unknown): {
   ok: boolean;
   status: number;
   text: () => Promise<string>;
+  json: () => Promise<unknown>;
 } {
+  const textPayload = JSON.stringify(payload);
   return {
     ok: true,
     status: 200,
-    text: async () => JSON.stringify(payload),
+    text: async () => textPayload,
+    json: async () => payload,
   };
 }
 

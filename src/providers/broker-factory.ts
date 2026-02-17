@@ -98,8 +98,23 @@ export function createBrokerProviders(env: Env, preferred?: string | null): Brok
     return primary;
   }
 
-  const fallbackProviders = createProvidersForBroker(env, fallbackBroker);
+  let fallbackProviders: BrokerProviders;
+  try {
+    fallbackProviders = createProvidersForBroker(env, fallbackBroker);
+  } catch (error) {
+    console.warn("[broker-factory] fallback broker initialization failed; using primary only", {
+      primaryBroker: broker,
+      fallbackBroker,
+      error: String(error),
+      errorCode:
+        error && typeof error === "object" && "code" in error ? String((error as Record<string, unknown>).code) : null,
+    });
+    return primary;
+  }
+
   return wrapBrokerProvidersWithFallback(primary, fallbackProviders, {
+    // WARNING: allowing trading fallback can submit stateful operations (create/cancel/close)
+    // to a different venue than the primary broker. Enable only when order state is mirrored.
     allowTradingFallback: parseBoolean(env.BROKER_FALLBACK_ALLOW_TRADING, false),
   });
 }

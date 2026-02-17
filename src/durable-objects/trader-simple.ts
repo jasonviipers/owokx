@@ -24,6 +24,8 @@ interface TraderState extends AgentBaseState {
     timestamp: number;
     success: boolean;
     error?: string;
+    broker_provider?: string;
+    asset_class?: "us_equity" | "crypto";
   }>;
   lastTradeTime: number;
   strategyProfile: {
@@ -63,6 +65,13 @@ interface RiskValidationContext {
 function isMissingDecisionTraceSchemaError(error: unknown): boolean {
   const message = String(error).toLowerCase();
   return message.includes("no such table") && message.includes("decision_traces");
+}
+
+function inferAssetClassFromSymbol(symbol: string, brokerId: string): "us_equity" | "crypto" {
+  const normalized = symbol.trim().toUpperCase();
+  if (brokerId === "okx" || brokerId === "polymarket") return "crypto";
+  if (normalized.startsWith("POLY:") || normalized.includes("/")) return "crypto";
+  return "us_equity";
 }
 
 export class TraderSimple extends AgentBase<TraderState> {
@@ -432,6 +441,7 @@ export class TraderSimple extends AgentBase<TraderState> {
         return false;
       }
 
+      const requestedAssetClass = inferAssetClassFromSymbol(symbol, broker.broker);
       const execution = await executeOrder({
         env: this.env,
         db,
@@ -440,13 +450,15 @@ export class TraderSimple extends AgentBase<TraderState> {
         idempotency_key,
         order: {
           symbol,
-          asset_class: broker.broker === "alpaca" ? "us_equity" : "crypto",
+          asset_class: requestedAssetClass,
           side: "buy",
           notional: Math.round(positionSize * 100) / 100,
           order_type: "market",
           time_in_force: "day",
         },
       });
+      const executedBrokerProvider = execution.broker_provider ?? broker.broker;
+      const executedAssetClass = execution.asset_class ?? requestedAssetClass;
 
       const success = isAcceptedSubmissionState(execution.submission.state);
       await this.recordDecisionTrace({
@@ -472,10 +484,15 @@ export class TraderSimple extends AgentBase<TraderState> {
         metadata: {
           source: "harness",
           approval_id: execution.submission.approval_id ?? null,
+          broker_provider: executedBrokerProvider,
+          asset_class: executedAssetClass,
         },
       });
 
-      this.recordTrade(symbol, "buy", positionSize, success, undefined);
+      this.recordTrade(symbol, "buy", positionSize, success, undefined, {
+        broker_provider: executedBrokerProvider,
+        asset_class: executedAssetClass,
+      });
 
       if (success) {
         this.state.lastTradeTime = Date.now();
@@ -489,6 +506,8 @@ export class TraderSimple extends AgentBase<TraderState> {
         success,
         confidence,
         reason: success ? "Order submitted" : "Order submission failed",
+        broker_provider: executedBrokerProvider,
+        asset_class: executedAssetClass,
       });
 
       return success;
@@ -585,6 +604,7 @@ export class TraderSimple extends AgentBase<TraderState> {
 
       const db = createD1Client(this.env.DB);
       const idempotency_key = this.buildIdempotencyKey("sell", symbol);
+      const requestedAssetClass = position.asset_class === "us_equity" ? "us_equity" : "crypto";
 
       const execution = await executeOrder({
         env: this.env,
@@ -594,13 +614,15 @@ export class TraderSimple extends AgentBase<TraderState> {
         idempotency_key,
         order: {
           symbol: position.symbol,
-          asset_class: position.asset_class === "us_equity" ? "us_equity" : "crypto",
+          asset_class: requestedAssetClass,
           side: "sell",
           qty: position.qty,
           order_type: "market",
           time_in_force: "day",
         },
       });
+      const executedBrokerProvider = execution.broker_provider ?? broker.broker;
+      const executedAssetClass = execution.asset_class ?? requestedAssetClass;
 
       const success = isAcceptedSubmissionState(execution.submission.state);
       await this.recordDecisionTrace({
@@ -626,10 +648,15 @@ export class TraderSimple extends AgentBase<TraderState> {
         metadata: {
           source: "harness",
           approval_id: execution.submission.approval_id ?? null,
+          broker_provider: executedBrokerProvider,
+          asset_class: executedAssetClass,
         },
       });
 
-      this.recordTrade(position.symbol, "sell", position.market_value, success, undefined);
+      this.recordTrade(position.symbol, "sell", position.market_value, success, undefined, {
+        broker_provider: executedBrokerProvider,
+        asset_class: executedAssetClass,
+      });
 
       if (success) {
         this.state.lastTradeTime = Date.now();
@@ -643,6 +670,8 @@ export class TraderSimple extends AgentBase<TraderState> {
         success,
         pnl: position.unrealized_pl,
         reason: success ? reason : "Sell submission failed",
+        broker_provider: executedBrokerProvider,
+        asset_class: executedAssetClass,
       });
 
       return success;
@@ -670,7 +699,14 @@ export class TraderSimple extends AgentBase<TraderState> {
     }
   }
 
-  private recordTrade(symbol: string, side: "buy" | "sell", size: number, success: boolean, error?: string): void {
+  private recordTrade(
+    symbol: string,
+    side: "buy" | "sell",
+    size: number,
+    success: boolean,
+    error?: string,
+    metadata?: { broker_provider?: string; asset_class?: "us_equity" | "crypto" }
+  ): void {
     const trade = {
       symbol,
       side,
@@ -678,6 +714,8 @@ export class TraderSimple extends AgentBase<TraderState> {
       timestamp: Date.now(),
       success,
       error,
+      broker_provider: metadata?.broker_provider,
+      asset_class: metadata?.asset_class,
     };
 
     this.state.tradeHistory.push(trade);
@@ -897,6 +935,8 @@ export class TraderSimple extends AgentBase<TraderState> {
     confidence?: number;
     pnl?: number;
     reason?: string;
+    broker_provider?: string;
+    asset_class?: "us_equity" | "crypto";
   }): Promise<void> {
     try {
       await this.publishEvent("trade_outcome", {

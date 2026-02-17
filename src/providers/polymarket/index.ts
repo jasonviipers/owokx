@@ -25,6 +25,14 @@ function parsePositiveInteger(value: string | undefined, fallback: number): numb
   return parsed;
 }
 
+function parseNonNegativeInteger(value: string | undefined, fallback: number): number {
+  const parsed = Number.parseInt(value ?? "", 10);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    return fallback;
+  }
+  return parsed;
+}
+
 function parseNonNegativeNumber(value: string | undefined, fallback: number): number {
   const parsed = Number.parseFloat(value ?? "");
   if (!Number.isFinite(parsed) || parsed < 0) {
@@ -54,7 +62,7 @@ export function createPolymarketProviders(env: Env): PolymarketProviders {
     chainId: parsePositiveInteger(env.POLYMARKET_CHAIN_ID, 137),
     signatureType: parsePositiveInteger(env.POLYMARKET_SIGNATURE_TYPE, 2),
     requestTimeoutMs: parsePositiveInteger(env.POLYMARKET_REQUEST_TIMEOUT_MS, 10_000),
-    maxRetries: parsePositiveInteger(env.POLYMARKET_MAX_RETRIES, 2),
+    maxRetries: parseNonNegativeInteger(env.POLYMARKET_MAX_RETRIES, 2),
     maxRequestsPerSecond: parseNonNegativeNumber(env.POLYMARKET_MAX_REQUESTS_PER_SECOND, 10),
     credentials:
       env.POLYMARKET_API_KEY && env.POLYMARKET_API_SECRET && env.POLYMARKET_API_PASSPHRASE && env.POLYMARKET_ADDRESS

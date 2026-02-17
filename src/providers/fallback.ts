@@ -1,6 +1,6 @@
 import { ErrorCode } from "../lib/errors";
 import type { BrokerProviders } from "./broker-factory";
-import type { BrokerProvider, MarketDataProvider, OptionsProvider } from "./types";
+import type { BrokerProvider, MarketDataProvider, OptionsProvider, Order } from "./types";
 
 export interface BrokerFallbackConfig {
   allowTradingFallback: boolean;
@@ -15,8 +15,11 @@ function getErrorCode(error: unknown): string | null {
 function shouldFallback(error: unknown): boolean {
   const code = getErrorCode(error);
   if (!code) {
-    const message = String(error ?? "").toLowerCase();
-    return message.includes("timeout") || message.includes("network") || message.includes("fetch failed");
+    const message = String(error instanceof Error ? error.message : (error ?? ""));
+    const name = error instanceof Error ? error.name : "";
+    if (/\b(timeout|network|fetch failed)\b/i.test(message)) return true;
+    if (error instanceof TypeError && /\b(fetch|network)\b/i.test(message)) return true;
+    return /\b(fetcherror|aborterror)\b/i.test(name);
   }
 
   return code === ErrorCode.RATE_LIMITED || code === ErrorCode.PROVIDER_ERROR || code === ErrorCode.NOT_SUPPORTED;
@@ -32,20 +35,31 @@ async function withFallback<T>(
 ): Promise<T> {
   try {
     return await primaryCall();
-  } catch (error) {
-    if (!allowFallback || !shouldFallback(error)) {
-      throw error;
+  } catch (primaryError) {
+    if (!allowFallback || !shouldFallback(primaryError)) {
+      throw primaryError;
     }
 
     console.warn("[broker-fallback] primary call failed, invoking fallback", {
       method,
       primary: primaryBroker,
       fallback: fallbackBroker,
-      error: String(error),
-      errorCode: getErrorCode(error),
+      error: String(primaryError),
+      errorCode: getErrorCode(primaryError),
     });
-    return fallbackCall();
+    try {
+      return await fallbackCall();
+    } catch (fallbackError) {
+      throw new AggregateError(
+        [primaryError, fallbackError],
+        `[broker-fallback] both primary and fallback failed for ${method}`
+      );
+    }
   }
+}
+
+function annotateOrderBrokerProvider(order: Order, brokerProvider: string): Order {
+  return { ...order, broker_provider: brokerProvider };
 }
 
 function createTradingWithFallback(
@@ -83,14 +97,15 @@ function createTradingWithFallback(
         () => primary.getPosition(symbol),
         () => fallback.getPosition(symbol)
       ),
+    // WARNING: mutating operations are unsafe to fallback unless both brokers share identical order state.
     closePosition: (symbol, qty, percentage) =>
       withFallback(
         "trading.closePosition",
         primaryBroker,
         fallbackBroker,
         config.allowTradingFallback,
-        () => primary.closePosition(symbol, qty, percentage),
-        () => fallback.closePosition(symbol, qty, percentage)
+        async () => annotateOrderBrokerProvider(await primary.closePosition(symbol, qty, percentage), primaryBroker),
+        async () => annotateOrderBrokerProvider(await fallback.closePosition(symbol, qty, percentage), fallbackBroker)
       ),
     createOrder: (params) =>
       withFallback(
@@ -98,8 +113,8 @@ function createTradingWithFallback(
         primaryBroker,
         fallbackBroker,
         config.allowTradingFallback,
-        () => primary.createOrder(params),
-        () => fallback.createOrder(params)
+        async () => annotateOrderBrokerProvider(await primary.createOrder(params), primaryBroker),
+        async () => annotateOrderBrokerProvider(await fallback.createOrder(params), fallbackBroker)
       ),
     getOrder: (orderId) =>
       withFallback(
@@ -119,6 +134,7 @@ function createTradingWithFallback(
         () => primary.listOrders(params),
         () => fallback.listOrders(params)
       ),
+    // WARNING: mutating operations are unsafe to fallback unless both brokers share identical order state.
     cancelOrder: (orderId) =>
       withFallback(
         "trading.cancelOrder",

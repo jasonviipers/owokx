@@ -1,18 +1,11 @@
+import { ErrorCode } from "../../lib/errors";
 import type { Bar, BarsParams, MarketDataProvider, Quote, Snapshot } from "../types";
 import type { PolymarketClient } from "./client";
 import { PolymarketClientError } from "./errors";
 import { type PolymarketSymbolMap, resolvePolymarketTokenId } from "./symbols";
 import { toQuote, toSnapshot, toSyntheticBar } from "./transformers";
 import type { PolymarketPriceHistoryPoint, PolymarketPriceHistoryResponse } from "./types";
-
-function parseNumber(value: unknown, fallback = 0): number {
-  if (typeof value === "number") return Number.isFinite(value) ? value : fallback;
-  if (typeof value === "string") {
-    const parsed = Number.parseFloat(value);
-    return Number.isFinite(parsed) ? parsed : fallback;
-  }
-  return fallback;
-}
+import { parseNumber } from "./utils";
 
 function parseHistoryPoint(point: PolymarketPriceHistoryPoint | undefined): { t: string; p: number } | null {
   if (!point) return null;
@@ -38,10 +31,7 @@ function parseHistoryPoint(point: PolymarketPriceHistoryPoint | undefined): { t:
     return { t: new Date(ms).toISOString(), p: price };
   }
 
-  return {
-    t: new Date().toISOString(),
-    p: price,
-  };
+  return null;
 }
 
 function parseHistory(response: PolymarketPriceHistoryResponse | undefined): Array<{ t: string; p: number }> {
@@ -98,11 +88,10 @@ export function createPolymarketMarketDataProvider(
     },
 
     async getLatestBars(symbols: string[]): Promise<Record<string, Bar>> {
-      const out: Record<string, Bar> = {};
-      for (const symbol of symbols) {
-        out[symbol] = await this.getLatestBar(symbol);
-      }
-      return out;
+      const entries = await Promise.all(
+        symbols.map(async (symbol) => [symbol, await this.getLatestBar(symbol)] as const)
+      );
+      return Object.fromEntries(entries);
     },
 
     async getQuote(symbol: string): Promise<Quote> {
@@ -112,11 +101,8 @@ export function createPolymarketMarketDataProvider(
     },
 
     async getQuotes(symbols: string[]): Promise<Record<string, Quote>> {
-      const out: Record<string, Quote> = {};
-      for (const symbol of symbols) {
-        out[symbol] = await this.getQuote(symbol);
-      }
-      return out;
+      const entries = await Promise.all(symbols.map(async (symbol) => [symbol, await this.getQuote(symbol)] as const));
+      return Object.fromEntries(entries);
     },
 
     async getSnapshot(symbol: string): Promise<Snapshot> {
@@ -138,18 +124,17 @@ export function createPolymarketMarketDataProvider(
     },
 
     async getSnapshots(symbols: string[]): Promise<Record<string, Snapshot>> {
-      const out: Record<string, Snapshot> = {};
-      for (const symbol of symbols) {
-        out[symbol] = await this.getSnapshot(symbol);
-      }
-      return out;
+      const entries = await Promise.all(
+        symbols.map(async (symbol) => [symbol, await this.getSnapshot(symbol)] as const)
+      );
+      return Object.fromEntries(entries);
     },
 
     async getCryptoSnapshot(symbol: string): Promise<Snapshot> {
       try {
         return await this.getSnapshot(symbol);
       } catch (error) {
-        if (error instanceof PolymarketClientError && error.code === "NOT_FOUND") {
+        if (error instanceof PolymarketClientError && error.code === ErrorCode.NOT_FOUND) {
           throw new Error(`No Polymarket market data found for ${symbol}`);
         }
         throw error;

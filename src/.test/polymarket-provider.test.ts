@@ -13,6 +13,22 @@ function jsonResponse(payload: unknown, status = 200): Response {
 
 describe("Polymarket provider integration", () => {
   const symbolMap = createPolymarketSymbolMap('{"AAPL":"111"}');
+  const baseClientConfig = {
+    baseUrl: "https://clob.polymarket.com",
+    chainId: 137,
+    signatureType: 2,
+    requestTimeoutMs: 10_000,
+    maxRetries: 0,
+    maxRequestsPerSecond: 100,
+    credentials: {
+      apiKey: "k",
+      apiSecret: "c2VjcmV0MTIz",
+      apiPassphrase: "p",
+      address: "0xabc",
+    },
+  } as const;
+  const makePolymarketClient = (overrides: Partial<Parameters<typeof createPolymarketClient>[0]> = {}) =>
+    createPolymarketClient({ ...baseClientConfig, ...overrides });
   let fetchMock: ReturnType<typeof vi.fn>;
 
   beforeEach(() => {
@@ -100,20 +116,7 @@ describe("Polymarket provider integration", () => {
   });
 
   it("maps balance allowance into broker account fields", async () => {
-    const client = createPolymarketClient({
-      baseUrl: "https://clob.polymarket.com",
-      chainId: 137,
-      signatureType: 2,
-      requestTimeoutMs: 10_000,
-      maxRetries: 0,
-      maxRequestsPerSecond: 100,
-      credentials: {
-        apiKey: "k",
-        apiSecret: "c2VjcmV0MTIz",
-        apiPassphrase: "p",
-        address: "0xabc",
-      },
-    });
+    const client = makePolymarketClient();
     const signer: PolymarketOrderSigner = {
       signOrder: vi.fn(),
     };
@@ -123,28 +126,17 @@ describe("Polymarket provider integration", () => {
     expect(account.cash).toBe(150.25);
     expect(account.buying_power).toBe(200);
 
-    const firstCall = fetchMock.mock.calls[0] as [string, RequestInit];
-    const firstRequest = new Request(firstCall[0], firstCall[1]);
-    expect(firstRequest.headers.get("POLY_API_KEY")).toBe("k");
-    expect(firstRequest.headers.get("POLY_PASSPHRASE")).toBe("p");
-    expect(firstRequest.headers.get("POLY_ADDRESS")).toBe("0xabc");
+    const balanceCall = fetchMock.mock.calls.find(([input]) => String(input).includes("/balance-allowance"));
+    expect(balanceCall).toBeTruthy();
+    const balanceRequest = new Request(String(balanceCall?.[0]), balanceCall?.[1] as RequestInit);
+    expect(balanceRequest.headers.get("POLY_API_KEY")).toBe("k");
+    expect(balanceRequest.headers.get("POLY_PASSPHRASE")).toBe("p");
+    expect(balanceRequest.headers.get("POLY_ADDRESS")).toBe("0xabc");
   });
 
   it("maps positions from the data API /positions endpoint", async () => {
-    const client = createPolymarketClient({
-      baseUrl: "https://clob.polymarket.com",
+    const client = makePolymarketClient({
       dataApiBaseUrl: "https://data-api.polymarket.com",
-      chainId: 137,
-      signatureType: 2,
-      requestTimeoutMs: 10_000,
-      maxRetries: 0,
-      maxRequestsPerSecond: 100,
-      credentials: {
-        apiKey: "k",
-        apiSecret: "c2VjcmV0MTIz",
-        apiPassphrase: "p",
-        address: "0xabc",
-      },
     });
     const signer: PolymarketOrderSigner = {
       signOrder: vi.fn(),
@@ -159,20 +151,7 @@ describe("Polymarket provider integration", () => {
   });
 
   it("creates orders via signer + /order endpoint", async () => {
-    const client = createPolymarketClient({
-      baseUrl: "https://clob.polymarket.com",
-      chainId: 137,
-      signatureType: 2,
-      requestTimeoutMs: 10_000,
-      maxRetries: 0,
-      maxRequestsPerSecond: 100,
-      credentials: {
-        apiKey: "k",
-        apiSecret: "c2VjcmV0MTIz",
-        apiPassphrase: "p",
-        address: "0xabc",
-      },
-    });
+    const client = makePolymarketClient();
 
     const signer: PolymarketOrderSigner = {
       signOrder: vi.fn(async () => ({
@@ -204,13 +183,8 @@ describe("Polymarket provider integration", () => {
   });
 
   it("builds snapshots from book + midpoint endpoints", async () => {
-    const client = createPolymarketClient({
-      baseUrl: "https://clob.polymarket.com",
-      chainId: 137,
-      signatureType: 2,
-      requestTimeoutMs: 10_000,
-      maxRetries: 0,
-      maxRequestsPerSecond: 100,
+    const client = makePolymarketClient({
+      credentials: undefined,
     });
 
     const marketData = createPolymarketMarketDataProvider(client, symbolMap);
@@ -223,20 +197,7 @@ describe("Polymarket provider integration", () => {
   });
 
   it("supports list/get order response formats from Polymarket", async () => {
-    const client = createPolymarketClient({
-      baseUrl: "https://clob.polymarket.com",
-      chainId: 137,
-      signatureType: 2,
-      requestTimeoutMs: 10_000,
-      maxRetries: 0,
-      maxRequestsPerSecond: 100,
-      credentials: {
-        apiKey: "k",
-        apiSecret: "c2VjcmV0MTIz",
-        apiPassphrase: "p",
-        address: "0xabc",
-      },
-    });
+    const client = makePolymarketClient();
     const signer: PolymarketOrderSigner = {
       signOrder: vi.fn(),
     };

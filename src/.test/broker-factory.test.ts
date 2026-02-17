@@ -243,6 +243,27 @@ describe("broker-factory", () => {
     expect(account.id).toBe("alpaca-account");
   });
 
+  it("degrades to primary-only when fallback broker initialization fails", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const providers = createBrokerProviders(
+      createEnv({
+        BROKER_PROVIDER: "polymarket",
+        BROKER_FALLBACK_PROVIDER: "okx",
+        OKX_API_KEY: undefined,
+        OKX_SECRET: undefined,
+        OKX_PASSPHRASE: undefined,
+      }) as any
+    );
+
+    const account = await providers.trading.getAccount();
+    expect(account.id).toBe("polymarket-account");
+    expect(warnSpy).toHaveBeenCalledWith(
+      "[broker-factory] fallback broker initialization failed; using primary only",
+      expect.objectContaining({ fallbackBroker: "okx" })
+    );
+    warnSpy.mockRestore();
+  });
+
   it("does not fallback on unauthorized errors", async () => {
     mocks.polymarketTradingGetAccount.mockRejectedValueOnce({ code: "UNAUTHORIZED", message: "bad creds" });
     const providers = createBrokerProviders(

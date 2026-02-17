@@ -26,6 +26,7 @@ interface PolymarketRequestOptions {
   privateAuth?: boolean;
   timeoutMs?: number;
   baseUrl?: string;
+  expectNoContent?: boolean;
 }
 
 interface PolymarketClientLogger {
@@ -101,17 +102,42 @@ function setQueryParams(searchParams: URLSearchParams, key: string, value: Query
 }
 
 class RollingRateLimiter {
-  private readonly requestTimestamps: number[] = [];
+  private readonly requestTimestamps: number[];
+  private head = 0;
+  private tail = 0;
+  private size = 0;
 
-  constructor(private readonly maxRequestsPerSecond: number) {}
+  constructor(private readonly maxRequestsPerSecond: number) {
+    const capacity =
+      Number.isFinite(maxRequestsPerSecond) && maxRequestsPerSecond > 0 ? Math.floor(maxRequestsPerSecond) : 0;
+    this.requestTimestamps = new Array<number>(capacity);
+  }
 
   private prune(now: number): void {
+    if (this.requestTimestamps.length === 0) return;
     const windowStart = now - 1000;
-    while (this.requestTimestamps.length > 0) {
-      const first = this.requestTimestamps[0];
+    while (this.size > 0) {
+      const first = this.requestTimestamps[this.head];
       if (first === undefined || first > windowStart) break;
-      this.requestTimestamps.shift();
+      this.head = (this.head + 1) % this.requestTimestamps.length;
+      this.size--;
     }
+  }
+
+  private push(now: number): void {
+    if (this.requestTimestamps.length === 0) return;
+    this.requestTimestamps[this.tail] = now;
+    this.tail = (this.tail + 1) % this.requestTimestamps.length;
+    if (this.size < this.requestTimestamps.length) {
+      this.size++;
+      return;
+    }
+    this.head = (this.head + 1) % this.requestTimestamps.length;
+  }
+
+  private peekOldest(): number | undefined {
+    if (this.size === 0 || this.requestTimestamps.length === 0) return undefined;
+    return this.requestTimestamps[this.head];
   }
 
   async waitForSlot(): Promise<void> {
@@ -120,11 +146,11 @@ class RollingRateLimiter {
     while (true) {
       const now = Date.now();
       this.prune(now);
-      if (this.requestTimestamps.length < this.maxRequestsPerSecond) {
-        this.requestTimestamps.push(now);
+      if (this.size < this.maxRequestsPerSecond) {
+        this.push(now);
         return;
       }
-      const first = this.requestTimestamps[0];
+      const first = this.peekOldest();
       const waitMs = first === undefined ? 0 : Math.max(0, 1000 - (now - first));
       await sleep(waitMs);
     }
@@ -236,6 +262,7 @@ export class PolymarketClient {
     await this.request("DELETE", "/order", {
       privateAuth: true,
       body: { orderID: orderId },
+      expectNoContent: true,
     });
   }
 
@@ -243,6 +270,7 @@ export class PolymarketClient {
     await this.request("DELETE", "/cancel-all", {
       privateAuth: true,
       body: {},
+      expectNoContent: true,
     });
   }
 
@@ -319,7 +347,17 @@ export class PolymarketClient {
     return Math.min(5000, 200 * 2 ** attempt) + jitter;
   }
 
-  private async request<T>(method: string, path: string, options: PolymarketRequestOptions = {}): Promise<T> {
+  private request(
+    method: string,
+    path: string,
+    options: PolymarketRequestOptions & { expectNoContent: true }
+  ): Promise<void>;
+  private request<T>(method: string, path: string, options?: PolymarketRequestOptions): Promise<T>;
+  private async request<T>(
+    method: string,
+    path: string,
+    options: PolymarketRequestOptions = {}
+  ): Promise<T | undefined> {
     const requestPath = this.buildPathWithQuery(path, options.query);
     const baseUrl = normalizeBaseUrl(options.baseUrl ?? this.baseUrl);
     const url = `${baseUrl}${requestPath}`;
@@ -358,7 +396,7 @@ export class PolymarketClient {
     requestPath: string,
     options: PolymarketRequestOptions,
     timeoutMs: number
-  ): Promise<T> {
+  ): Promise<T | undefined> {
     const headers: Record<string, string> = {
       "Content-Type": "application/json",
     };
@@ -396,8 +434,18 @@ export class PolymarketClient {
         throw toPolymarketClientError(response.status, payload ?? text, `Polymarket HTTP ${response.status}`);
       }
 
+      if (options.expectNoContent) {
+        return;
+      }
+
       if (response.status === 204 || text.length === 0) {
-        return undefined as T;
+        throw new PolymarketClientError(
+          "Polymarket response body was empty",
+          ErrorCode.PROVIDER_ERROR,
+          response.status,
+          payload ?? text,
+          false
+        );
       }
 
       return (payload ?? text) as T;

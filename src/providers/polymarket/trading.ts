@@ -23,15 +23,7 @@ import type {
   PolymarketOrderType,
   PolymarketTrade,
 } from "./types";
-
-function parseNumber(value: unknown, fallback = 0): number {
-  if (typeof value === "number") return Number.isFinite(value) ? value : fallback;
-  if (typeof value === "string") {
-    const parsed = Number.parseFloat(value);
-    return Number.isFinite(parsed) ? parsed : fallback;
-  }
-  return fallback;
-}
+import { parseNumber } from "./utils";
 
 function parseTimeInForce(orderType: OrderParams["time_in_force"]): PolymarketOrderType {
   if (orderType === "fok" || orderType === "ioc") return "FOK";
@@ -49,8 +41,8 @@ function mapStatusToOrderFilter(status: ListOrdersParams["status"]): string | un
   return undefined;
 }
 
-function isNonNotFoundError(error: unknown): boolean {
-  return !(error instanceof PolymarketClientError && error.code === ErrorCode.NOT_FOUND);
+function isNotFoundError(error: unknown): boolean {
+  return error instanceof PolymarketClientError && error.code === ErrorCode.NOT_FOUND;
 }
 
 function parseTimestampMs(value: unknown): number {
@@ -188,12 +180,31 @@ export class HttpPolymarketOrderSigner implements PolymarketOrderSigner {
         body: JSON.stringify(request),
         signal: controller.signal,
       });
-      const payload = (await response.json()) as PolymarketSignedOrderPayload;
+      const rawBody = await response.text();
 
       if (!response.ok) {
+        let payload: unknown = rawBody;
+        if (rawBody.trim().length > 0) {
+          try {
+            payload = JSON.parse(rawBody);
+          } catch {
+            payload = rawBody;
+          }
+        }
         throw createError(ErrorCode.PROVIDER_ERROR, "Polymarket signer request failed", {
           status: response.status,
           payload,
+        });
+      }
+
+      let payload: PolymarketSignedOrderPayload;
+      try {
+        payload = rawBody.trim().length === 0 ? ({} as PolymarketSignedOrderPayload) : JSON.parse(rawBody);
+      } catch (error) {
+        throw createError(ErrorCode.PROVIDER_ERROR, "Polymarket signer returned invalid JSON", {
+          status: response.status,
+          body: rawBody,
+          error: String(error),
         });
       }
 
@@ -227,8 +238,20 @@ export function createPolymarketTradingProvider(config: PolymarketTradingProvide
   const resolveTokenId = (symbol: string): string => resolvePolymarketTokenId(symbol, symbolMap);
 
   const estimateTradeSize = async (params: OrderParams, tokenId: string): Promise<{ size: number; price: number }> => {
-    const midpoint = await client.getMidpoint(tokenId).catch(() => ({ mid: undefined }));
-    const lastTrade = await client.getLastTradePrice(tokenId).catch(() => ({ price: undefined }));
+    const midpoint = await client.getMidpoint(tokenId).catch((error) => {
+      console.warn("[polymarket_trading] midpoint lookup failed while estimating trade size", {
+        tokenId,
+        error: String(error),
+      });
+      return { mid: undefined };
+    });
+    const lastTrade = await client.getLastTradePrice(tokenId).catch((error) => {
+      console.warn("[polymarket_trading] last-trade lookup failed while estimating trade size", {
+        tokenId,
+        error: String(error),
+      });
+      return { price: undefined };
+    });
     const marketPrice = parseNumber(midpoint.mid, parseNumber(lastTrade.price, 0));
     const limitPrice = params.limit_price ?? marketPrice;
     if (!Number.isFinite(limitPrice) || limitPrice <= 0) {
@@ -292,11 +315,22 @@ export function createPolymarketTradingProvider(config: PolymarketTradingProvide
   };
 
   const loadPositionsFromTrades = async (address: string): Promise<Position[]> => {
-    const tradesPayload = await client.listTrades({
-      maker: address,
-      limit: 500,
-    });
-    const fills = extractTrades(tradesPayload)
+    const pageSize = 500;
+    const trades: PolymarketTrade[] = [];
+
+    for (let page = 0, offset = 0; page < 20; page++, offset += pageSize) {
+      const tradesPayload = await client.listTrades({
+        maker: address,
+        limit: pageSize,
+        offset,
+      });
+      const pageTrades = extractTrades(tradesPayload);
+      if (pageTrades.length === 0) break;
+      trades.push(...pageTrades);
+      if (pageTrades.length < pageSize) break;
+    }
+
+    const fills = trades
       .map((trade) => formatTradeToSignedFill(trade))
       .filter((trade): trade is { tokenId: string; signedQty: number; price: number; timestampMs: number } =>
         Boolean(trade)
@@ -389,8 +423,8 @@ export function createPolymarketTradingProvider(config: PolymarketTradingProvide
 
         return await loadPositionsFromTrades(address);
       } catch (error) {
-        if (isNonNotFoundError(error)) throw error;
-        return [];
+        if (isNotFoundError(error)) return [];
+        throw error;
       }
     },
 
@@ -522,11 +556,13 @@ export function createPolymarketTradingProvider(config: PolymarketTradingProvide
 
     async getClock(): Promise<MarketClock> {
       const now = new Date();
+      const nextOpen = new Date(now.getTime() + 60 * 60 * 1000);
+      const nextClose = new Date(now.getTime() + 10 * 365 * 24 * 60 * 60 * 1000);
       return {
         timestamp: now.toISOString(),
         is_open: true,
-        next_open: new Date(now.getTime() + 60 * 60 * 1000).toISOString(),
-        next_close: new Date(now.getTime() + 60 * 60 * 1000).toISOString(),
+        next_open: nextOpen.toISOString(),
+        next_close: nextClose.toISOString(),
       };
     },
 
@@ -539,9 +575,7 @@ export function createPolymarketTradingProvider(config: PolymarketTradingProvide
       try {
         await client.getBook(tokenId);
       } catch (error) {
-        if (!isNonNotFoundError(error)) {
-          return null;
-        }
+        if (isNotFoundError(error)) return null;
         throw error;
       }
 

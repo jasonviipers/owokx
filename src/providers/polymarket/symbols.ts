@@ -36,6 +36,29 @@ export function createPolymarketSymbolMap(rawJson: string | undefined): Polymark
     const symbol = rawSymbol.trim().toUpperCase();
     const tokenId = String(rawToken ?? "").trim();
     if (!symbol || !tokenId) continue;
+
+    const existingTokenId = bySymbol.get(symbol);
+    if (existingTokenId && existingTokenId !== tokenId) {
+      console.warn("[polymarket_symbol_map] duplicate symbol mapping detected; overriding previous token id", {
+        rawSymbol,
+        rawToken,
+        normalizedSymbol: symbol,
+        normalizedTokenId: tokenId,
+        existingTokenId,
+      });
+    }
+
+    const existingSymbol = byTokenId.get(tokenId);
+    if (existingSymbol && existingSymbol !== symbol) {
+      console.warn("[polymarket_symbol_map] duplicate token-id mapping detected; overriding previous symbol", {
+        rawSymbol,
+        rawToken,
+        normalizedSymbol: symbol,
+        normalizedTokenId: tokenId,
+        existingSymbol,
+      });
+    }
+
     bySymbol.set(symbol, tokenId);
     byTokenId.set(tokenId, symbol);
   }
